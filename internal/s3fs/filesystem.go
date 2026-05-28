@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"sync"
 
 	"github.com/go-git/go-billy/v6"
 	"github.com/tigrisdata/storage-go"
@@ -18,6 +19,12 @@ type S3FS struct {
 	bucket    string
 	root      string
 	separator string
+
+	// temps holds TempFile-backed buffers keyed by canonical S3 key, so a
+	// subsequent Open of the same path returns a reader over the same bytes
+	// the writer is still appending to. See tempfs.go.
+	tempMu sync.Mutex
+	temps  map[string]*tempBuffer
 }
 
 // NewS3FS creates a new S3FS Filesystem.
@@ -31,6 +38,7 @@ func NewS3FS(client *storage.Client, bucket string) (billy.Filesystem, error) {
 		bucket:    bucket,
 		root:      "",
 		separator: DefaultSeparator,
+		temps:     make(map[string]*tempBuffer),
 	}, nil
 }
 

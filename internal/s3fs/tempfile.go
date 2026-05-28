@@ -10,14 +10,13 @@ import (
 	"github.com/go-git/go-billy/v6"
 )
 
-// TempFile creates a uniquely named, write-only file under dir whose name
-// begins with prefix. The object is uploaded to S3 when the returned file is
-// closed; until then nothing exists in the bucket. The caller is responsible
-// for renaming or removing it.
-//
-// Note: the returned file is write-only. S3 has no read-while-write temp file,
-// so callers that reopen the temp path for reading before Close (e.g. go-git's
-// streaming PackWriter) are not supported; use the loose-object path instead.
+// TempFile creates a uniquely named file under dir whose name begins with
+// prefix and returns a write handle to it. The bytes live in an in-memory
+// buffer registered against the filesystem; a subsequent Open of the same
+// path returns a reader over that same buffer (needed by go-git's streaming
+// PackWriter, which reads the temp pack back as it is written). The buffer
+// is uploaded to S3 only when the caller renames the path to its final
+// location; Remove discards it.
 func (fs3 *S3FS) TempFile(dir, prefix string) (billy.File, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -25,5 +24,7 @@ func (fs3 *S3FS) TempFile(dir, prefix string) (billy.File, error) {
 	}
 
 	name := fs3.Join(dir, prefix+hex.EncodeToString(b[:]))
-	return newS3WriteFile(fs3.client, fs3.bucket, fs3.key(name), name)
+	buf := &tempBuffer{}
+	fs3.registerTemp(name, buf)
+	return &tempWriteFile{buf: buf, name: name}, nil
 }

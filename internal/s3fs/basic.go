@@ -3,6 +3,7 @@
 package s3fs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -66,6 +68,13 @@ func (fs3 *S3FS) OpenFile(filename string, flag int, perm os.FileMode) (billy.Fi
 			return newS3DirFile(key, fs3.bucket, fs3.client), nil
 		}
 
+		// A TempFile that has not yet been renamed lives only in memory; serve
+		// reads from that buffer so go-git's PackWriter can read the pack back
+		// while it is still being written.
+		if buf, ok := fs3.lookupTemp(filename); ok {
+			return &tempReadFile{buf: buf, name: filename}, nil
+		}
+
 		f, err := newS3ReadFile(fs3.client, fs3.bucket, key, filename)
 		if err == nil {
 			return f, nil
@@ -118,6 +127,12 @@ func (fs3 *S3FS) Stat(filename string) (os.FileInfo, error) {
 		return newDirInfo("/"), nil
 	}
 
+	// A still-open TempFile lives only in memory; report its current size so
+	// callers that Stat the temp path before Rename see a consistent view.
+	if buf, ok := fs3.lookupTemp(filename); ok {
+		return newFileInfo(path.Base(filename), buf.size(), time.Now()), nil
+	}
+
 	ctx := context.TODO()
 
 	head, err := fs3.client.HeadObject(ctx, &s3.HeadObjectInput{
@@ -160,14 +175,29 @@ func (fs3 *S3FS) Stat(filename string) (os.FileInfo, error) {
 	return nil, &os.PathError{Op: "stat", Path: filename, Err: fs.ErrNotExist}
 }
 
-// Rename renames (moves) oldpath to newpath. If newpath already exists and
-// is not a directory, Rename replaces it. OS-specific restrictions may
-// apply when oldpath and newpath are in different directories.
+// Rename renames (moves) oldpath to newpath. If oldpath refers to an
+// in-memory TempFile, its buffer is uploaded to S3 under newpath and the
+// registry entry is dropped — this is how PackWriter's "tmp_pack_… →
+// pack-<sha>.pack" promotion lands the final pack in the bucket. Otherwise
+// Rename uses Tigris's in-place RenameObject extension.
 func (fs3 *S3FS) Rename(oldpath, newpath string) error {
 	ctx := context.TODO() // TODO: Get user-supplied context?
 
 	src := fs3.key(oldpath)
 	dst := fs3.key(newpath)
+
+	if buf, ok := fs3.detachTemp(oldpath); ok {
+		data := buf.snapshot()
+		_, err := fs3.client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: &fs3.bucket,
+			Key:    &dst,
+			Body:   bytes.NewReader(data),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to upload temp %q to %q: %w", oldpath, newpath, err)
+		}
+		return nil
+	}
 
 	// RenameObject is a Tigris extension that renames in place (no data copy),
 	// so we don't need a separate CopyObject + DeleteObject. CopySource is
@@ -185,12 +215,13 @@ func (fs3 *S3FS) Rename(oldpath, newpath string) error {
 	return nil
 }
 
-// Remove removes the named file or directory.
+// Remove removes the named file or directory. In-memory TempFile entries are
+// dropped from the registry without an S3 call.
 func (fs3 *S3FS) Remove(filename string) error {
-	// TODO: Validate the path?
-	// ...
+	if _, ok := fs3.detachTemp(filename); ok {
+		return nil
+	}
 
-	// Create a context
 	ctx := context.TODO() // TODO: Get user-supplied context?
 
 	key := fs3.key(filename)

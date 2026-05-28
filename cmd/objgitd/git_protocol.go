@@ -26,6 +26,22 @@ import (
 // It is cleared once the (possibly long) transfer begins.
 const handshakeTimeout = 30 * time.Second
 
+// streamingStorer wraps a storage.Storer to hide its optional
+// storer.PackfileWriter capability. go-git's UpdateObjectStorage drains the
+// incoming pack into PackfileWriter via io.CopyBuffer, which only returns on
+// io.EOF — fine over HTTP (the request body has a natural EOF) but a deadlock
+// over git://, where the client holds the connection open waiting for the
+// server's report-status. With PackfileWriter hidden, UpdateObjectStorage
+// falls through to Parser.Parse, which knows the end of the pack from the
+// pack format itself and never waits for an EOF.
+//
+// Trade-off: Parser.Parse writes loose objects (one Rename → one S3 PUT each)
+// instead of one packfile, so large git:// pushes incur more S3 calls. HTTP
+// keeps the fast PackfileWriter path.
+type streamingStorer struct {
+	storage.Storer
+}
+
 // daemon serves the git:// (TCP) protocol out of a billy filesystem.
 type daemon struct {
 	fs        billy.Filesystem
@@ -119,7 +135,7 @@ func (d *daemon) handle(ctx context.Context, conn net.Conn) error {
 			_, _ = pktline.WriteError(conn, fmt.Errorf("cannot open repository %q", req.Pathname))
 			return fmt.Errorf("opening %q for push: %w", req.Pathname, err)
 		}
-		return transport.ReceivePack(ctx, st, r, conn, &transport.ReceivePackRequest{
+		return transport.ReceivePack(ctx, streamingStorer{Storer: st}, r, conn, &transport.ReceivePackRequest{
 			GitProtocol: gitProtocol,
 		})
 
