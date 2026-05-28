@@ -54,19 +54,19 @@ func (fs3 *S3FS) OpenFile(filename string, flag int, perm os.FileMode) (billy.Fi
 		return nil, errors.New("unsupported open flag")
 	}
 
-	// Get the file path
-	p := path.Join(fs3.root, filename)
+	// Canonical S3 key for this path. Every branch uses it so reads and
+	// writes resolve to the same object regardless of chroot depth.
+	key := fs3.key(filename)
 
 	switch flag & SupportedOFlags {
 	case O_RDONLY:
 		// The bucket root is always a directory; short-circuit so WASI
 		// preopens (which OpenFile(".", O_RDONLY)) don't issue an S3 call.
-		key := strings.TrimPrefix(fs3.cleanPath(filename), "/")
 		if key == "" || key == "." {
-			return newS3DirFile(p, fs3.bucket, fs3.client), nil
+			return newS3DirFile(key, fs3.bucket, fs3.client), nil
 		}
 
-		f, err := newS3ReadFile(fs3.client, fs3.bucket, p)
+		f, err := newS3ReadFile(fs3.client, fs3.bucket, key, filename)
 		if err == nil {
 			return f, nil
 		}
@@ -96,15 +96,15 @@ func (fs3 *S3FS) OpenFile(filename string, flag int, perm os.FileMode) (billy.Fi
 			return nil, lerr
 		}
 		if len(list.Contents) > 0 || len(list.CommonPrefixes) > 0 {
-			return newS3DirFile(p, fs3.bucket, fs3.client), nil
+			return newS3DirFile(key, fs3.bucket, fs3.client), nil
 		}
 		return nil, &os.PathError{Op: "open", Path: filename, Err: fs.ErrNotExist}
 
 	case O_WRONLY:
-		return newS3WriteFile(fs3.client, fs3.bucket, p)
+		return newS3WriteFile(fs3.client, fs3.bucket, key, filename)
 
 	case O_WRMULTIPART:
-		return newS3MultipartUploadFile(fs3.client, fs3.bucket, p)
+		return newS3MultipartUploadFile(fs3.client, fs3.bucket, key, filename)
 
 	default:
 		return nil, errors.New("unsupported open flag")
@@ -164,33 +164,22 @@ func (fs3 *S3FS) Stat(filename string) (os.FileInfo, error) {
 // is not a directory, Rename replaces it. OS-specific restrictions may
 // apply when oldpath and newpath are in different directories.
 func (fs3 *S3FS) Rename(oldpath, newpath string) error {
-	// TODO: Validate the paths?
-
-	// Create a context
 	ctx := context.TODO() // TODO: Get user-supplied context?
 
-	// Format the paths
-	src := path.Join(fs3.root, oldpath)
-	dst := path.Join(fs3.root, newpath)
+	src := fs3.key(oldpath)
+	dst := fs3.key(newpath)
 
-	// Send the copy request
-	_, err := fs3.client.CopyObject(ctx, &s3.CopyObjectInput{
+	// RenameObject is a Tigris extension that renames in place (no data copy),
+	// so we don't need a separate CopyObject + DeleteObject. CopySource is
+	// bucket-qualified; Key is the destination key.
+	copySource := fs3.bucket + "/" + src
+	_, err := fs3.client.RenameObject(ctx, &s3.CopyObjectInput{
 		Bucket:     &fs3.bucket,
-		CopySource: &src,
+		CopySource: &copySource,
 		Key:        &dst,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to rename file: %s", err)
-	}
-
-	// Delete the old file
-	// TODO: Parse the response?
-	_, err = fs3.client.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: &fs3.bucket,
-		Key:    &src,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to remove file: %s", err)
+		return fmt.Errorf("failed to rename %q to %q: %w", oldpath, newpath, err)
 	}
 
 	return nil
@@ -204,17 +193,16 @@ func (fs3 *S3FS) Remove(filename string) error {
 	// Create a context
 	ctx := context.TODO() // TODO: Get user-supplied context?
 
-	// Format the path
-	p := path.Join(fs3.root, filename)
+	key := fs3.key(filename)
 
 	// Send the request
 	// TODO: Parse the response?
 	_, err := fs3.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: &fs3.bucket,
-		Key:    &p,
+		Key:    &key,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to remove file: %s", err)
+		return fmt.Errorf("failed to remove file: %w", err)
 	}
 	return nil
 }

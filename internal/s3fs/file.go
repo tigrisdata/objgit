@@ -37,13 +37,15 @@ type s3ReadFile struct {
 	client *storage.Client      // S3 SDK client
 	bucket string               // S3 bucket name
 	key    string               // File object's key in S3
+	name   string               // Root-relative path as presented to Open
 	closed bool                 // Is the file closed?
 	reader *bytes.Reader        // Buffer for file contents
 	head   *s3.HeadObjectOutput // File metadata from S3
 }
 
-// newS3ReadFile creates a new s3ReadFile.
-func newS3ReadFile(client *storage.Client, bucket, key string) (*s3ReadFile, error) {
+// newS3ReadFile creates a new s3ReadFile. key is the full S3 object key; name
+// is the root-relative path the caller passed to Open (returned by Name).
+func newS3ReadFile(client *storage.Client, bucket, key, name string) (*s3ReadFile, error) {
 	// Create the context
 	ctx := context.TODO() // TODO: How can user-supplied contexts be supported?
 
@@ -76,6 +78,7 @@ func newS3ReadFile(client *storage.Client, bucket, key string) (*s3ReadFile, err
 		client: client,
 		bucket: bucket,
 		key:    key,
+		name:   name,
 		reader: reader,
 		head:   ho,
 	}, nil
@@ -83,7 +86,7 @@ func newS3ReadFile(client *storage.Client, bucket, key string) (*s3ReadFile, err
 
 // Name returns the name of the file as presented to Open.
 func (f *s3ReadFile) Name() string {
-	return f.key
+	return f.name
 }
 
 // Write implements io.Writer for billy.File
@@ -159,26 +162,26 @@ type s3WriteFile struct {
 	client *storage.Client // s3 skd client
 	bucket string          // S3 bucket name
 	key    string          // File object's key in S3
+	name   string          // Root-relative path as presented to Open
 	closed bool            // Is the file closed?
 	buf    *bytes.Buffer   // Buffer for storing the file before it's uploaded
 }
 
-// newS3WriteFile creates a new s3ReadFile.
-func newS3WriteFile(client *storage.Client, bucket, key string) (*s3WriteFile, error) {
-	// TODO: Validate the key
-	// ...
-
+// newS3WriteFile creates a new s3WriteFile. key is the full S3 object key; name
+// is the root-relative path the caller passed to Open (returned by Name).
+func newS3WriteFile(client *storage.Client, bucket, key, name string) (*s3WriteFile, error) {
 	return &s3WriteFile{
 		client: client,
 		bucket: bucket,
 		key:    key,
+		name:   name,
 		buf:    bytes.NewBuffer(nil),
 	}, nil
 }
 
 // Name returns the name of the file as presented to Open.
 func (f *s3WriteFile) Name() string {
-	return f.key
+	return f.name
 }
 
 // Write implements os.Writer for billy.File
@@ -205,7 +208,7 @@ func (f *s3WriteFile) ReadAt(p []byte, off int64) (n int, err error) {
 
 // Seek implements io.Seeker for billy.File
 func (f *s3WriteFile) Seek(offset int64, whence int) (int64, error) {
-	return 0, ErrNotImplemented
+	return 0, &os.PathError{Op: "seek", Path: f.key, Err: ErrNotImplemented}
 }
 
 // Close implements io.Closer for billy.File
@@ -262,13 +265,15 @@ type s3MultipartUploadFile struct {
 	client   *storage.Client // s3 skd client
 	bucket   string          // S3 bucket name
 	key      string          // File object's key in S3
+	name     string          // Root-relative path as presented to Open
 	closed   bool            // Is the file closed?
 	uploadID string          // S3 multipart upload ID
 	uploadN  *atomic.Int32   // Counter tracking the number of uploads
 }
 
-// newS3MultipartUploadFile creates a new s3ReadFile.
-func newS3MultipartUploadFile(client *storage.Client, bucket, key string) (*s3MultipartUploadFile, error) {
+// newS3MultipartUploadFile creates a new s3MultipartUploadFile. key is the full
+// S3 object key; name is the root-relative path passed to Open.
+func newS3MultipartUploadFile(client *storage.Client, bucket, key, name string) (*s3MultipartUploadFile, error) {
 	// TODO: Check if the file exists
 	// ...
 
@@ -289,13 +294,14 @@ func newS3MultipartUploadFile(client *storage.Client, bucket, key string) (*s3Mu
 		client:   client,
 		bucket:   bucket,
 		key:      key,
+		name:     name,
 		uploadID: *res.UploadId,
 		uploadN:  atomic.NewInt32(1),
 	}, nil
 }
 
 // Name returns the name of the file as presented to Open.
-func (f *s3MultipartUploadFile) Name() string { return f.key }
+func (f *s3MultipartUploadFile) Name() string { return f.name }
 
 // Write implements os.Writer for billy.File
 func (f *s3MultipartUploadFile) Write(p []byte) (n int, err error) {
@@ -346,7 +352,7 @@ func (f *s3MultipartUploadFile) ReadAt(p []byte, off int64) (n int, err error) {
 
 // Seek implements io.Seeker for billy.File
 func (f *s3MultipartUploadFile) Seek(offset int64, whence int) (int64, error) {
-	return 0, errors.New("seek not implemented")
+	return 0, &os.PathError{Op: "seek", Path: f.key, Err: ErrNotImplemented}
 }
 
 // Close implements io.Closer for billy.File

@@ -3,6 +3,7 @@ package s3fs
 import (
 	"fmt"
 	"path"
+	"strings"
 
 	"github.com/go-git/go-billy/v6"
 	"github.com/tigrisdata/storage-go"
@@ -50,4 +51,12 @@ func (fs3 *S3FS) cleanPath(p ...string) string {
 
 	// Return the full path
 	return path.Clean(f)
+}
+
+// key turns a root-relative billy path into the canonical S3 object key:
+// root-joined, cleaned, and stripped of the leading slash that S3 keys never
+// carry. All S3 operations must funnel through here so reads and writes agree
+// on the same key regardless of chroot depth.
+func (fs3 *S3FS) key(name string) string {
+	return strings.TrimPrefix(fs3.cleanPath(name), "/")
 }

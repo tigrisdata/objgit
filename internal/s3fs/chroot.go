@@ -14,11 +14,15 @@ func (fs3 *S3FS) Chroot(path string) (billy.Filesystem, error) {
 	// Calculate the new root
 	p := fs3.Join(fs3.root, path)
 
-	// Create the new S3FS with the new root directory
+	// Create the new S3FS with the new root directory. The separator must be
+	// carried over; without it ListObjectsV2 runs with an empty delimiter and
+	// ReadDir flattens the tree, breaking directory-structured reads (e.g. git
+	// ref enumeration under refs/).
 	nfs := &S3FS{
-		client: fs3.client,
-		bucket: fs3.bucket,
-		root:   p,
+		client:    fs3.client,
+		bucket:    fs3.bucket,
+		root:      p,
+		separator: fs3.separator,
 	}
 	return nfs, nil
 }

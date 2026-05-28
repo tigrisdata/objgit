@@ -2,16 +2,28 @@
 
 package s3fs
 
-import "github.com/go-git/go-billy/v6"
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 
-// TempFile creates a new temporary file in the directory dir with a name
-// beginning with prefix, opens the file for reading and writing, and
-// returns the resulting *os.File. If dir is the empty string, TempFile
-// uses the default directory for temporary files (see os.TempDir).
-// Multiple programs calling TempFile simultaneously will not choose the
-// same file. The caller can use f.Name() to find the pathname of the file.
-// It is the caller's responsibility to remove the file when no longer
-// needed.
+	"github.com/go-git/go-billy/v6"
+)
+
+// TempFile creates a uniquely named, write-only file under dir whose name
+// begins with prefix. The object is uploaded to S3 when the returned file is
+// closed; until then nothing exists in the bucket. The caller is responsible
+// for renaming or removing it.
+//
+// Note: the returned file is write-only. S3 has no read-while-write temp file,
+// so callers that reopen the temp path for reading before Close (e.g. go-git's
+// streaming PackWriter) are not supported; use the loose-object path instead.
 func (fs3 *S3FS) TempFile(dir, prefix string) (billy.File, error) {
-	return nil, nil
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return nil, fmt.Errorf("s3fs: generating temp file name: %w", err)
+	}
+
+	name := fs3.Join(dir, prefix+hex.EncodeToString(b[:]))
+	return newS3WriteFile(fs3.client, fs3.bucket, fs3.key(name), name)
 }

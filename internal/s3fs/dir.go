@@ -3,8 +3,8 @@
 package s3fs
 
 import (
+	"bytes"
 	"context"
-	"errors"
 	"io/fs"
 	"os"
 	pathpkg "path"
@@ -80,5 +80,11 @@ func (fs3 *S3FS) ReadDir(dir string) ([]fs.DirEntry, error) {
 // perm are used for all directories that MkdirAll creates. If path is/
 // already a directory, MkdirAll does nothing and returns nil.
 func (fs3 *S3FS) MkdirAll(filename string, perm os.FileMode) error {
-	return errors.New("not implemented")
+	_, err := fs3.client.PutObject(context.TODO(), &s3.PutObjectInput{
+		Bucket: new(fs3.bucket),
+		Key:    new(filename),
+		Body:   bytes.NewBuffer(nil),
+	})
+
+	return err
 }
