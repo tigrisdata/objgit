@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
 	"github.com/go-git/go-billy/v6"
@@ -110,10 +109,10 @@ func (fs3 *S3FS) OpenFile(filename string, flag int, perm os.FileMode) (billy.Fi
 		return nil, &os.PathError{Op: "open", Path: filename, Err: fs.ErrNotExist}
 
 	case O_WRONLY:
-		return newS3WriteFile(fs3.client, fs3.bucket, key, filename)
+		return newS3WriteFile(fs3.client, fs3.bucket, key, filename, fs3.unixMeta)
 
 	case O_WRMULTIPART:
-		return newS3MultipartUploadFile(fs3.client, fs3.bucket, key, filename)
+		return newS3MultipartUploadFile(fs3.client, fs3.bucket, key, filename, fs3.unixMeta)
 
 	default:
 		return nil, errors.New("unsupported open flag")
@@ -140,11 +139,7 @@ func (fs3 *S3FS) Stat(filename string) (os.FileInfo, error) {
 		Key:    &key,
 	})
 	if err == nil {
-		return newFileInfo(
-			path.Base(key),
-			aws.ToInt64(head.ContentLength),
-			aws.ToTime(head.LastModified),
-		), nil
+		return newFileInfoFromHead(path.Base(key), head, fs3.unixMeta), nil
 	}
 
 	var apiErr smithy.APIError

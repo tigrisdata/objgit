@@ -23,6 +23,7 @@ func (fs3 *S3FS) Chroot(path string) (billy.Filesystem, error) {
 		bucket:    fs3.bucket,
 		root:      p,
 		separator: fs3.separator,
+		unixMeta:  fs3.unixMeta,
 		temps:     make(map[string]*tempBuffer),
 	}
 	return nfs, nil

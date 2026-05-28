@@ -2,6 +2,7 @@ package s3fs
 
 import (
 	"fmt"
+	"os"
 	"path"
 	"strings"
 	"sync"
@@ -14,11 +15,20 @@ const (
 	DefaultSeparator = "/"
 )
 
+// unixMetaConfig holds the session defaults used when the optional Unix-metadata
+// feature is enabled. A nil *unixMetaConfig means the feature is off and the
+// filesystem behaves as if no POSIX attributes exist.
+type unixMetaConfig struct {
+	uid, gid uint32
+	umask    os.FileMode
+}
+
 type S3FS struct {
 	client    *storage.Client
 	bucket    string
 	root      string
 	separator string
+	unixMeta  *unixMetaConfig
 
 	// temps holds TempFile-backed buffers keyed by canonical S3 key, so a
 	// subsequent Open of the same path returns a reader over the same bytes
@@ -27,19 +37,37 @@ type S3FS struct {
 	temps  map[string]*tempBuffer
 }
 
+// Option configures an S3FS at construction time.
+type Option func(*S3FS)
+
+// WithUnixMetadata enables storing and reading POSIX file attributes as S3 user
+// metadata (see the unixmeta package). uid and gid are the numeric owner/group
+// recorded on newly written objects; callers resolve any names to numbers
+// themselves. umask is applied to the default mode (0666 for files) when
+// writing. Without this option the filesystem stores no attributes.
+func WithUnixMetadata(uid, gid uint32, umask os.FileMode) Option {
+	return func(fs3 *S3FS) {
+		fs3.unixMeta = &unixMetaConfig{uid: uid, gid: gid, umask: umask}
+	}
+}
+
 // NewS3FS creates a new S3FS Filesystem.
-func NewS3FS(client *storage.Client, bucket string) (billy.Filesystem, error) {
+func NewS3FS(client *storage.Client, bucket string, opts ...Option) (billy.Filesystem, error) {
 	// Check for a non-nil client
 	if client == nil {
 		return nil, fmt.Errorf("s3 client cannot be nil")
 	}
-	return &S3FS{
+	fs3 := &S3FS{
 		client:    client,
 		bucket:    bucket,
 		root:      "",
 		separator: DefaultSeparator,
 		temps:     make(map[string]*tempBuffer),
-	}, nil
+	}
+	for _, opt := range opts {
+		opt(fs3)
+	}
+	return fs3, nil
 }
 
 // Capabilities returns the filesystem capabilities.
