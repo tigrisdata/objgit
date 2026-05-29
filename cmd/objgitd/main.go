@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/facebookgo/flagenv"
+	"github.com/gliderlabs/ssh"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/tigrisdata/storage-go"
 	"golang.org/x/sync/errgroup"
@@ -27,6 +28,7 @@ import (
 var (
 	gitBind   = flag.String("git-bind", ":9418", "TCP address to listen on for the git:// protocol; empty disables it")
 	httpBind  = flag.String("http-bind", ":8080", "TCP address to listen on for the git smart-HTTP protocol; empty disables it")
+	sshBind   = flag.String("ssh-bind", "", "TCP address to listen on for the git-over-SSH protocol; empty disables it")
 	bucket    = flag.String("bucket", "", "Tigris bucket that holds the git repositories")
 	allowPush = flag.Bool("allow-push", false, "allow unauthenticated git-receive-pack (push) requests")
 	slogLevel = flag.String("slog-level", "INFO", "log level (DEBUG, INFO, WARN, ERROR)")
@@ -51,8 +53,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *gitBind == "" && *httpBind == "" {
-		slog.Error("at least one of -git-bind or -http-bind must be set")
+	if *gitBind == "" && *httpBind == "" && *sshBind == "" {
+		slog.Error("at least one of -git-bind, -http-bind, or -ssh-bind must be set")
 		os.Exit(1)
 	}
 
@@ -82,6 +84,7 @@ func main() {
 	slog.Info("objgitd listening",
 		"git_bind", *gitBind,
 		"http_bind", *httpBind,
+		"ssh_bind", *sshBind,
 		"bucket", *bucket,
 		"allow_push", *allowPush,
 		"allow_hooks", *allowHooks,
@@ -107,6 +110,26 @@ func main() {
 		srv := &http.Server{Handler: d}
 		g.Go(func() error {
 			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return err
+			}
+			return nil
+		})
+		g.Go(func() error {
+			<-gCtx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			return srv.Shutdown(shutdownCtx)
+		})
+	}
+
+	if *sshBind != "" {
+		srv, err := newSSHServer(d, *sshBind)
+		if err != nil {
+			slog.Error("can't create ssh server", "ssh_bind", *sshBind, "err", err)
+			os.Exit(1)
+		}
+		g.Go(func() error {
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, ssh.ErrServerClosed) {
 				return err
 			}
 			return nil
