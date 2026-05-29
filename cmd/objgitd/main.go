@@ -8,8 +8,10 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -105,8 +107,14 @@ func main() {
 			slog.Error("can't listen", "metrics_bind", *metricsBind, "err", err)
 			os.Exit(1)
 		}
+		runtime.SetBlockProfileRate(100)
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.Handler())
+		mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+		mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
 		srv := &http.Server{Handler: mux}
 		g.Go(func() error {
 			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
