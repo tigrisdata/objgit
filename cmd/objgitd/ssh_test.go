@@ -6,7 +6,59 @@ import (
 	"testing"
 
 	"github.com/go-git/go-billy/v6/memfs"
+	"github.com/go-git/go-git/v6/plumbing/transport"
 )
+
+func TestGitServiceFor(t *testing.T) {
+	tt := []struct {
+		name    string
+		command string
+		service string
+		ok      bool
+	}{
+		{
+			name:    "upload-pack",
+			command: "git-upload-pack",
+			service: transport.UploadPackService,
+			ok:      true,
+		},
+		{
+			name:    "upload-archive",
+			command: "git-upload-archive",
+			service: transport.UploadArchiveService,
+			ok:      true,
+		},
+		{
+			name:    "receive-pack",
+			command: "git-receive-pack",
+			service: transport.ReceivePackService,
+			ok:      true,
+		},
+		{
+			name:    "git-shell is unsupported",
+			command: "git-shell",
+			service: "",
+			ok:      false,
+		},
+		{
+			name:    "empty string is unsupported",
+			command: "",
+			service: "",
+			ok:      false,
+		},
+	}
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := gitServiceFor(tc.command)
+			if ok != tc.ok {
+				t.Errorf("gitServiceFor(%q) ok=%v, want %v", tc.command, ok, tc.ok)
+			}
+			if got != tc.service {
+				t.Errorf("gitServiceFor(%q) service=%q, want %q", tc.command, got, tc.service)
+			}
+		})
+	}
+}
 
 func TestLoadOrCreateHostKey(t *testing.T) {
 	fs := memfs.New()
