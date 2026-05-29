@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-git/go-billy/v6"
@@ -47,6 +48,12 @@ type daemon struct {
 	fs        billy.Filesystem
 	loader    transport.Loader
 	allowPush bool
+
+	// allowHooks gates running .objgit/hooks/receive-pack after a push.
+	allowHooks  bool
+	hookTimeout time.Duration
+	// hookWG tracks in-flight async hooks so shutdown can drain them.
+	hookWG sync.WaitGroup
 }
 
 // Serve accepts connections on l until ctx is cancelled or Accept fails.
@@ -135,7 +142,7 @@ func (d *daemon) handle(ctx context.Context, conn net.Conn) error {
 			_, _ = pktline.WriteError(conn, fmt.Errorf("cannot open repository %q", req.Pathname))
 			return fmt.Errorf("opening %q for push: %w", req.Pathname, err)
 		}
-		return transport.ReceivePack(ctx, streamingStorer{Storer: st}, r, conn, &transport.ReceivePackRequest{
+		return d.receivePack(ctx, streamingStorer{Storer: st}, st, req.Pathname, r, conn, &transport.ReceivePackRequest{
 			GitProtocol: gitProtocol,
 		})
 

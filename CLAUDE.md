@@ -42,6 +42,30 @@ go test -run TestSmartHTTP ./cmd/objgitd/...
 
 2. **No-op closers everywhere.** `transport.UploadPack`/`ReceivePack` call `Close` on the reader (and sometimes the writer) between negotiation rounds. The git:// socket can't survive that, and the HTTP `ResponseWriter` doesn't implement `Close`. Wrap with `io.NopCloser` (reader) and `ioutil.WriteNopCloser` from `go-git/v6/utils/ioutil` (writer).
 
+### Push hooks (`hooks.go`, sandboxed via kefka)
+
+When `-allow-hooks` is set, a successful `receive-pack` runs the repository's
+`.objgit/hooks/receive-pack` script. Because `transport.ReceivePack` does not
+report which refs it changed, `receivePack` (the wrapper both transports call
+instead of `transport.ReceivePack` directly) snapshots branch refs before and
+after and diffs them (`snapshotRefs`/`diffRefs`). For each created/updated
+branch it spawns an **async** goroutine (tracked by `daemon.hookWG`, drained on
+shutdown) — hooks run after the client already has its response and **cannot
+reject a push**. Deleted branches are skipped.
+
+The script is read from the pushed commit's tree, so a branch carries its own
+hook. It runs in a **kefka** virtual shell (`tangled.org/xeiaso.net/kefka`),
+which is *not* an OS sandbox: it is an `mvdan.cc/sh` interpreter wired to a
+`billy.Filesystem` plus a fixed registry of commands (coreutils only here). The
+sandbox filesystem is an `internal/mountfs` composite of `/src` (a lazy
+read-only `internal/treefs` view of the commit tree — blobs fetched on open, no
+checkout to disk) and `/tmp` (a writable `memfs` for scratch; `HOME`/`TMPDIR`
+point here). Writing anywhere but `/tmp` fails — and a redirect into `/src`
+aborts the script. Hook stdout/stderr and exit status are logged via `slog`
+only, never relayed to the pusher. `internal/kefkash` vendors kefka's
+unexported `billysh` handler wiring (its `OpenHandler` is adapted to permit
+writes so `/tmp` redirections work; the filesystem enforces read-only `/src`).
+
 ### `internal/s3fs` — billy.Filesystem on Tigris
 
 Vendored from Austin Poor's s3fs and adapted to **billy v6** and the Tigris `storage-go` client. Treats an S3 bucket as a filesystem so go-git's `filesystem.NewStorage` can store loose objects and packs against it.

@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+#
+# Example objgitd receive-pack hook.
+#
+# objgitd runs this script after a successful push when started with
+# -allow-hooks. It does NOT run on a normal `git` server — it only has meaning
+# when this repository is served by objgitd.
+#
+# Execution environment (see CLAUDE.md "Push hooks"):
+#   * It runs in a kefka virtual shell, NOT a real OS shell. Only kefka's
+#     built-in commands are available (coreutils: cat, ls, echo, printf, head,
+#     tail, cut, sort, uniq, wc, sha256sum, grep, ...). There is no PATH to
+#     system binaries, no network, and no `git`.
+#   * /src is a READ-ONLY checkout of the pushed commit. The working directory
+#     starts here.
+#   * /tmp is the only writable location (also $HOME and $TMPDIR). Writing
+#     anywhere else fails; a redirect into /src aborts the script.
+#   * The hook runs asynchronously after the push response, so it cannot reject
+#     a push. Its stdout/stderr and exit status are written to the server log
+#     only — the person pushing never sees them.
+#   * One run happens per created or updated branch. Branch deletions are
+#     skipped.
+#
+# These variables describe the ref that triggered this run:
+#   OBJGIT_REPO      repository path, e.g. /myproject.git
+#   OBJGIT_SERVICE   always "receive-pack"
+#   OBJGIT_REF       full ref name, e.g. refs/heads/main
+#   OBJGIT_BRANCH    short branch name, e.g. main
+#   OBJGIT_OLD_SHA   previous tip (all zeros when the branch was created)
+#   OBJGIT_NEW_SHA   new tip
+# git's usual "<old> <new> <ref>" line is also fed on stdin.
+
+echo "push to ${OBJGIT_REPO} ${OBJGIT_REF}: ${OBJGIT_OLD_SHA} -> ${OBJGIT_NEW_SHA}"
+
+# /src is the checkout of the new commit. List what landed at the top level.
+echo "top-level contents:"
+ls /src
+
+# Read a file out of the push and act on it.
+if [ -f /src/go.mod ]; then
+	module="$(head -n 1 /src/go.mod | cut -d' ' -f2)"
+	echo "go module: ${module}"
+fi
+
+# Scratch work goes in /tmp. Here we record a tiny build manifest.
+manifest=/tmp/manifest.txt
+echo "ref ${OBJGIT_REF}" > "${manifest}"
+echo "sha ${OBJGIT_NEW_SHA}" >> "${manifest}"
+echo "manifest (${manifest}):"
+cat "${manifest}"
+
+echo "hook done"

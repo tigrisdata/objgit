@@ -29,6 +29,9 @@ var (
 	bucket    = flag.String("bucket", "", "Tigris bucket that holds the git repositories")
 	allowPush = flag.Bool("allow-push", false, "allow unauthenticated git-receive-pack (push) requests")
 	slogLevel = flag.String("slog-level", "INFO", "log level (DEBUG, INFO, WARN, ERROR)")
+
+	allowHooks  = flag.Bool("allow-hooks", false, "run .objgit/hooks/receive-pack in a sandbox after a successful push")
+	hookTimeout = flag.Duration("hook-timeout", 60*time.Second, "wall-clock limit for a single hook run")
 )
 
 func main() {
@@ -68,9 +71,11 @@ func main() {
 	}
 
 	d := &daemon{
-		fs:        fsys,
-		loader:    transport.NewFilesystemLoader(fsys, false),
-		allowPush: *allowPush,
+		fs:          fsys,
+		loader:      transport.NewFilesystemLoader(fsys, false),
+		allowPush:   *allowPush,
+		allowHooks:  *allowHooks,
+		hookTimeout: *hookTimeout,
 	}
 
 	slog.Info("objgitd listening",
@@ -78,6 +83,7 @@ func main() {
 		"http_bind", *httpBind,
 		"bucket", *bucket,
 		"allow_push", *allowPush,
+		"allow_hooks", *allowHooks,
 	)
 
 	g, gCtx := errgroup.WithContext(ctx)
@@ -112,7 +118,18 @@ func main() {
 		})
 	}
 
-	if err := g.Wait(); err != nil {
+	err = g.Wait()
+
+	// Let in-flight async hooks finish before exiting, but don't hang forever.
+	drained := make(chan struct{})
+	go func() { d.hookWG.Wait(); close(drained) }()
+	select {
+	case <-drained:
+	case <-time.After(10 * time.Second):
+		slog.Warn("shutdown: gave up waiting for in-flight hooks")
+	}
+
+	if err != nil {
 		slog.Error("server stopped", "err", err)
 		os.Exit(1)
 	}
