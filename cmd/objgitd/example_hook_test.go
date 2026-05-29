@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-git/go-billy/v6/memfs"
 	"github.com/go-git/go-git/v6/plumbing/transport"
+	"tangled.org/xeiaso.net/objgit/internal/auth"
 )
 
 // TestExampleHookRuns pushes the repository's own example hook
@@ -38,6 +39,7 @@ func TestExampleHookRuns(t *testing.T) {
 	d := &daemon{
 		fs:          fs,
 		loader:      transport.NewFilesystemLoader(fs, false),
+		authz:       auth.AllowAnonymous{AllowWrite: true},
 		allowPush:   true,
 		allowHooks:  true,
 		hookTimeout: 30 * time.Second,

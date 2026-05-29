@@ -18,6 +18,7 @@ import (
 	"github.com/tigrisdata/storage-go"
 	"golang.org/x/sync/errgroup"
 	"tangled.org/xeiaso.net/objgit/internal"
+	"tangled.org/xeiaso.net/objgit/internal/auth"
 	"tangled.org/xeiaso.net/objgit/internal/s3fs"
 
 	_ "github.com/joho/godotenv/autoload"
@@ -73,6 +74,7 @@ func main() {
 	d := &daemon{
 		fs:          fsys,
 		loader:      transport.NewFilesystemLoader(fsys, false),
+		authz:       auth.AllowAnonymous{AllowWrite: *allowPush},
 		allowPush:   *allowPush,
 		allowHooks:  *allowHooks,
 		hookTimeout: *hookTimeout,

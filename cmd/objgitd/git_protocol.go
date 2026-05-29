@@ -21,6 +21,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/storage"
 	"github.com/go-git/go-git/v6/storage/filesystem"
+	"tangled.org/xeiaso.net/objgit/internal/auth"
 )
 
 // handshakeTimeout bounds how long a client has to send its git-proto-request.
@@ -43,10 +44,20 @@ type streamingStorer struct {
 	storage.Storer
 }
 
+// operationFor maps a git service to the access it needs: receive-pack writes,
+// everything else (upload-pack, upload-archive) reads.
+func operationFor(service string) auth.Operation {
+	if service == transport.ReceivePackService {
+		return auth.Write
+	}
+	return auth.Read
+}
+
 // daemon serves the git:// (TCP) protocol out of a billy filesystem.
 type daemon struct {
 	fs        billy.Filesystem
 	loader    transport.Loader
+	authz     auth.Authorizer
 	allowPush bool
 
 	// allowHooks gates running .objgit/hooks/receive-pack after a push.
@@ -113,6 +124,16 @@ func (d *daemon) handle(ctx context.Context, conn net.Conn) error {
 	// writer is the raw conn: its final Close() ends the connection.
 	r := io.NopCloser(conn)
 
+	if d.authz.Authorize(ctx, auth.Request{
+		Repo:      req.Pathname,
+		Operation: operationFor(req.RequestCommand),
+		Cred:      auth.Anonymous{},
+		Transport: "git",
+	}) != auth.Allow {
+		_, _ = pktline.WriteError(conn, fmt.Errorf("access denied"))
+		return fmt.Errorf("access denied for %q (%s)", req.Pathname, req.RequestCommand)
+	}
+
 	switch req.RequestCommand {
 	case transport.UploadPackService:
 		st, err := d.loader.Load(&url.URL{Path: req.Pathname})
@@ -133,10 +154,6 @@ func (d *daemon) handle(ctx context.Context, conn net.Conn) error {
 		return transport.UploadArchive(ctx, st, r, conn, &transport.UploadArchiveRequest{})
 
 	case transport.ReceivePackService:
-		if !d.allowPush {
-			_, _ = pktline.WriteError(conn, fmt.Errorf("push is disabled on this server"))
-			return fmt.Errorf("push rejected for %q", req.Pathname)
-		}
 		st, err := d.loadOrInit(req.Pathname)
 		if err != nil {
 			_, _ = pktline.WriteError(conn, fmt.Errorf("cannot open repository %q", req.Pathname))

@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-git/go-billy/v6/memfs"
 	"github.com/go-git/go-git/v6/plumbing/transport"
+	"tangled.org/xeiaso.net/objgit/internal/auth"
 )
 
 // TestDaemonPushCreatesRepo reproduces "git push git://host/new.git" against a
@@ -26,6 +27,7 @@ func TestDaemonPushCreatesRepo(t *testing.T) {
 	d := &daemon{
 		fs:        fs,
 		loader:    transport.NewFilesystemLoader(fs, false),
+		authz:     auth.AllowAnonymous{AllowWrite: true},
 		allowPush: true,
 	}
 
@@ -83,6 +85,7 @@ func TestDaemonPushDisabled(t *testing.T) {
 	d := &daemon{
 		fs:        fs,
 		loader:    transport.NewFilesystemLoader(fs, false),
+		authz:     auth.AllowAnonymous{AllowWrite: false},
 		allowPush: false,
 	}
 
