@@ -96,10 +96,6 @@ func gitServiceFor(command string) (string, bool) {
 	}
 }
 
-// pubKeyContextKey keys the authenticated public key stashed on the SSH context
-// by PublicKeyHandler, for handleSSH to read when authorizing.
-type pubKeyContextKey struct{}
-
 // newSSHServer builds the git-over-SSH server. It accepts every public key at
 // connect time and defers real authorization to handleSSH via daemon.authz.
 func newSSHServer(d *daemon, addr string) (*ssh.Server, error) {
@@ -110,8 +106,9 @@ func newSSHServer(d *daemon, addr string) (*ssh.Server, error) {
 	srv := &ssh.Server{
 		Addr:    addr,
 		Handler: d.handleSSH,
+		// A non-nil handler is required to enable public-key auth at all;
+		// gliderlabs stashes the connecting key for Session.PublicKey().
 		PublicKeyHandler: func(ctx ssh.Context, key ssh.PublicKey) bool {
-			ctx.SetValue(pubKeyContextKey{}, key)
 			return true
 		},
 	}
@@ -124,7 +121,7 @@ func newSSHServer(d *daemon, addr string) (*ssh.Server, error) {
 // command. The session is the protocol stream (reader and writer).
 func (d *daemon) handleSSH(s ssh.Session) {
 	cmd := s.Command()
-	if len(cmd) != 2 {
+	if len(cmd) < 2 {
 		fmt.Fprintln(s.Stderr(), "objgitd: this is a git SSH endpoint; interactive shells are not supported")
 		_ = s.Exit(1)
 		return
@@ -141,7 +138,7 @@ func (d *daemon) handleSSH(s ssh.Session) {
 	repoPath := strings.TrimPrefix(cmd[1], "/")
 
 	var cred auth.Credential = auth.Anonymous{}
-	if key, ok := s.Context().Value(pubKeyContextKey{}).(ssh.PublicKey); ok && key != nil {
+	if key := s.PublicKey(); key != nil {
 		cred = auth.PublicKey{Key: key}
 	}
 	if d.authz.Authorize(s.Context(), auth.Request{
@@ -168,6 +165,8 @@ func (d *daemon) handleSSH(s ssh.Session) {
 	w := ioutil.WriteNopCloser(s)
 	ctx := s.Context()
 
+	// Protocol v2 negotiation (GIT_PROTOCOL via s.Environ()) is intentionally not
+	// forwarded yet; v0/v1 is sufficient. See plan.
 	switch service {
 	case transport.UploadPackService:
 		st, err := d.loader.Load(&url.URL{Path: repoPath})
