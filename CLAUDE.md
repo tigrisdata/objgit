@@ -4,10 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`objgitd` is a single-binary Git server that stores repositories as objects in a Tigris/S3 bucket instead of on a local filesystem. It speaks two transports against the same backend:
+`objgitd` is a single-binary Git server that stores repositories as objects in a Tigris/S3 bucket instead of on a local filesystem. It speaks three transports against the same backend:
 
-- **Smart HTTP** (`-http-bind`, default `:8080`) — primary transport, where auth middleware would wrap.
+- **Smart HTTP** (`-http-bind`, default `:8080`) — primary transport. Carries an HTTP Basic credential into the auth seam.
 - **git://** (`-git-bind`, default `:9418`) — unauthenticated TCP, opt-in.
+- **SSH** (`-ssh-bind`, default off) — public-key transport, opt-in. Host key persisted in the bucket.
+
+All three funnel authorization through one pluggable `internal/auth.Authorizer` (see [The auth seam](#the-auth-seam-internalauth)).
 
 Module path: `tangled.org/xeiaso.net/objgit`. Go 1.26.
 
@@ -23,7 +26,11 @@ go test -run TestSmartHTTP ./cmd/objgitd/...
 # Run locally. Flags can also come from env via flagenv (UPPER_SNAKE of the flag name).
 # A .env file in CWD is auto-loaded by godotenv.
 ./objgitd -bucket $BUCKET -http-bind :8080 -allow-push
+./objgitd -bucket $BUCKET -ssh-bind :2222 -allow-push   # git clone ssh://git@host:2222/repo.git
 ```
+
+SSH tests additionally need `ssh` and `ssh-keygen` on PATH (skipped otherwise);
+run them with `go test -run TestSSH ./cmd/objgitd/...`.
 
 `flagenv` maps `-allow-push` → `ALLOW_PUSH`, `-bucket` → `BUCKET`, etc. Tigris client credentials come from the standard AWS SDK chain (`AWS_PROFILE` etc.).
 
@@ -31,16 +38,65 @@ go test -run TestSmartHTTP ./cmd/objgitd/...
 
 ### The `daemon` is the shared backend
 
-`cmd/objgitd/main.go` constructs one `*daemon` holding `(fs billy.Filesystem, loader transport.Loader, allowPush bool)` and serves it through both transports concurrently under an `errgroup`. Repository resolution, the `allowPush` gate, and **create-on-first-push** all live on `*daemon` (`loadOrInit` in `git_protocol.go`) so both transports behave identically.
+`cmd/objgitd/main.go` constructs one `*daemon` holding `(fs billy.Filesystem, loader transport.Loader, authz auth.Authorizer)` (plus the hooks fields) and serves it through all three transports concurrently under an `errgroup`. Repository resolution, authorization, and **create-on-first-push** all live on `*daemon` (`loadOrInit` in `git_protocol.go`) so every transport behaves identically.
 
-- `cmd/objgitd/git_protocol.go` — git:// TCP server: `Serve` → `handle` decodes a `packp.GitProtoRequest`, then dispatches to `transport.UploadPack` / `UploadArchive` / `ReceivePack`.
+- `cmd/objgitd/git_protocol.go` — git:// TCP server: `Serve` → `handle` decodes a `packp.GitProtoRequest`, then dispatches to `transport.UploadPack` / `UploadArchive` / `ReceivePack`. Also holds the shared `operationFor(service)` helper (receive-pack → `auth.Write`, else `auth.Read`).
 - `cmd/objgitd/http.go` — `*daemon` implements `http.Handler` directly. Dispatch is by **URL suffix** (`/info/refs`, `/git-upload-pack`, `/git-receive-pack`) because repo paths are variable-depth and `http.ServeMux` wildcards can't capture a prefix before a fixed suffix. Smart-HTTP uses the same go-git server commands with `StatelessRPC: true` (and `AdvertiseRefs: true` for `GET /info/refs`).
+- `cmd/objgitd/ssh.go` — SSH server (gliderlabs/ssh): `newSSHServer` builds the server and host key; `handleSSH` is the per-session dispatcher, a sibling of `handle` (see [Git over SSH](#git-over-ssh-sshgo)).
 
 ### Two subtle protocol points
 
 1. **`streamingStorer` in `git_protocol.go`** wraps the storer for git:// receive-pack to **hide its `PackfileWriter` capability**. `UpdateObjectStorage`'s `PackfileWriter` path uses `io.CopyBuffer` and only returns on `io.EOF`, which deadlocks over a persistent TCP socket (the client is waiting for report-status). Hiding the capability falls through to `Parser.Parse`, which knows the pack's end from the format itself. HTTP doesn't need this — request bodies have a real EOF — so HTTP keeps the faster PackfileWriter path. Trade-off: git:// pushes write loose objects (one S3 PUT per object).
 
 2. **No-op closers everywhere.** `transport.UploadPack`/`ReceivePack` call `Close` on the reader (and sometimes the writer) between negotiation rounds. The git:// socket can't survive that, and the HTTP `ResponseWriter` doesn't implement `Close`. Wrap with `io.NopCloser` (reader) and `ioutil.WriteNopCloser` from `go-git/v6/utils/ioutil` (writer).
+
+**SSH shares both gotchas with git://**, not HTTP: an `ssh.Session` is a persistent bidirectional stream, so `handleSSH` uses `streamingStorer{}` for receive-pack and wraps the session in the same no-op closers. (HTTP keeps the faster `PackfileWriter` path because the request body has a real EOF.)
+
+### The auth seam (`internal/auth`)
+
+Every transport authorizes through one interface so a real authn/authz layer can
+drop in without touching transport code. `internal/auth` is deliberately
+transport-neutral — it imports only `context` and `golang.org/x/crypto/ssh` (for
+the public-key wire type), **not** gliderlabs/ssh or go-git.
+
+- `Authorizer.Authorize(ctx, auth.Request) auth.Decision`. The `Request` carries
+  `Repo`, `Operation` (`Read`/`Write`), a `Credential`, and a `Transport` tag.
+- `Credential` is a sum type (sealed via an unexported method): `Anonymous{}`
+  (git://, or HTTP/SSH with nothing presented), `PublicKey{Key}` (SSH), and
+  `BasicAuth{Username, Password}` (HTTP — **unvalidated**; the Authorizer owns
+  the user store).
+- `Decision` is `Allow` / `Deny` / `Unauthenticated`. `Unauthenticated` is the
+  seam that lets HTTP issue a `401 WWW-Authenticate` challenge; SSH and git://
+  treat anything other than `Allow` as denial.
+
+Each transport's job is only to **collect** the credential, **map** the git
+service to an `Operation` (via `operationFor`), and **render** the `Decision` in
+its own dialect (pktline error / `401`/`403` / stderr + non-zero exit). The lone
+implementation today is `auth.AllowAnonymous{AllowWrite}`: read for everyone,
+write only when set — wired in `main.go` as `AllowAnonymous{AllowWrite: *allowPush}`,
+so `-allow-push` is now just this default's config rather than a field on `daemon`.
+
+### Git over SSH (`ssh.go`)
+
+A third sibling to `git_protocol.go` / `http.go`. Like git:// (and unlike wish's
+`git/git.go`, which execs the real `git-upload-pack` binary), objgitd answers the
+protocol **natively** with the same `transport.*` functions — no `git` binary, no
+on-disk checkout. `handleSSH` mirrors `handle`: `s.Command()` is already
+shlex-split by gliderlabs/ssh, so `gitServiceFor(cmd[0])` selects the service, the
+repo path is `strings.TrimPrefix(cmd[1], "/")` (so `ssh://host/foo.git` and
+scp-style `host:foo.git` resolve the same), and the session is the protocol
+stream (reader + writer).
+
+- **Connect vs. authorize.** `PublicKeyHandler` returns `true` for every key — it
+  must be set or the server won't offer pubkey auth at all — and authorization
+  happens per-command via `d.authz` (`Cred: auth.PublicKey{Key: s.PublicKey()}`).
+- **Host key** lives in the bucket at `.objgit/ssh_host_ed25519_key`
+  (`loadOrCreateHostKey`): generated ed25519 on first start, reused after, so no
+  host-key-changed warnings across restarts. No local-disk dependency.
+- Receive-pack goes through **`d.receivePack`** (not `transport.ReceivePack`), so
+  push hooks fire over SSH too.
+- Protocol v2 (`GIT_PROTOCOL` via `s.Environ()`) is intentionally not forwarded
+  yet; v0/v1 is sufficient.
 
 ### Push hooks (`hooks.go`, sandboxed via kefka)
 
