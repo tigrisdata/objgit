@@ -109,7 +109,6 @@ func TestReceivePackHook(t *testing.T) {
 		fs:          fs,
 		loader:      transport.NewFilesystemLoader(fs, false),
 		authz:       auth.AllowAnonymous{AllowWrite: true},
-		allowPush:   true,
 		allowHooks:  true,
 		hookTimeout: 30 * time.Second,
 	}
@@ -187,7 +186,6 @@ func TestReceivePackHookAbsent(t *testing.T) {
 		fs:          fs,
 		loader:      transport.NewFilesystemLoader(fs, false),
 		authz:       auth.AllowAnonymous{AllowWrite: true},
-		allowPush:   true,
 		allowHooks:  true,
 		hookTimeout: 30 * time.Second,
 	}

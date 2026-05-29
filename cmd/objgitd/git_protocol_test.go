@@ -25,10 +25,9 @@ func TestDaemonPushCreatesRepo(t *testing.T) {
 
 	fs := memfs.New()
 	d := &daemon{
-		fs:        fs,
-		loader:    transport.NewFilesystemLoader(fs, false),
-		authz:     auth.AllowAnonymous{AllowWrite: true},
-		allowPush: true,
+		fs:     fs,
+		loader: transport.NewFilesystemLoader(fs, false),
+		authz:  auth.AllowAnonymous{AllowWrite: true},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -83,10 +82,9 @@ func TestDaemonPushDisabled(t *testing.T) {
 
 	fs := memfs.New()
 	d := &daemon{
-		fs:        fs,
-		loader:    transport.NewFilesystemLoader(fs, false),
-		authz:     auth.AllowAnonymous{AllowWrite: false},
-		allowPush: false,
+		fs:     fs,
+		loader: transport.NewFilesystemLoader(fs, false),
+		authz:  auth.AllowAnonymous{AllowWrite: false},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

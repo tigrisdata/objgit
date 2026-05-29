@@ -10,6 +10,7 @@ import (
 	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/memfs"
 	"github.com/go-git/go-git/v6/plumbing/transport"
+	"tangled.org/xeiaso.net/objgit/internal/auth"
 )
 
 // TestSmartHTTP drives a real git client against the smart-HTTP handler over an
@@ -103,13 +104,46 @@ func newHTTPServer(t *testing.T, allowPush bool) (*httptest.Server, billy.Filesy
 	t.Helper()
 	fs := memfs.New()
 	d := &daemon{
-		fs:        fs,
-		loader:    transport.NewFilesystemLoader(fs, false),
-		allowPush: allowPush,
+		fs:     fs,
+		loader: transport.NewFilesystemLoader(fs, false),
+		authz:  auth.AllowAnonymous{AllowWrite: allowPush},
 	}
 	ts := httptest.NewServer(d)
 	t.Cleanup(ts.Close)
 	return ts, fs
+}
+
+// TestSmartHTTPAnonymousReadWhilePushDisabled verifies that with push disabled,
+// anonymous clone of an existing repo still succeeds — reads are always allowed
+// by the default authorizer, only writes are gated.
+func TestSmartHTTPAnonymousReadWhilePushDisabled(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+
+	// Seed a repo via a push-enabled server over a shared filesystem.
+	fs := memfs.New()
+	seed := httptest.NewServer(&daemon{fs: fs, loader: transport.NewFilesystemLoader(fs, false), authz: auth.AllowAnonymous{AllowWrite: true}})
+	defer seed.Close()
+
+	work := seedRepo(t)
+	srcHead := strings.TrimSpace(runGit(t, work, "rev-parse", "HEAD"))
+	if out, err := tryGit(work, "push", seed.URL+"/test.git", "main"); err != nil {
+		t.Fatalf("seed push failed: %v\n%s", err, out)
+	}
+
+	// Serve the same filesystem with push disabled and clone from it.
+	ro := httptest.NewServer(&daemon{fs: fs, loader: transport.NewFilesystemLoader(fs, false), authz: auth.AllowAnonymous{AllowWrite: false}})
+	defer ro.Close()
+
+	dst := t.TempDir()
+	if out, err := tryGit(dst, "clone", ro.URL+"/test.git", "cloned"); err != nil {
+		t.Fatalf("anonymous clone should succeed with push disabled: %v\n%s", err, out)
+	}
+	gotHead := strings.TrimSpace(runGit(t, filepath.Join(dst, "cloned"), "rev-parse", "HEAD"))
+	if gotHead != srcHead {
+		t.Errorf("cloned HEAD %q != seeded HEAD %q", gotHead, srcHead)
+	}
 }
 
 // seedRepo creates a local git repository with one commit and returns its path.

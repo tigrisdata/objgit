@@ -55,10 +55,9 @@ func operationFor(service string) auth.Operation {
 
 // daemon serves the git:// (TCP) protocol out of a billy filesystem.
 type daemon struct {
-	fs        billy.Filesystem
-	loader    transport.Loader
-	authz     auth.Authorizer
-	allowPush bool
+	fs     billy.Filesystem
+	loader transport.Loader
+	authz  auth.Authorizer
 
 	// allowHooks gates running .objgit/hooks/receive-pack after a push.
 	allowHooks  bool

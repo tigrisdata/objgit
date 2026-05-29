@@ -13,6 +13,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/storage"
 	"github.com/go-git/go-git/v6/utils/ioutil"
+	"tangled.org/xeiaso.net/objgit/internal/auth"
 )
 
 // ServeHTTP speaks the git smart-HTTP protocol. It dispatches on the URL suffix
@@ -44,7 +45,7 @@ func (d *daemon) handleInfoRefs(w http.ResponseWriter, r *http.Request, repoPath
 		return
 	}
 
-	st, ok := d.resolve(w, service, repoPath)
+	st, ok := d.resolve(w, r, service, repoPath)
 	if !ok {
 		return
 	}
@@ -86,7 +87,7 @@ func (d *daemon) handleInfoRefs(w http.ResponseWriter, r *http.Request, repoPath
 // handleRPC serves a stateless negotiation round:
 // POST /{repo}/git-(upload|receive)-pack.
 func (d *daemon) handleRPC(w http.ResponseWriter, r *http.Request, service, repoPath string) {
-	st, ok := d.resolve(w, service, repoPath)
+	st, ok := d.resolve(w, r, service, repoPath)
 	if !ok {
 		return
 	}
@@ -136,16 +137,28 @@ func (d *daemon) handleRPC(w http.ResponseWriter, r *http.Request, service, repo
 	}
 }
 
-// resolve loads the storer for an HTTP request, applying the same rules as the
-// git:// handler: anonymous read, push gated by allowPush, and create-on-first-
-// push. It writes an HTTP error and returns ok=false when the request cannot
-// proceed.
-func (d *daemon) resolve(w http.ResponseWriter, service, repoPath string) (storage.Storer, bool) {
+// resolve loads the storer for an HTTP request, authorizing via the daemon's
+// Authorizer before touching the repository. It writes an HTTP error and
+// returns ok=false when the request cannot proceed.
+func (d *daemon) resolve(w http.ResponseWriter, r *http.Request, service, repoPath string) (storage.Storer, bool) {
+	switch d.authz.Authorize(r.Context(), auth.Request{
+		Repo:      repoPath,
+		Operation: operationFor(service),
+		Cred:      credFromRequest(r),
+		Transport: "http",
+	}) {
+	case auth.Allow:
+		// authorized; fall through to repo resolution
+	case auth.Unauthenticated:
+		w.Header().Set("WWW-Authenticate", `Basic realm="objgit"`)
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+		return nil, false
+	default: // auth.Deny
+		http.Error(w, "access denied", http.StatusForbidden)
+		return nil, false
+	}
+
 	if service == transport.ReceivePackService {
-		if !d.allowPush {
-			http.Error(w, "push is disabled on this server", http.StatusForbidden)
-			return nil, false
-		}
 		st, err := d.loadOrInit(repoPath)
 		if err != nil {
 			slog.Error("opening repository for push", "path", repoPath, "err", err)
@@ -166,4 +179,14 @@ func (d *daemon) resolve(w http.ResponseWriter, service, repoPath string) (stora
 		return nil, false
 	}
 	return st, true
+}
+
+// credFromRequest extracts an auth credential from an HTTP request: HTTP Basic
+// if present, otherwise anonymous. It does not validate — the Authorizer owns
+// the user store.
+func credFromRequest(r *http.Request) auth.Credential {
+	if u, p, ok := r.BasicAuth(); ok {
+		return auth.BasicAuth{Username: u, Password: p}
+	}
+	return auth.Anonymous{}
 }

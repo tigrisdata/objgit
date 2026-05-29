@@ -75,7 +75,6 @@ func main() {
 		fs:          fsys,
 		loader:      transport.NewFilesystemLoader(fsys, false),
 		authz:       auth.AllowAnonymous{AllowWrite: *allowPush},
-		allowPush:   *allowPush,
 		allowHooks:  *allowHooks,
 		hookTimeout: *hookTimeout,
 	}
