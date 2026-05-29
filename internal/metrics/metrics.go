@@ -155,3 +155,63 @@ func ObserveHook(status string, dur time.Duration) {
 func ReposCreated() {
 	reposCreated.Inc()
 }
+
+// ListingCacheStats is a flat snapshot of the s3fs directory-listing cache's
+// groupcache counters. It mirrors s3fs.CacheStats but is defined here so s3fs
+// stays free of any Prometheus import; main bridges the two.
+type ListingCacheStats struct {
+	Gets, CacheHits, Loads, LocalLoads, PeerLoads, LocalLoadErrs int64
+	MainBytes, MainItems, MainEvictions                          int64
+	HotBytes, HotItems                                           int64
+}
+
+// RegisterListingCache installs a Prometheus collector that reports the
+// directory-listing cache's groupcache counters under objgit_s3_listing_cache_*.
+// provider is polled at scrape time. Call once at startup when the cache is
+// enabled.
+func RegisterListingCache(provider func() ListingCacheStats) {
+	prometheus.MustRegister(&listingCacheCollector{provider: provider})
+}
+
+type listingCacheCollector struct {
+	provider func() ListingCacheStats
+}
+
+var (
+	lcGets      = prometheus.NewDesc("objgit_s3_listing_cache_gets_total", "Listing-cache Get requests (incl. from peers).", nil, nil)
+	lcHits      = prometheus.NewDesc("objgit_s3_listing_cache_hits_total", "Listing-cache requests served from cache.", nil, nil)
+	lcLoads     = prometheus.NewDesc("objgit_s3_listing_cache_loads_total", "Listing-cache loads (gets minus hits).", nil, nil)
+	lcLocal     = prometheus.NewDesc("objgit_s3_listing_cache_local_loads_total", "Listing-cache loads served by listing S3 locally.", nil, nil)
+	lcPeer      = prometheus.NewDesc("objgit_s3_listing_cache_peer_loads_total", "Listing-cache loads served by a peer.", nil, nil)
+	lcLoadErrs  = prometheus.NewDesc("objgit_s3_listing_cache_local_load_errors_total", "Listing-cache local load errors.", nil, nil)
+	lcBytes     = prometheus.NewDesc("objgit_s3_listing_cache_bytes", "Listing-cache resident bytes by cache.", []string{"cache"}, nil)
+	lcItems     = prometheus.NewDesc("objgit_s3_listing_cache_items", "Listing-cache resident items by cache.", []string{"cache"}, nil)
+	lcEvictions = prometheus.NewDesc("objgit_s3_listing_cache_evictions_total", "Listing-cache main-cache evictions.", nil, nil)
+)
+
+func (c *listingCacheCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- lcGets
+	ch <- lcHits
+	ch <- lcLoads
+	ch <- lcLocal
+	ch <- lcPeer
+	ch <- lcLoadErrs
+	ch <- lcBytes
+	ch <- lcItems
+	ch <- lcEvictions
+}
+
+func (c *listingCacheCollector) Collect(ch chan<- prometheus.Metric) {
+	s := c.provider()
+	ch <- prometheus.MustNewConstMetric(lcGets, prometheus.CounterValue, float64(s.Gets))
+	ch <- prometheus.MustNewConstMetric(lcHits, prometheus.CounterValue, float64(s.CacheHits))
+	ch <- prometheus.MustNewConstMetric(lcLoads, prometheus.CounterValue, float64(s.Loads))
+	ch <- prometheus.MustNewConstMetric(lcLocal, prometheus.CounterValue, float64(s.LocalLoads))
+	ch <- prometheus.MustNewConstMetric(lcPeer, prometheus.CounterValue, float64(s.PeerLoads))
+	ch <- prometheus.MustNewConstMetric(lcLoadErrs, prometheus.CounterValue, float64(s.LocalLoadErrs))
+	ch <- prometheus.MustNewConstMetric(lcEvictions, prometheus.CounterValue, float64(s.MainEvictions))
+	ch <- prometheus.MustNewConstMetric(lcBytes, prometheus.GaugeValue, float64(s.MainBytes), "main")
+	ch <- prometheus.MustNewConstMetric(lcBytes, prometheus.GaugeValue, float64(s.HotBytes), "hot")
+	ch <- prometheus.MustNewConstMetric(lcItems, prometheus.GaugeValue, float64(s.MainItems), "main")
+	ch <- prometheus.MustNewConstMetric(lcItems, prometheus.GaugeValue, float64(s.HotItems), "hot")
+}

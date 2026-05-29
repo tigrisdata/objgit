@@ -74,7 +74,27 @@ func (fs3 *S3FS) OpenFile(filename string, flag int, perm os.FileMode) (billy.Fi
 			return &tempReadFile{buf: buf, name: filename}, nil
 		}
 
-		f, err := newS3ReadFile(fs3.client, fs3.bucket, key, filename)
+		// If the parent folder's listing is cached, resolve the open without a
+		// negotiation round-trip: absent → not-exist, a sub-prefix → directory.
+		// For a present file the head cache (prewarmed in the background) lets
+		// newS3ReadFile skip its HeadObject; only GetObject fetches the body.
+		if info, found, known := fs3.resolve(context.TODO(), key); known {
+			switch {
+			case !found:
+				return nil, &os.PathError{Op: "open", Path: filename, Err: fs.ErrNotExist}
+			case info.Kind == kindDir:
+				return newS3DirFile(key, fs3.bucket, fs3.client), nil
+			default:
+				if ho, err := fs3.cache.headInfo(context.TODO(), key); err == nil {
+					return newS3ReadFile(fs3.client, fs3.bucket, key, filename, ho)
+				} else if isNotFound(err) {
+					return nil, &os.PathError{Op: "open", Path: filename, Err: fs.ErrNotExist}
+				}
+				// transient head-cache error: fall through to a live read.
+			}
+		}
+
+		f, err := newS3ReadFile(fs3.client, fs3.bucket, key, filename, nil)
 		if err == nil {
 			return f, nil
 		}
@@ -111,14 +131,36 @@ func (fs3 *S3FS) OpenFile(filename string, flag int, perm os.FileMode) (billy.Fi
 		return nil, &os.PathError{Op: "open", Path: filename, Err: fs.ErrNotExist}
 
 	case O_WRONLY:
-		return newS3WriteFile(fs3.client, fs3.bucket, key, filename, fs3.unixMeta)
+		return newS3WriteFile(fs3.client, fs3.bucket, key, filename, fs3.unixMeta, fs3.cache)
 
 	case O_WRMULTIPART:
-		return newS3MultipartUploadFile(fs3.client, fs3.bucket, key, filename, fs3.unixMeta)
+		return newS3MultipartUploadFile(fs3.client, fs3.bucket, key, filename, fs3.unixMeta, fs3.cache)
 
 	default:
 		return nil, errors.New("unsupported open flag")
 	}
+}
+
+// resolve consults the listing cache for key's parent folder. known is false
+// when the cache is disabled or the lookup failed — the caller then falls back
+// to a live S3 round-trip, so cache problems never fail an operation. When
+// known, found reports whether base exists under the parent and info describes
+// it (kind/size/mtime).
+func (fs3 *S3FS) resolve(ctx context.Context, key string) (info childEntry, found, known bool) {
+	if fs3.cache == nil {
+		return childEntry{}, false, false
+	}
+	prefix, base := splitKey(key)
+	entries, err := fs3.cache.list(ctx, prefix)
+	if err != nil {
+		return childEntry{}, false, false
+	}
+	for _, e := range entries {
+		if e.Name == base {
+			return e, true, true
+		}
+	}
+	return childEntry{}, false, true
 }
 
 // Stat returns a FileInfo describing the named file.
@@ -135,6 +177,24 @@ func (fs3 *S3FS) Stat(filename string) (os.FileInfo, error) {
 	}
 
 	ctx := context.TODO()
+
+	// If the parent folder's listing is cached, answer without a foreground S3
+	// round-trip: absent → not-exist, a sub-prefix → directory, a present file
+	// → the head cache (prewarmed in the background from the listing).
+	if info, found, known := fs3.resolve(ctx, key); known {
+		if !found {
+			return nil, &os.PathError{Op: "stat", Path: filename, Err: fs.ErrNotExist}
+		}
+		if info.Kind == kindDir {
+			return newDirInfo(path.Base(key)), nil
+		}
+		if ho, err := fs3.cache.headInfo(ctx, key); err == nil {
+			return newFileInfoFromHead(path.Base(key), ho, fs3.unixMeta), nil
+		} else if isNotFound(err) {
+			return nil, &os.PathError{Op: "stat", Path: filename, Err: fs.ErrNotExist}
+		}
+		// transient head-cache error: fall through to a direct HeadObject.
+	}
 
 	start := time.Now()
 	head, err := fs3.client.HeadObject(ctx, &s3.HeadObjectInput{
@@ -199,6 +259,10 @@ func (fs3 *S3FS) Rename(oldpath, newpath string) error {
 		if err != nil {
 			return fmt.Errorf("failed to upload temp %q to %q: %w", oldpath, newpath, err)
 		}
+		if fs3.cache != nil {
+			prefix, _ := splitKey(dst)
+			fs3.cache.invalidate(prefix)
+		}
 		return nil
 	}
 
@@ -215,6 +279,14 @@ func (fs3 *S3FS) Rename(oldpath, newpath string) error {
 	observeS3("RenameObject", start, err)
 	if err != nil {
 		return fmt.Errorf("failed to rename %q to %q: %w", oldpath, newpath, err)
+	}
+
+	// Both folders changed: the source lost a child, the destination gained one.
+	if fs3.cache != nil {
+		srcPrefix, _ := splitKey(src)
+		dstPrefix, _ := splitKey(dst)
+		fs3.cache.invalidate(srcPrefix)
+		fs3.cache.invalidate(dstPrefix)
 	}
 
 	return nil
@@ -241,6 +313,10 @@ func (fs3 *S3FS) Remove(filename string) error {
 	observeS3("DeleteObject", start, err)
 	if err != nil {
 		return fmt.Errorf("failed to remove file: %w", err)
+	}
+	if fs3.cache != nil {
+		prefix, _ := splitKey(key)
+		fs3.cache.invalidate(prefix)
 	}
 	return nil
 }

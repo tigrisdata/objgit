@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/tigrisdata/storage-go"
 	"go.uber.org/atomic"
 	"tangled.org/xeiaso.net/objgit/internal/s3fs/unixmeta"
 )
@@ -50,7 +49,7 @@ var (
 //
 // Upon creation, the file is loaded from S3.
 type s3ReadFile struct {
-	client *storage.Client      // S3 SDK client
+	client s3Client             // S3 SDK client
 	bucket string               // S3 bucket name
 	key    string               // File object's key in S3
 	name   string               // Root-relative path as presented to Open
@@ -60,23 +59,29 @@ type s3ReadFile struct {
 }
 
 // newS3ReadFile creates a new s3ReadFile. key is the full S3 object key; name
-// is the root-relative path the caller passed to Open (returned by Name).
-func newS3ReadFile(client *storage.Client, bucket, key, name string) (*s3ReadFile, error) {
+// is the root-relative path the caller passed to Open (returned by Name). When
+// head is non-nil it is used as-is — the caller already has the object's
+// metadata (e.g. from the listing-cache head precache) so the redundant
+// HeadObject round-trip is skipped; pass nil to fetch it here.
+func newS3ReadFile(client s3Client, bucket, key, name string, head *s3.HeadObjectOutput) (*s3ReadFile, error) {
 	// Create the context
 	ctx := context.TODO() // TODO: How can user-supplied contexts be supported?
 
-	start := time.Now()
-	ho, err := client.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket: new(bucket),
-		Key:    new(key),
-	})
-	observeS3("HeadObject", start, err)
-	if err != nil {
-		return nil, &os.PathError{Op: "read", Path: key, Err: err}
+	if head == nil {
+		start := time.Now()
+		ho, err := client.HeadObject(ctx, &s3.HeadObjectInput{
+			Bucket: new(bucket),
+			Key:    new(key),
+		})
+		observeS3("HeadObject", start, err)
+		if err != nil {
+			return nil, &os.PathError{Op: "read", Path: key, Err: err}
+		}
+		head = ho
 	}
 
 	// Run the GetObject operation
-	start = time.Now()
+	start := time.Now()
 	res, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: &bucket,
 		Key:    &key,
@@ -100,7 +105,7 @@ func newS3ReadFile(client *storage.Client, bucket, key, name string) (*s3ReadFil
 		key:    key,
 		name:   name,
 		reader: reader,
-		head:   ho,
+		head:   head,
 	}, nil
 }
 
@@ -179,18 +184,19 @@ func (f *s3ReadFile) Stat() (fs.FileInfo, error) {
 // Upon creation, a buffer is created to store the file contents. Upon close,
 // the file is uploaded to S3.
 type s3WriteFile struct {
-	client   *storage.Client // s3 skd client
+	client   s3Client        // s3 skd client
 	bucket   string          // S3 bucket name
 	key      string          // File object's key in S3
 	name     string          // Root-relative path as presented to Open
 	closed   bool            // Is the file closed?
 	buf      *bytes.Buffer   // Buffer for storing the file before it's uploaded
 	unixMeta *unixMetaConfig // optional POSIX attribute defaults (nil = disabled)
+	cache    *ListingCache   // optional listing cache to invalidate on upload
 }
 
 // newS3WriteFile creates a new s3WriteFile. key is the full S3 object key; name
 // is the root-relative path the caller passed to Open (returned by Name).
-func newS3WriteFile(client *storage.Client, bucket, key, name string, cfg *unixMetaConfig) (*s3WriteFile, error) {
+func newS3WriteFile(client s3Client, bucket, key, name string, cfg *unixMetaConfig, cache *ListingCache) (*s3WriteFile, error) {
 	return &s3WriteFile{
 		client:   client,
 		bucket:   bucket,
@@ -198,6 +204,7 @@ func newS3WriteFile(client *storage.Client, bucket, key, name string, cfg *unixM
 		name:     name,
 		buf:      bytes.NewBuffer(nil),
 		unixMeta: cfg,
+		cache:    cache,
 	}, nil
 }
 
@@ -262,6 +269,13 @@ func (f *s3WriteFile) Close() error {
 		return fmt.Errorf("unable to perform GetObject operation: %w", err)
 	}
 
+	// The new object changes its parent folder's listing; drop the cached
+	// listing so the next read re-lists and sees it.
+	if f.cache != nil {
+		prefix, _ := splitKey(f.key)
+		f.cache.invalidate(prefix)
+	}
+
 	return nil
 }
 
@@ -287,18 +301,19 @@ func (f *s3WriteFile) Truncate(size int64) error {
 
 // s3MultipartUploadFile implements billy.File
 type s3MultipartUploadFile struct {
-	client   *storage.Client // s3 skd client
-	bucket   string          // S3 bucket name
-	key      string          // File object's key in S3
-	name     string          // Root-relative path as presented to Open
-	closed   bool            // Is the file closed?
-	uploadID string          // S3 multipart upload ID
-	uploadN  *atomic.Int32   // Counter tracking the number of uploads
+	client   s3Client      // s3 skd client
+	bucket   string        // S3 bucket name
+	key      string        // File object's key in S3
+	name     string        // Root-relative path as presented to Open
+	closed   bool          // Is the file closed?
+	uploadID string        // S3 multipart upload ID
+	uploadN  *atomic.Int32 // Counter tracking the number of uploads
+	cache    *ListingCache // optional listing cache to invalidate on upload
 }
 
 // newS3MultipartUploadFile creates a new s3MultipartUploadFile. key is the full
 // S3 object key; name is the root-relative path passed to Open.
-func newS3MultipartUploadFile(client *storage.Client, bucket, key, name string, cfg *unixMetaConfig) (*s3MultipartUploadFile, error) {
+func newS3MultipartUploadFile(client s3Client, bucket, key, name string, cfg *unixMetaConfig, cache *ListingCache) (*s3MultipartUploadFile, error) {
 	// TODO: Check if the file exists
 	// ...
 
@@ -326,6 +341,7 @@ func newS3MultipartUploadFile(client *storage.Client, bucket, key, name string, 
 		name:     name,
 		uploadID: *res.UploadId,
 		uploadN:  atomic.NewInt32(1),
+		cache:    cache,
 	}, nil
 }
 
@@ -412,6 +428,11 @@ func (f *s3MultipartUploadFile) Close() error {
 		return fmt.Errorf("unable to complete multipart upload: %w", err)
 	}
 
+	if f.cache != nil {
+		prefix, _ := splitKey(f.key)
+		f.cache.invalidate(prefix)
+	}
+
 	return nil
 }
 
@@ -430,10 +451,10 @@ func (f *s3MultipartUploadFile) Stat() (fs.FileInfo, error) {
 type s3DirFile struct {
 	name, bucket string
 	closed       bool
-	cli          *storage.Client
+	cli          s3Client
 }
 
-func newS3DirFile(name, bucket string, cli *storage.Client) *s3DirFile {
+func newS3DirFile(name, bucket string, cli s3Client) *s3DirFile {
 	return &s3DirFile{
 		name:   name,
 		bucket: bucket,

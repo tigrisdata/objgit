@@ -15,27 +15,22 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-// ReadDir reads the directory named by dirname and returns a list of
-// directory entries sorted by filename.
-func (fs3 *S3FS) ReadDir(dir string) ([]fs.DirEntry, error) {
-	key := strings.TrimPrefix(fs3.cleanPath(dir), "/")
-	var prefix string
-	if key != "" && key != "." {
-		prefix = key + "/"
-	}
-
-	ctx := context.TODO()
-
+// listChildren lists the immediate children of prefix (a full-canonical key
+// prefix: "" for the bucket root, otherwise ending in separator), paginating to
+// completion. Sub-prefixes come back as kindDir, objects as kindFile carrying
+// size/mtime — dirs first then files, preserving S3's lexicographic order. It
+// is a free function so the listing cache's getter, which holds only the raw
+// client, can reuse it.
+func listChildren(ctx context.Context, client s3Client, bucket, separator, prefix string) ([]childEntry, error) {
 	var ct *string
-	var dirs []fs.DirEntry
-	var files []fs.DirEntry
+	var dirs, files []childEntry
 	for {
 		start := time.Now()
-		res, err := fs3.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-			Bucket:            &fs3.bucket,
+		res, err := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            &bucket,
 			Prefix:            &prefix,
 			ContinuationToken: ct,
-			Delimiter:         &fs3.separator,
+			Delimiter:         &separator,
 		})
 		observeS3("ListObjectsV2", start, err)
 		if err != nil {
@@ -47,7 +42,7 @@ func (fs3 *S3FS) ReadDir(dir string) ([]fs.DirEntry, error) {
 			if name == "" {
 				continue
 			}
-			dirs = append(dirs, fs.FileInfoToDirEntry(newDirInfo(name)))
+			dirs = append(dirs, childEntry{Name: name, Kind: kindDir})
 		}
 
 		for _, f := range res.Contents {
@@ -60,13 +55,12 @@ func (fs3 *S3FS) ReadDir(dir string) ([]fs.DirEntry, error) {
 			if name == "" {
 				continue
 			}
-			files = append(files,
-				fs.FileInfoToDirEntry(newFileInfo(
-					pathpkg.Base(name),
-					aws.ToInt64(f.Size),
-					aws.ToTime(f.LastModified),
-				)),
-			)
+			files = append(files, childEntry{
+				Name:  pathpkg.Base(name),
+				Kind:  kindFile,
+				Size:  aws.ToInt64(f.Size),
+				Mtime: aws.ToTime(f.LastModified).UnixNano(),
+			})
 		}
 
 		if !aws.ToBool(res.IsTruncated) {
@@ -76,6 +70,41 @@ func (fs3 *S3FS) ReadDir(dir string) ([]fs.DirEntry, error) {
 	}
 
 	return append(dirs, files...), nil
+}
+
+// ReadDir reads the directory named by dirname and returns a list of
+// directory entries. When a listing cache is attached the listing is served
+// through it (and reused by later Stat/Open of siblings).
+func (fs3 *S3FS) ReadDir(dir string) ([]fs.DirEntry, error) {
+	key := strings.TrimPrefix(fs3.cleanPath(dir), "/")
+	var prefix string
+	if key != "" && key != "." {
+		prefix = key + "/"
+	}
+
+	ctx := context.TODO()
+
+	var entries []childEntry
+	var err error
+	if fs3.cache != nil {
+		entries, err = fs3.cache.list(ctx, prefix)
+	} else {
+		entries, err = listChildren(ctx, fs3.client, fs3.bucket, fs3.separator, prefix)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]fs.DirEntry, 0, len(entries))
+	for _, e := range entries {
+		if e.Kind == kindDir {
+			out = append(out, fs.FileInfoToDirEntry(newDirInfo(e.Name)))
+			continue
+		}
+		out = append(out, fs.FileInfoToDirEntry(newFileInfo(e.Name, e.Size, time.Unix(0, e.Mtime))))
+	}
+
+	return out, nil
 }
 
 // MkdirAll creates a directory named path, along with any necessary
@@ -90,6 +119,10 @@ func (fs3 *S3FS) MkdirAll(filename string, perm os.FileMode) error {
 		Body:   bytes.NewBuffer(nil),
 	})
 	observeS3("PutObject", start, err)
+	if err == nil && fs3.cache != nil {
+		prefix, _ := splitKey(fs3.key(filename))
+		fs3.cache.invalidate(prefix)
+	}
 
 	return err
 }

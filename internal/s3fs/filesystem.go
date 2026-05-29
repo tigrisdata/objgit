@@ -1,19 +1,35 @@
 package s3fs
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path"
 	"strings"
 	"sync"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/go-git/go-billy/v6"
-	"github.com/tigrisdata/storage-go"
 )
 
 const (
 	DefaultSeparator = "/"
 )
+
+// s3Client is the subset of *storage.Client (which embeds *s3.Client) that the
+// filesystem uses. Naming it as an interface lets tests substitute a counting
+// stub; the concrete Tigris client satisfies it unchanged.
+type s3Client interface {
+	HeadObject(context.Context, *s3.HeadObjectInput, ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
+	GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error)
+	PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+	ListObjectsV2(context.Context, *s3.ListObjectsV2Input, ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+	DeleteObject(context.Context, *s3.DeleteObjectInput, ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
+	RenameObject(context.Context, *s3.CopyObjectInput, ...func(*s3.Options)) (*s3.CopyObjectOutput, error)
+	CreateMultipartUpload(context.Context, *s3.CreateMultipartUploadInput, ...func(*s3.Options)) (*s3.CreateMultipartUploadOutput, error)
+	UploadPart(context.Context, *s3.UploadPartInput, ...func(*s3.Options)) (*s3.UploadPartOutput, error)
+	CompleteMultipartUpload(context.Context, *s3.CompleteMultipartUploadInput, ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error)
+}
 
 // unixMetaConfig holds the session defaults used when the optional Unix-metadata
 // feature is enabled. A nil *unixMetaConfig means the feature is off and the
@@ -24,11 +40,16 @@ type unixMetaConfig struct {
 }
 
 type S3FS struct {
-	client    *storage.Client
+	client    s3Client
 	bucket    string
 	root      string
 	separator string
 	unixMeta  *unixMetaConfig
+
+	// cache, when non-nil, memoises directory listings so Stat/Open of a path
+	// whose parent folder has been listed can skip the S3 round-trip. It is
+	// shared by pointer across this filesystem and all of its Chroot children.
+	cache *ListingCache
 
 	// temps holds TempFile-backed buffers keyed by canonical S3 key, so a
 	// subsequent Open of the same path returns a reader over the same bytes
@@ -51,8 +72,18 @@ func WithUnixMetadata(uid, gid uint32, umask os.FileMode) Option {
 	}
 }
 
-// NewS3FS creates a new S3FS Filesystem.
-func NewS3FS(client *storage.Client, bucket string, opts ...Option) (billy.Filesystem, error) {
+// WithListingCache attaches a directory-listing cache. The same *ListingCache is
+// carried into every Chroot child so the whole tree shares one cache keyed by
+// full-canonical prefix. Construct the cache with NewListingCache.
+func WithListingCache(c *ListingCache) Option {
+	return func(fs3 *S3FS) {
+		fs3.cache = c
+	}
+}
+
+// NewS3FS creates a new S3FS Filesystem. client is typically a *storage.Client;
+// it is accepted as the s3Client interface so tests can substitute a stub.
+func NewS3FS(client s3Client, bucket string, opts ...Option) (billy.Filesystem, error) {
 	// Check for a non-nil client
 	if client == nil {
 		return nil, fmt.Errorf("s3 client cannot be nil")
