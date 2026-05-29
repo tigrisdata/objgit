@@ -142,7 +142,7 @@ func (d *daemon) handleRPC(w http.ResponseWriter, r *http.Request, service, repo
 			GitProtocol:  gitProtocol,
 		})
 	case transport.ReceivePackService:
-		err = d.receivePack(r.Context(), st, st, repoPath, in, out, &transport.ReceivePackRequest{
+		err = d.receivePack(r.Context(), st, repoPath, in, out, &transport.ReceivePackRequest{
 			StatelessRPC: true,
 			GitProtocol:  gitProtocol,
 		})

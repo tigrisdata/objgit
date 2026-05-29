@@ -76,7 +76,7 @@ func (fs3 *S3FS) OpenFile(filename string, flag int, perm os.FileMode) (billy.Fi
 
 		// If the parent folder's listing is cached, resolve the open without a
 		// negotiation round-trip: absent → not-exist, a sub-prefix → directory.
-		// For a present file the head cache (prewarmed in the background) lets
+		// For a present file the head cache (seeded from the listing) lets
 		// newS3ReadFile skip its HeadObject; only GetObject fetches the body.
 		if info, found, known := fs3.resolve(context.TODO(), key); known {
 			switch {
@@ -85,7 +85,7 @@ func (fs3 *S3FS) OpenFile(filename string, flag int, perm os.FileMode) (billy.Fi
 			case info.Kind == kindDir:
 				return newS3DirFile(key, fs3.bucket, fs3.client), nil
 			default:
-				if ho, err := fs3.cache.headInfo(context.TODO(), key); err == nil {
+				if ho, err := fs3.cache.headInfo(context.TODO(), key, fs3.unixMeta != nil); err == nil {
 					return newS3ReadFile(fs3.client, fs3.bucket, key, filename, ho)
 				} else if isNotFound(err) {
 					return nil, &os.PathError{Op: "open", Path: filename, Err: fs.ErrNotExist}
@@ -180,7 +180,7 @@ func (fs3 *S3FS) Stat(filename string) (os.FileInfo, error) {
 
 	// If the parent folder's listing is cached, answer without a foreground S3
 	// round-trip: absent → not-exist, a sub-prefix → directory, a present file
-	// → the head cache (prewarmed in the background from the listing).
+	// → the head cache (seeded from the listing's size/mtime).
 	if info, found, known := fs3.resolve(ctx, key); known {
 		if !found {
 			return nil, &os.PathError{Op: "stat", Path: filename, Err: fs.ErrNotExist}
@@ -188,7 +188,7 @@ func (fs3 *S3FS) Stat(filename string) (os.FileInfo, error) {
 		if info.Kind == kindDir {
 			return newDirInfo(path.Base(key)), nil
 		}
-		if ho, err := fs3.cache.headInfo(ctx, key); err == nil {
+		if ho, err := fs3.cache.headInfo(ctx, key, fs3.unixMeta != nil); err == nil {
 			return newFileInfoFromHead(path.Base(key), ho, fs3.unixMeta), nil
 		} else if isNotFound(err) {
 			return nil, &os.PathError{Op: "stat", Path: filename, Err: fs.ErrNotExist}

@@ -72,6 +72,44 @@ func listChildren(ctx context.Context, client s3Client, bucket, separator, prefi
 	return append(dirs, files...), nil
 }
 
+// listSubtree lists every object under root with a single delimiter-less
+// (recursive) paginated ListObjectsV2, returning each object's full key plus
+// size/mtime. It stops once more than maxKeys objects have accumulated and
+// reports truncated=true; the caller then abandons the subtree and falls back to
+// delimited per-folder listing, so an unbounded namespace can't blow up memory.
+func listSubtree(ctx context.Context, client s3Client, bucket, root string, maxKeys int) (objs []subtreeObject, truncated bool, err error) {
+	var ct *string
+	for {
+		start := time.Now()
+		res, lerr := client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            &bucket,
+			Prefix:            &root,
+			ContinuationToken: ct,
+			// No Delimiter: a recursive listing of the whole subtree.
+		})
+		observeS3("ListObjectsV2", start, lerr)
+		if lerr != nil {
+			return nil, false, lerr
+		}
+
+		for _, o := range res.Contents {
+			objs = append(objs, subtreeObject{
+				Key:   aws.ToString(o.Key),
+				Size:  aws.ToInt64(o.Size),
+				Mtime: aws.ToTime(o.LastModified).UnixNano(),
+			})
+		}
+
+		if maxKeys > 0 && len(objs) > maxKeys {
+			return objs, true, nil
+		}
+		if !aws.ToBool(res.IsTruncated) {
+			return objs, false, nil
+		}
+		ct = res.NextContinuationToken
+	}
+}
+
 // ReadDir reads the directory named by dirname and returns a list of
 // directory entries. When a listing cache is attached the listing is served
 // through it (and reused by later Stat/Open of siblings).

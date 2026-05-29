@@ -48,11 +48,13 @@ run them with `go test -run TestSSH ./cmd/objgitd/...`.
 
 ### Two subtle protocol points
 
-1. **`streamingStorer` in `git_protocol.go`** wraps the storer for git:// receive-pack to **hide its `PackfileWriter` capability**. `UpdateObjectStorage`'s `PackfileWriter` path uses `io.CopyBuffer` and only returns on `io.EOF`, which deadlocks over a persistent TCP socket (the client is waiting for report-status). Hiding the capability falls through to `Parser.Parse`, which knows the pack's end from the format itself. HTTP doesn't need this — request bodies have a real EOF — so HTTP keeps the faster PackfileWriter path. Trade-off: git:// pushes write loose objects (one S3 PUT per object).
+1. **`writePack` in `receivepack.go`** stores the incoming pack whole on every transport. go-git's default `PackfileWriter` path (`WritePackfileToObjectStorage` → `io.CopyBufferPool`) copies until `io.EOF`, which deadlocks over a persistent git:// / SSH socket (the client holds the connection open awaiting report-status). Instead of relying on EOF, `writePack` drives a `packfile.Scanner` over an `io.TeeReader(rd, packWriter)`: the scanner knows the pack's end from its own framing (header object count + trailer checksum) and stops there, while the tee mirrors exactly those bytes into the `PackfileWriter`. The result is one `.pack` + one `.idx` per push — no per-object loose writes (which on S3 cost a `HeadObject` dedup `Lstat` **and** a `PutObject` each). This replaced the old `streamingStorer` hack (which hid `PackfileWriter` to force the loose-object `Parser.Parse` path on git:// / SSH); all three transports now share `writePack`.
 
 2. **No-op closers everywhere.** `transport.UploadPack`/`ReceivePack` call `Close` on the reader (and sometimes the writer) between negotiation rounds. The git:// socket can't survive that, and the HTTP `ResponseWriter` doesn't implement `Close`. Wrap with `io.NopCloser` (reader) and `ioutil.WriteNopCloser` from `go-git/v6/utils/ioutil` (writer).
 
-**SSH shares both gotchas with git://**, not HTTP: an `ssh.Session` is a persistent bidirectional stream, so `handleSSH` uses `streamingStorer{}` for receive-pack and wraps the session in the same no-op closers. (HTTP keeps the faster `PackfileWriter` path because the request body has a real EOF.)
+**SSH shares both gotchas with git://**, not HTTP: an `ssh.Session` is a persistent bidirectional stream, so `handleSSH` wraps the session in the same no-op closers and relies on the same Scanner-bounded `writePack` (gotcha #1) instead of the request-body EOF that HTTP enjoys.
+
+> **s3fs `ReadAt` contract.** Because packs are now read back via go-git's `packfile.FSObject` (which probes a packed object's handle with a 1-byte `ReadAt` and reopens the pack on `os.ErrClosed`), `s3fs`'s read file (`internal/s3fs/file.go`) returns `os.ErrClosed` from `Read`/`ReadAt`/`Seek` once closed rather than dereferencing its niled `*bytes.Reader`. A post-receive hook reading the just-pushed commit hits exactly this path.
 
 ### The auth seam (`internal/auth`)
 

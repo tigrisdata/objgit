@@ -1,4 +1,11 @@
-# Plan: groupcache-backed directory-listing cache for `internal/s3fs`
+# Plan: directory-listing cache for `internal/s3fs`
+
+> **Status note.** This started as a groupcache-backed, fleet-shareable cache
+> (hence the filename). It shipped as a **process-local `sync.Map` cache** —
+> groupcache was ripped out for simplicity. There is no cross-process sharing,
+> no peer pool, and no window-encoded key; TTL is a plain per-entry expiry. The
+> sections below are revised to match what shipped; ignore any lingering peer/
+> window phrasing.
 
 ## Context
 
@@ -17,30 +24,26 @@ authoritative content/metadata, which listings don't carry) when it's a file. Th
 `Stat`/`Open` touching an un-cached folder lists that **parent folder** in full and
 populates the cache, warming every sibling at once.
 
-**Backend (user decision): `github.com/golang/groupcache`,** so the listing cache is
-shared across processes via groupcache's consistent-hash peer pool. groupcache is a
-fill-once, **immutable** cache: no `Set`, no `Delete`, no TTL. We adapt to that with two
-techniques baked into the cache **key**:
+**Backend: process-local `sync.Map`s** (one for folder listings, one for recursive
+subtrees, one for per-object heads). Each cached entry carries two pieces of bookkeeping:
 
-- **Window-encoded TTL.** The key carries a time window `floor(now/TTL)`. When the
-  window advances the key changes → groupcache miss → the getter re-lists from S3. Old
-  keys age out by LRU. Staleness is bounded by one TTL window.
-- **Per-prefix local generation for precise in-process invalidation.** The key also
-  carries a process-local counter per prefix, bumped on every local write under that
-  prefix. A local write moves the key, so the next read in this process re-lists and
-  sees its own write immediately — recovering read-after-write correctness that
-  groupcache alone cannot give (no delete). The stale entry under the old key is simply
-  never queried again by us.
+- **Per-entry TTL.** An entry stores `expires = now + TTL`; past it the entry is ignored
+  and re-listed. This bounds how long a write this process can't see stays hidden. (There
+  is no background warmer requirement for correctness; the warmer just keeps hot entries
+  fresh and sweeps expired ones, since a `sync.Map` has no LRU.)
+- **Per-prefix local generation for precise invalidation.** A process-local counter per
+  prefix is bumped on every local write under that prefix (and its ancestors — see
+  subtree caching). An entry whose stored generation no longer matches is ignored, so the
+  next read re-lists and sees the write immediately (read-after-write correctness).
+  Concurrent identical fills are coalesced with `golang.org/x/sync/singleflight`.
 
-**Accepted limitation (explicit user choice):** cross-process and post-restart staleness
-is bounded by the TTL window — another process (or this one after a restart that resets
-the local generation) may read a just-written object as "not found" for up to one
-window. This is safe for git's _content_ (objects are immutable and content-addressed, so
-positive listings never go wrong), and the window bounds the negative-staleness risk.
-Operators tune it with `-s3-cache-ttl`; `-s3-cache-ttl 0` disables the cache and restores
-today's exact behavior.
+**Accepted limitation:** negative staleness is bounded by the TTL — a just-deleted-or-
+created object may read stale for up to one TTL. Safe for git's _content_ (objects are
+immutable and content-addressed, so positive listings never go wrong); the TTL bounds the
+negative-staleness risk. Operators tune it with `-s3-cache-ttl`; `-s3-cache-ttl 0`
+disables the cache and restores today's exact behavior.
 
-**Defaults:** on by default, tunable; single-process unless peers are configured.
+**Defaults:** on by default, tunable; always single-process.
 
 ## Correctness model
 
@@ -48,106 +51,147 @@ today's exact behavior.
   with a different `root`, so the `*ListingCache` is **shared by pointer** across a root
   fs and all chroot children, and prefixes are full-canonical (`fs3.key()`/`cleanPath` —
   root-joined, leading slash stripped). `chroot.go:21` must copy the cache pointer.
-- **groupcache key** = `prefix "\x00" window "\x00" localgen`, where
-  `window = now.Unix() / int64(ttl.Seconds())` and `localgen = c.gen(prefix)`. The
-  getter parses `prefix` back off the key (segment before the first `\x00`) and lists it.
-- **Population is via the getter only** (groupcache has no `Set`). Both `ReadDir` and the
-  `Stat`/`Open` resolution route through `group.Get`, so each folder is listed once per
-  (window, localgen) and the result feeds both. groupcache's singleflight dedupes
-  concurrent identical `Get`s (one list even when a clone fans out across siblings), and
-  the owning peer dedupes across the fleet.
+- **Cache key** is just the canonical prefix; the entry holds `{gen, expires}` alongside
+  its payload. A read hits only when `entry.gen == gen(prefix)` and `now < entry.expires`.
+- **Both `ReadDir` and `Stat`/`Open` route through `list()`**, so each folder is listed
+  once and the result feeds both; `singleflight` coalesces concurrent identical fills (one
+  list even when a clone fans out across siblings).
 - **Listing payload** carries enough to serve both consumers without a second call:
   per child `{name, kind(file|dir), size, mtimeUnixNano}` (`CommonPrefixes`→dir with
   zero size/mtime, `Contents`→file; file wins on the pathological file+prefix collision,
-  matching today's Head-first precedence). Encoded compactly (JSON is fine; listings are
-  small).
+  matching today's Head-first precedence). Stored as a Go value in the `sync.Map` — no
+  serialization.
 - **In-process writes bump the local generation** of the parent prefix at _write
   completion_, moving the key so the next read re-lists:
   - `s3WriteFile.Close` / `s3MultipartUploadFile.Close` — after the upload succeeds.
   - `Rename` (covers `TempFile`→final pack promotion), `Remove`, `MkdirAll`.
 - **Positive `Stat`/`Open` of a file** is served from a second cache, the **head
-  cache** (see [Head precache](#head-precache)), rather than a foreground `HeadObject`.
-  Listings omit the user-metadata the unix-metadata feature needs, so head metadata is
-  cached per object and **prefetched in the background** when a listing is filled. `Open`
-  still issues `GetObject` for the body but skips its `HeadObject`. A `NoSuchKey` from a
-  delete racing the listing maps to `NotExist`.
+  cache** (see [Head cache](#head-cache)), rather than a foreground `HeadObject`. The head
+  cache is **seeded straight from each listing** — `ListObjectsV2` already returns every
+  file's size and mtime — so a positive lookup costs no extra round-trip. Listings omit
+  the user-metadata the unix-metadata feature needs, so a caller that requires it (i.e.
+  unix-metadata enabled) treats a listing-seeded entry as a miss and fills via a real
+  `HeadObject`. `Open` still issues `GetObject` for the body but skips its `HeadObject`. A
+  `NoSuchKey` from a delete racing the listing maps to `NotExist`.
 
 ## Changes
 
 ### go.mod
 
-- Add `github.com/golang/groupcache` (effectively dependency-free).
+- No new direct dependency. `golang.org/x/sync/singleflight` (already vendored for
+  `errgroup`) dedupes concurrent fills.
 
 ### New file: `internal/s3fs/listingcache.go`
 
-The cache wrapper, groupcache group, key logic, and background warmer.
+The three `sync.Map` caches, the TTL/generation key logic, and the background warmer.
 
 ```go
 type CacheConfig struct {
     TTL, RefreshInterval, IdleTTL time.Duration
-    SizeBytes                     int64    // groupcache LRU budget
-    Name                          string   // group name (default "objgit-listings")
-    DisableHeadPrefetch           bool     // zero value = background head prefetch on
-    Self  string                  // this node's groupcache URL ("" = single-process)
-    Peers []string                // peer URLs (incl. self) when sharing
+    DisableHeadPrefetch           bool     // zero value = seed heads from listings on
+    RecursivePrefixes             []string // nil → {"refs/"}; empty → subtree caching off
+    MaxSubtreeKeys                int      // <=0 → 50000
 }
 
 type childKind uint8 // kindFile / kindDir
 type childEntry struct { Name string; Kind childKind; Size, Mtime int64 }
 type headData   struct { Size, Mtime int64; Meta map[string]string }
+type headCacheEntry struct { data headData; gen uint64; expires time.Time; hasMeta bool }
+type listingEntry  struct { entries []childEntry; gen uint64; expires time.Time }
+type subtreeEntry  struct { data subtreeData;     gen uint64; expires time.Time }
 
 type ListingCache struct {
-    group       *groupcache.Group           // listings, keyed by prefix
-    headGroup   *groupcache.Group           // HeadObject metadata, keyed by object key
-    pool        *groupcache.HTTPPool         // nil in single-process mode
-    ttl         time.Duration
-    cfg         CacheConfig
-    clock       func() time.Time             // overridable in tests
-    prefetchSem chan struct{}                // bounds background head precaches
-    mu          sync.Mutex
-    gens        map[string]uint64            // per-prefix local generation
-    seen        map[string]time.Time         // prefixes accessed → driven by the warmer
+    ttl       time.Duration
+    cfg       CacheConfig
+    client    s3Client
+    bucket    string
+    separator string
+    roots     []string             // normalised RecursivePrefixes, longest first
+    clock     func() time.Time     // overridable in tests
+    listings  sync.Map             // prefix     → listingEntry
+    subtrees  sync.Map             // root       → subtreeEntry
+    heads     sync.Map             // object key → headCacheEntry
+    sf, headSF singleflight.Group  // coalesce concurrent fills
+    hits, misses atomic.Int64      // for metrics
+    mu        sync.Mutex
+    gens      map[string]uint64    // per-prefix local generation
+    seen      map[string]time.Time // prefixes accessed → driven by the warmer
 }
 ```
 
-- `NewListingCache(cfg, client, bucket, separator) *ListingCache` — creates the
-  groupcache `Group` (name `"objgit-listings"`, `cfg.SizeBytes`) with a `GetterFunc`
-  closure over `client`/`bucket`/`separator` that parses the prefix from the key, runs a
-  full paginated `listChildren`, and encodes the payload into the sink. When
-  `cfg.Self != ""`, builds a `groupcache.NewHTTPPoolOpts(cfg.Self, …)` and `pool.Set(cfg.Peers…)`.
-- `list(ctx, prefix) ([]childEntry, error)` — record `seen[prefix]=now`; build the
-  groupcache key; `group.Get(ctx, key, AllocatingByteSliceSink(&buf))`; decode. This is
-  the one entry point both `ReadDir` and `Stat`/`Open` use.
-- `gen(prefix)` / `invalidate(prefix)` — `invalidate` bumps `gens[prefix]` and records
-  `seen` so the warmer re-warms the new key (no groupcache delete needed).
-- `runWarmer(ctx)` / `RunWarmer(ctx)` — `time.NewTicker(RefreshInterval)`; each tick drop
-  `seen` entries idle past `IdleTTL`, then `group.Get` the current key for each remaining
-  prefix (pre-fills the new window before clients wait and smooths window-rollover
-  herds). No-op when `RefreshInterval<=0`. Returns on `ctx.Done()` (errgroup idiom).
-- `PoolHandler() http.Handler` / `Stats()` accessors for `main` to serve peers and export
-  metrics.
+- `NewListingCache(cfg, client, bucket, separator)` — applies defaults and normalises the
+  recursive roots; no groups, no pool.
+- `list(ctx, prefix) ([]childEntry, error)` — the one entry point both `ReadDir` and
+  `Stat`/`Open` use. Routes recursive prefixes to `subtree`; otherwise `listFolder`
+  (sync.Map lookup gated on gen+expiry, `fillFolder` via singleflight on a miss).
+- `gen(prefix)` / `invalidate(prefix)` — `invalidate` bumps the generation of `prefix`
+  **and every ancestor** and records `seen` (so the warmer refreshes them).
+- `RunWarmer(ctx)` — `time.NewTicker(RefreshInterval)`; each tick drops `seen` entries idle
+  past `IdleTTL`, re-fills the rest (routing recursive→subtree, deduped), then sweeps
+  expired entries from all three maps (no LRU, so the warmer bounds growth). No-op when
+  `RefreshInterval<=0`. Returns on `ctx.Done()`.
+- `Stats()` accessor exports hit/miss counters and resident item counts to metrics.
 - `splitKey(key) (prefix, base)` — split on last `/`; no slash → `("", key)`.
 
-### Head precache
+### Head cache
 
-A **second groupcache group** (`<name>-heads`, keyed by object key) caches each file's
-`HeadObject` result — `headData{size, mtimeUnixNano, meta}` — so positive `Stat`/`Open`
-never pay a foreground `HeadObject`. The head key reuses the window + the **parent
-prefix's** local generation, so a write under that prefix re-heads the object exactly as
-it re-lists the folder.
+The per-object head cache is a **`sync.Map`** of `headCacheEntry`, keyed by
+canonical object key — like the listing and subtree caches. An
+entry is a hit only while (a) unexpired (`expires`, one TTL past fill), (b) still tagged
+with its parent prefix's current local generation — so `invalidate`'s generation bump
+drops every cached head under the prefix without a map scan, mirroring listing
+invalidation — and (c) carrying user metadata when the caller needs it (`hasMeta`).
 
-- **Background prefetch (`prefetchHeads`).** When the listing getter fills a folder, it
-  launches a **detached goroutine per file** (`go headGroup.Get(context.Background(), …)`)
-  to warm the head cache off the request's critical path; groupcache singleflight
-  coalesces a background precache with any foreground head lookup for the same object. A
-  semaphore (`maxPrefetchInFlight = 64`) bounds the in-flight precaches so a large folder
-  can't spawn an unbounded goroutine/S3 storm — overflow files are fetched on demand
-  (logged at debug). `CacheConfig.DisableHeadPrefetch` turns this off (zero value = on).
-- **`headInfo(ctx, key) (*s3.HeadObjectOutput, error)`** serves a foreground lookup from
-  the head cache (a warm hit costs no round-trip; a miss fills via one `HeadObject`).
-- `Stat`/`Open` of a present file call `headInfo`; `newS3ReadFile` gains an optional
-  precomputed `*s3.HeadObjectOutput` so it skips its own `HeadObject` and only `GetObject`s
-  the body.
+- **Seeded from listings (`seedHeads`), not separately fetched.** When the listing getter
+  fills a folder, it stores a `headCacheEntry` for every file **directly from the
+  `ListObjectsV2` data** (size + mtime), with `hasMeta=false`. This warms the head cache
+  with **zero** extra `HeadObject` calls — the listing already paid for the data.
+  `CacheConfig.DisableHeadPrefetch` turns seeding off (zero value = on).
+- **`headInfo(ctx, key, needMeta) (*s3.HeadObjectOutput, error)`** serves a foreground
+  lookup. A warm hit costs no round-trip. `needMeta` reports whether the caller needs the
+  x-amz-meta-* user metadata (true iff unix-metadata is enabled): when true, a
+  listing-seeded (`hasMeta=false`) entry is treated as a miss and filled via one real
+  `HeadObject` (which stores `hasMeta=true`). `headSF` (a `singleflight.Group`) dedupes
+  concurrent fills for the same key.
+- The warmer also **sweeps expired head entries** each tick — the `sync.Map` has no LRU,
+  so the warmer is what bounds its growth to roughly the live working set.
+- `Stat`/`Open` of a present file call `headInfo` with `needMeta = fs3.unixMeta != nil`;
+  `newS3ReadFile` gains an optional precomputed `*s3.HeadObjectOutput` so it skips its own
+  `HeadObject` and only `GetObject`s the body.
+
+### Subtree caching (`RecursivePrefixes`)
+
+Caching one folder per `ListObjectsV2` is wasteful for bounded namespaces that callers
+walk folder-by-folder — `refs/` above all (`refs/`, `refs/heads/`, `refs/tags/`,
+`refs/remotes/…`, each its own delimited list). A **single delimiter-less
+`ListObjectsV2` over `refs/`** returns the whole subtree; every descendant folder's
+listing and every negative lookup beneath it is then synthesised in memory.
+
+- **A second `sync.Map`** (`subtrees`, keyed by root) holds `subtreeData{ Objects
+  []subtreeObject; Truncated bool }` — the flat key+size+mtime set under a root — in a
+  `subtreeEntry{gen, expires}`, the same TTL/generation scheme as folder listings.
+- **`list(prefix)` routes**: if `recursiveRoot(prefix)` matches a configured root, serve
+  from `subtree(root)` via `synthesizeListing(objects, prefix)` (remainder-after-prefix
+  with a `/` ⇒ child dir, deduped; else child file). Otherwise the existing delimited
+  path. A complete subtree is authoritative for negative lookups (it has *all* keys under
+  the root); only `!Truncated` subtrees are trusted.
+- **Bounded.** `listSubtree` stops once it exceeds `MaxSubtreeKeys` (default 50000) and
+  reports `Truncated`; `list` then **falls back to the delimited per-folder listing**, so
+  an unbounded namespace can't blow up memory. The truncated marker is itself cached, so
+  the fallback costs one near-free subtree-cache hit plus the folder list.
+- **Invalidation walks ancestors.** `invalidate(prefix)` now bumps the generation of
+  `prefix` **and every parent up to `""`** (`ancestorPrefixes`), so a write to
+  `refs/tags/v1` moves the `refs/` subtree key (and the root listing's). Trade-off: a
+  broader blast radius — a write also re-lists the coarser folders above it on their next
+  read. Acceptable because writes are pushes and a re-list after a push is expected.
+- **Head seeding** extends to subtrees: a complete scan seeds every file's head
+  (`seedSubtreeHeads`), each tagged with its own parent prefix's generation. A truncated
+  scan seeds nothing (leaves heads to the fallback path).
+- **Warmer routing** mirrors `list`: seen prefixes under a recursive root warm that root's
+  subtree (deduped across siblings) rather than per-folder.
+- **Config**: `CacheConfig.RecursivePrefixes` (nil ⇒ `{"refs/"}`; explicit empty ⇒ off)
+  and `MaxSubtreeKeys`. `main.go` exposes `-s3-cache-recursive-prefixes` (default `refs/`,
+  empty disables) and `-s3-cache-max-subtree-keys` (default 50000).
 
 ### `internal/s3fs/filesystem.go`
 
@@ -164,8 +208,8 @@ it re-lists the folder.
 - Extract `listChildren(ctx, client, bucket, separator, prefix) ([]childEntry, error)` —
   the paginated `ListObjectsV2` loop, classifying `CommonPrefixes`→dir, `Contents`→file
   with size/mtime, dirs-then-files preserving S3 order. A free function so the getter
-  (which holds only the raw client) can reuse it. Used by `ReadDir` (cache off) and both
-  getters.
+  (which holds only the raw client) can reuse it. Used by `ReadDir` (cache off) and the
+  listing getter.
 - `ReadDir`: when `cache != nil`, get the entries via `cache.list(ctx, prefix)` and
   build `[]fs.DirEntry` from them (rebuilding `newDirInfo`/`newFileInfo` from the payload);
   otherwise list directly as today.
@@ -196,54 +240,45 @@ it re-lists the folder.
 
 ### `internal/metrics/metrics.go`
 
-- A Prometheus collector that reads `ListingCache.Stats()` (groupcache `group.Stats`:
-  Gets, CacheHits, Loads, LocalLoads, PeerLoads, LoaderErrors; plus `CacheStats` bytes/
-  items/evictions) and exports them as `objgit_s3_listing_cache_*` gauges/counters. No
-  `repo` label. (groupcache fills are already counted as `ListObjectsV2` via `observeS3`.)
-  `main` registers it only when the cache is enabled.
+- A Prometheus collector that reads `ListingCache.Stats()` (`{Hits, Misses, ListingItems,
+  SubtreeItems, HeadItems}`) and exports `objgit_s3_listing_cache_hits_total`,
+  `_misses_total`, and `_items{kind=listing|subtree|head}`. No `repo` label. (Cache fills
+  are already counted as `ListObjectsV2`/`HeadObject` via `observeS3`.) `main` registers it
+  only when the cache is enabled.
 
 ### `cmd/objgitd/main.go`
 
-- New flags (kebab-case + flagenv) in the `var (...)` block at `main.go:32`:
-  - `-s3-cache-ttl` (`Duration`, default `60s`) — window size; `<=0` disables the cache.
+- Flags (kebab-case + flagenv):
+  - `-s3-cache-ttl` (`Duration`, default `60s`) — per-entry TTL; `<=0` disables the cache.
   - `-s3-cache-refresh` (`Duration`, default `30s`) — warmer interval; `<=0` disables the
     warmer (lazy fill still works).
   - `-s3-cache-idle` (`Duration`, default `10m`) — drop un-accessed prefixes from the warmer.
-  - `-s3-cache-size` (`Int64`, default `64<<20`) — groupcache LRU budget.
-  - `-groupcache-self` (`String`, default `""`) — this node's groupcache base URL; empty =
-    single-process.
-  - `-groupcache-peers` (`String`, default `""`) — comma-separated peer URLs.
-  - `-groupcache-bind` (`String`, default `""`) — listen addr serving `PoolHandler()`.
+  - `-s3-cache-recursive-prefixes` (`String`, default `refs/`) — comma-separated subtree
+    roots; empty disables subtree caching.
+  - `-s3-cache-max-subtree-keys` (`Int`, default `50000`) — subtree scan cap.
 - When `ttl > 0`: build `cache := s3fs.NewListingCache(cfg, client, *bucket, "/")`, pass
-  `s3fs.WithListingCache(cache)` into `NewS3FS` (`main.go:78`), register the metrics
-  collector, and in the errgroup:
-  - if `-groupcache-bind != ""`, `net.Listen` + serve `cache.PoolHandler()` (plus the
-    Serve/`Shutdown`-on-`gCtx.Done()` two-goroutine idiom used by the other listeners).
-  - `g.Go(func() error { cache.RunWarmer(gCtx); return nil })`.
+  `s3fs.WithListingCache(cache)` into `NewS3FS`, register the metrics collector, and add
+  `g.Go(func() error { cache.RunWarmer(gCtx); return nil })` to the errgroup.
 - Add the cache settings to the startup `slog.Info` line.
 
 ## Why this is acceptably safe
 
 Within a single git operation the repeated negative lookups happen within milliseconds,
-so even a 60s window eliminates essentially all redundant `HeadObject`+probe pairs, and
-the first miss in a folder warms every sibling via one parent listing (deduped by
-groupcache singleflight, fleet-wide via the owning peer). Local writes bump the
-per-prefix generation, so a push reads its own objects immediately. git object _content_
-is immutable, so positive/`ReadDir` results are never wrong about what exists — only the
-_recency_ of newly-added entries is window-bounded. The residual risk is a cross-process
-(or post-restart) negative read of an object another writer just created, bounded by one
-TTL window — the limitation the user explicitly accepted; `-s3-cache-ttl 0` opts out
-entirely. Note: writes fragment the shared keyspace for written prefixes (each writer's
-`localgen` differs), so cross-process sharing is strongest on the read-only prefixes that
-dominate clone/fetch and weakest on actively-pushed prefixes — which is the desirable
-bias.
+so even a 60s TTL eliminates essentially all redundant `HeadObject`+probe pairs, and the
+first miss in a folder warms every sibling via one parent listing (deduped by
+singleflight). Local writes bump the per-prefix generation (and its ancestors'), so a
+push reads its own objects immediately. git object _content_ is immutable, so
+positive/`ReadDir` results are never wrong about what exists — only the _recency_ of
+newly-added entries is TTL-bounded. The residual risk is a negative read of an object
+another process just created (this cache is process-local), bounded by one TTL; `-s3-cache-ttl 0`
+opts out entirely.
 
 ## Verification
 
 1. `go build ./...`; `go mod tidy`; `go test ./...`.
 2. **Cache disabled = no behavior change:** the cache is only wired when `-s3-cache-ttl>0`;
    existing protocol tests (`go test ./cmd/objgitd/...`, needs `git` on PATH) must pass
-   with the cache off and on (single-process, no peers).
+   with the cache off and on.
 3. **New unit tests in `internal/s3fs`** (table-driven `tt`, counting-stub `storage.Client`):
    - **Populate-on-miss:** first `Stat` of an absent key in a never-listed folder issues
      exactly one `ListObjectsV2` (the parent) and **zero** `HeadObject`; a second absent
@@ -251,17 +286,19 @@ bias.
    - `ReadDir` then `Stat`/`Open` of an absent sibling → zero S3; a dir child → zero S3.
    - **Local invalidation:** `Create`+`Close` / `Rename` / `Remove` / `MkdirAll` bump the
      generation so a following `Stat`/`ReadDir` re-lists and sees the change (read-after-write).
-   - **Window TTL:** advancing time past `TTL` changes the key → re-list (inject a clock or
-     a settable `now` in `ListingCache` for the test).
-   - **Warmer:** `RunWarmer` re-`Get`s accessed prefixes and evicts idle ones past `IdleTTL`.
+   - **TTL expiry:** advancing time past `TTL` expires the entry → re-list (inject a clock
+     or a settable `now` in `ListingCache` for the test).
+   - **Warmer:** `RunWarmer` re-fills accessed prefixes and evicts idle ones past `IdleTTL`.
    - **Chroot sharing:** `ReadDir` on the root then `Stat` of an absent child through a
      chroot resolves from the same cached prefix (same canonical key).
-   - **Head precache:** one listing fill warms every file's head in the background; once
-     warm, `Stat` of a file does **zero** further `HeadObject`s (counting-stub tests
-     disable prefetch for determinism; a dedicated test enables it and waits for warmup).
-4. **Two-process sharing (manual):** run two `objgitd` with `-groupcache-self`/`-peers`
-   pointing at each other; clone through one and confirm via `objgit_s3_listing_cache_*`
-   (PeerLoads > 0 on the non-owner) that listings are served cross-process.
-5. **End-to-end:** `./objgitd -bucket $BUCKET -allow-push`; clone a packed repo twice and
+   - **Head seeding:** one listing fill seeds every file's head from the `ListObjectsV2`
+     data with **zero** `HeadObject`s; `Stat` of a seeded file then does **zero** further
+     `HeadObject`s (counting-stub tests disable seeding for determinism; a dedicated test
+     enables it and asserts no heads are issued).
+   - **Subtree caching:** one read of any `refs/` folder scans the subtree once; other
+     `refs/` folders and negative lookups beneath them then do **zero** S3; a write to a
+     sibling `refs/` folder re-scans (ancestor invalidation) and is visible; a subtree
+     past `MaxSubtreeKeys` falls back to a delimited listing yet still returns correctly.
+4. **End-to-end:** `./objgitd -bucket $BUCKET -allow-push`; clone a packed repo twice and
    confirm `objgit_s3_requests_total{operation="HeadObject"}` grows far slower than with
-   `-s3-cache-ttl 0`.
+   `-s3-cache-ttl 0`, and watch `objgit_s3_listing_cache_hits_total` climb.

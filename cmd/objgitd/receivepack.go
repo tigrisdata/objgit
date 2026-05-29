@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/go-git/go-git/v6/config"
 	"github.com/go-git/go-git/v6/plumbing"
+	formatcfg "github.com/go-git/go-git/v6/plumbing/format/config"
 	"github.com/go-git/go-git/v6/plumbing/format/packfile"
 	"github.com/go-git/go-git/v6/plumbing/format/pktline"
 	"github.com/go-git/go-git/v6/plumbing/protocol"
@@ -115,7 +117,7 @@ func receivePackStreaming(
 	// Receive the packfile
 	var unpackErr error
 	if needPackfile {
-		unpackErr = packfile.UpdateObjectStorage(st, rd)
+		unpackErr = writePack(st, rd)
 	}
 
 	// Done with the request, now close the reader
@@ -180,6 +182,44 @@ func receivePackStreaming(
 		return firstErr
 	}
 	return closeWriter(w)
+}
+
+// writePack stores the incoming packfile as a single packfile object via the
+// storer's PackfileWriter, delimiting the pack with a Scanner rather than waiting
+// for the reader to reach io.EOF. go-git's default PackfileWriter path
+// (WritePackfileToObjectStorage → io.CopyBufferPool until EOF) deadlocks on a
+// persistent git:// / SSH socket, where the client holds the connection open
+// awaiting report-status. The Scanner knows the pack's end from its own framing
+// (header object count + trailer checksum) and stops there, while a TeeReader
+// mirrors exactly those bytes into the PackfileWriter — so the whole pack lands as
+// one object on every transport. Falls back to UpdateObjectStorage (loose objects)
+// if the storer cannot write packs.
+func writePack(st storage.Storer, rd io.Reader) error {
+	pw, ok := st.(storer.PackfileWriter)
+	if !ok {
+		return packfile.UpdateObjectStorage(st, rd)
+	}
+
+	var sopts []packfile.ScannerOption
+	if c, ok := st.(config.ConfigStorer); ok {
+		if cfg, err := c.Config(); err == nil && cfg.Extensions.ObjectFormat == formatcfg.SHA256 {
+			sopts = append(sopts, packfile.WithSHA256())
+		}
+	}
+
+	w, err := pw.PackfileWriter()
+	if err != nil {
+		return err
+	}
+
+	sc := packfile.NewScanner(io.TeeReader(rd, w), sopts...)
+	for sc.Scan() {
+	}
+	if err := sc.Error(); err != nil {
+		_ = w.Close()
+		return err
+	}
+	return w.Close()
 }
 
 // sidebandProgress writes to the sideband progress channel (band 2), which the

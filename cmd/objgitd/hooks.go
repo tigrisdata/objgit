@@ -81,15 +81,16 @@ func diffRefs(before, after map[plumbing.ReferenceName]plumbing.Hash) []refUpdat
 // the repository's receive-pack hook for each updated branch once the push
 // succeeds — synchronously, streaming hook output to the client over the
 // sideband progress channel (rendered as "remote: " lines) before the response
-// stream is closed. rpStorer is what the service writes through (the git:// and
-// SSH paths hide the PackfileWriter capability via streamingStorer); readStorer
-// is the underlying storer used for ref snapshots and hook checkouts.
-func (d *daemon) receivePack(ctx context.Context, rpStorer, readStorer storage.Storer, repoPath string, r io.ReadCloser, w io.WriteCloser, req *transport.ReceivePackRequest) error {
+// stream is closed. st is both what the service writes through and the storer
+// used for ref snapshots and hook checkouts — all three transports now share the
+// same Scanner-bounded PackfileWriter path (see writePack), so no transport needs
+// a capability-hiding wrapper.
+func (d *daemon) receivePack(ctx context.Context, st storage.Storer, repoPath string, r io.ReadCloser, w io.WriteCloser, req *transport.ReceivePackRequest) error {
 	if !d.allowHooks {
-		return receivePackStreaming(ctx, rpStorer, r, w, req, nil)
+		return receivePackStreaming(ctx, st, r, w, req, nil)
 	}
 
-	before, err := snapshotRefs(readStorer)
+	before, err := snapshotRefs(st)
 	if err != nil {
 		slog.Warn("hook: ref snapshot before push failed", "path", repoPath, "err", err)
 	}
@@ -99,7 +100,7 @@ func (d *daemon) receivePack(ctx context.Context, rpStorer, readStorer storage.S
 	// progress is the sideband band-2 writer, or nil when the client did not
 	// negotiate sideband (hooks then fall back to logging only).
 	onUpdated := func(progress io.Writer) {
-		after, err := snapshotRefs(readStorer)
+		after, err := snapshotRefs(st)
 		if err != nil {
 			slog.Error("hook: ref snapshot after push failed", "path", repoPath, "err", err)
 			return
@@ -108,10 +109,10 @@ func (d *daemon) receivePack(ctx context.Context, rpStorer, readStorer storage.S
 		if len(updates) == 0 {
 			return
 		}
-		d.runHooks(repoPath, "receive-pack", readStorer, updates, progress)
+		d.runHooks(repoPath, "receive-pack", st, updates, progress)
 	}
 
-	return receivePackStreaming(ctx, rpStorer, r, w, req, onUpdated)
+	return receivePackStreaming(ctx, st, r, w, req, onUpdated)
 }
 
 // runHooks executes the receive-pack hook once per non-deleted branch update,

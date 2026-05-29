@@ -219,9 +219,9 @@ func (d *daemon) serveSSH(s ssh.Session, service, repoPath string) error {
 			_ = s.Exit(1)
 			return fmt.Errorf("opening %q for push: %w", repoPath, err)
 		}
-		// streamingStorer hides PackfileWriter (the io.CopyBuffer-until-EOF path
-		// deadlocks on a live socket); d.receivePack runs push hooks afterward.
-		if err := d.receivePack(ctx, streamingStorer{Storer: st}, st, repoPath, r, w, &transport.ReceivePackRequest{}); err != nil {
+		// d.receivePack stores the pack whole (Scanner-bounded PackfileWriter, see
+		// writePack) and runs push hooks afterward.
+		if err := d.receivePack(ctx, st, repoPath, r, w, &transport.ReceivePackRequest{}); err != nil {
 			slog.Error("ssh receive-pack failed", "path", repoPath, "err", err)
 			return err
 		}

@@ -243,6 +243,11 @@ func TestSSH(t *testing.T) {
 			if !pushLanded && statErr == nil {
 				t.Fatal("repository must not exist when push did not land")
 			}
+			if pushLanded {
+				// SSH shares the Scanner-bounded PackfileWriter path: the push
+				// must land as a packfile, not loose objects.
+				assertPackedRepo(t, fs, "/test.git")
+			}
 
 			dst := t.TempDir()
 			out, err := gitWithEnv(dst, env, "clone", remote, "cloned")

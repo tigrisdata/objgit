@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 	"sort"
@@ -132,15 +131,10 @@ func (s *stubClient) CompleteMultipartUpload(_ context.Context, in *s3.CompleteM
 	return &s3.CompleteMultipartUploadOutput{}, nil
 }
 
-// gcSeq gives every test cache a unique groupcache group name; NewGroup panics
-// on a duplicate name.
-var gcSeq atomic.Int64
-
-// newTestCache disables the background head precache so S3-call counts are
-// deterministic; TestListingCacheHeadPrefetch exercises it explicitly.
+// newTestCache disables listing-driven head seeding so S3-call counts are
+// deterministic; TestListingCacheHeadSeed exercises it explicitly.
 func newTestCache(stub *stubClient, ttl time.Duration) *ListingCache {
-	n := gcSeq.Add(1)
-	return NewListingCache(CacheConfig{TTL: ttl, Name: fmt.Sprintf("test-%d", n), DisableHeadPrefetch: true}, stub, "bucket", "/")
+	return NewListingCache(CacheConfig{TTL: ttl, DisableHeadPrefetch: true}, stub, "bucket", "/")
 }
 
 func newCachedFS(t *testing.T, stub *stubClient, cache *ListingCache) billy.Filesystem {
@@ -320,37 +314,147 @@ func TestListingCacheWarmer(t *testing.T) {
 	}
 }
 
-func TestListingCacheHeadPrefetch(t *testing.T) {
+func TestListingCacheHeadSeed(t *testing.T) {
 	stub := newStub("objects/ab/f1", "objects/ab/f2")
-	n := gcSeq.Add(1)
-	cache := NewListingCache(CacheConfig{TTL: time.Hour, Name: fmt.Sprintf("test-%d", n)}, stub, "bucket", "/")
+	cache := NewListingCache(CacheConfig{TTL: time.Hour}, stub, "bucket", "/")
 	fsys := newCachedFS(t, stub, cache)
 
-	// A single listing fill (here triggered by an absent lookup) prefetches the
-	// HeadObject for every file in the folder, in the background.
+	// A single listing fill (here triggered by an absent lookup) seeds the head
+	// cache for every file in the folder straight from the ListObjectsV2 data —
+	// no HeadObject round-trips at all.
 	if _, err := fsys.Stat("objects/ab/nope"); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("Stat: %v", err)
 	}
-
-	// Wait for the two background HeadObjects to land.
-	deadline := time.Now().Add(2 * time.Second)
-	for stub.heads.Load() < 2 {
-		if time.Now().After(deadline) {
-			t.Fatalf("prefetch did not warm both heads: got %d", stub.heads.Load())
-		}
-		time.Sleep(time.Millisecond)
-	}
-	if got := stub.heads.Load(); got != 2 {
-		t.Fatalf("prefetch heads = %d, want 2", got)
+	if got := stub.heads.Load(); got != 0 {
+		t.Fatalf("seeding issued HeadObjects: got %d, want 0", got)
 	}
 
-	// Stat of a prewarmed file is served from the head cache: no new HeadObject.
-	h0 := stub.heads.Load()
-	if _, err := fsys.Stat("objects/ab/f1"); err != nil {
+	// Stat of a seeded file is served from the head cache: still no HeadObject,
+	// and it reports a file with the listed size.
+	fi, err := fsys.Stat("objects/ab/f1")
+	if err != nil {
 		t.Fatalf("Stat f1: %v", err)
 	}
-	if stub.heads.Load() != h0 {
-		t.Fatalf("prewarmed Stat did a HeadObject: %d->%d", h0, stub.heads.Load())
+	if fi.IsDir() {
+		t.Fatalf("Stat f1: reported a directory")
+	}
+	if got := stub.heads.Load(); got != 0 {
+		t.Fatalf("seeded Stat did a HeadObject: got %d, want 0", got)
+	}
+}
+
+func TestListingCacheSubtreeCollapsesFolders(t *testing.T) {
+	stub := newStub("refs/heads/main", "refs/heads/dev", "refs/tags/v1")
+	cache := newTestCache(stub, time.Hour) // default RecursivePrefixes = {"refs/"}
+	fsys := newCachedFS(t, stub, cache)
+
+	// The first touch of any refs/ folder scans the whole refs/ subtree once.
+	entries, err := fsys.ReadDir("refs/heads")
+	if err != nil {
+		t.Fatalf("ReadDir refs/heads: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("refs/heads entries = %d, want 2", len(entries))
+	}
+	if stub.lists.Load() != 1 {
+		t.Fatalf("first refs read lists = %d, want 1", stub.lists.Load())
+	}
+
+	// A different refs/ folder is served from that same subtree: no new S3.
+	l0 := stub.lists.Load()
+	tags, err := fsys.ReadDir("refs/tags")
+	if err != nil {
+		t.Fatalf("ReadDir refs/tags: %v", err)
+	}
+	if len(tags) != 1 {
+		t.Fatalf("refs/tags entries = %d, want 1", len(tags))
+	}
+	if stub.lists.Load() != l0 {
+		t.Fatalf("second refs folder re-listed: %d->%d", l0, stub.lists.Load())
+	}
+
+	// refs/ itself synthesises its child directories from the subtree.
+	top, err := fsys.ReadDir("refs")
+	if err != nil {
+		t.Fatalf("ReadDir refs: %v", err)
+	}
+	if len(top) != 2 {
+		t.Fatalf("refs entries = %d, want 2 (heads, tags)", len(top))
+	}
+	for _, e := range top {
+		if !e.IsDir() {
+			t.Fatalf("refs child %q not a directory", e.Name())
+		}
+	}
+
+	// And a negative lookup anywhere under refs/ is free.
+	if _, err := fsys.Stat("refs/heads/missing"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Stat missing: want ErrNotExist, got %v", err)
+	}
+	if stub.lists.Load() != l0 {
+		t.Fatalf("negative lookup did S3: %d->%d", l0, stub.lists.Load())
+	}
+}
+
+func TestListingCacheSubtreeInvalidate(t *testing.T) {
+	stub := newStub("refs/heads/main")
+	cache := newTestCache(stub, time.Hour)
+	fsys := newCachedFS(t, stub, cache)
+
+	// Warm the whole refs/ subtree by reading one folder.
+	if _, err := fsys.ReadDir("refs/heads"); err != nil {
+		t.Fatalf("ReadDir refs/heads: %v", err)
+	}
+	if stub.lists.Load() != 1 {
+		t.Fatalf("warm lists = %d, want 1", stub.lists.Load())
+	}
+
+	// Write a ref into a *sibling* folder. Ancestor invalidation must move the
+	// refs/ subtree key so the next read re-scans and sees it.
+	f, err := fsys.Create("refs/tags/v1")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := f.Write([]byte("deadbeef")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	tags, err := fsys.ReadDir("refs/tags")
+	if err != nil {
+		t.Fatalf("ReadDir refs/tags after write: %v", err)
+	}
+	if len(tags) != 1 {
+		t.Fatalf("refs/tags entries = %d, want 1", len(tags))
+	}
+	if stub.lists.Load() < 2 {
+		t.Fatalf("subtree not re-scanned after sibling write: lists = %d", stub.lists.Load())
+	}
+}
+
+func TestListingCacheSubtreeTruncationFallback(t *testing.T) {
+	stub := newStub("refs/heads/a", "refs/heads/b", "refs/heads/c")
+	cache := NewListingCache(CacheConfig{
+		TTL:                 time.Hour,
+		DisableHeadPrefetch: true,
+		MaxSubtreeKeys:      2, // 3 refs exceed the cap → subtree abandoned
+	}, stub, "bucket", "/")
+	fsys := newCachedFS(t, stub, cache)
+
+	// The oversized subtree scan is abandoned; the folder is still served
+	// correctly, by falling back to a delimited per-folder listing.
+	entries, err := fsys.ReadDir("refs/heads")
+	if err != nil {
+		t.Fatalf("ReadDir refs/heads: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("entries = %d, want 3", len(entries))
+	}
+	// One truncated subtree scan + one delimited fallback listing.
+	if stub.lists.Load() != 2 {
+		t.Fatalf("fallback lists = %d, want 2", stub.lists.Load())
 	}
 }
 

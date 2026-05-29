@@ -3,8 +3,42 @@ package s3fs
 import (
 	"bytes"
 	"errors"
+	"os"
 	"testing"
 )
+
+// TestS3ReadFileClosed locks in the billy contract go-git's
+// packfile.FSObject.Reader depends on: once a read file is closed, Read/ReadAt/Seek
+// must return an os.ErrClosed-matching error rather than dereferencing the nil
+// reader and panicking. FSObject probes a packed object's handle with a 1-byte
+// ReadAt and reopens the pack when it sees os.ErrClosed; the previous nil-deref
+// panic crashed the server when a cache-resident object outlived its pack handle
+// (e.g. a post-receive hook reading the just-pushed commit).
+func TestS3ReadFileClosed(t *testing.T) {
+	newClosed := func() *s3ReadFile {
+		f := &s3ReadFile{name: "k", reader: bytes.NewReader([]byte("hello"))}
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		return f
+	}
+
+	t.Run("ReadAt", func(t *testing.T) {
+		if _, err := newClosed().ReadAt(make([]byte, 1), 0); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("ReadAt after close: err = %v, want os.ErrClosed", err)
+		}
+	})
+	t.Run("Read", func(t *testing.T) {
+		if _, err := newClosed().Read(make([]byte, 1)); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("Read after close: err = %v, want os.ErrClosed", err)
+		}
+	})
+	t.Run("Seek", func(t *testing.T) {
+		if _, err := newClosed().Seek(0, 0); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("Seek after close: err = %v, want os.ErrClosed", err)
+		}
+	})
+}
 
 // TestS3WriteFileWrite locks in two invariants on the write path that a prior
 // stub silently broke: every Write must append its bytes to the buffer, and

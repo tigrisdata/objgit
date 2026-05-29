@@ -126,16 +126,29 @@ func (f *s3ReadFile) WriteAt(p []byte, off int64) (n int, err error) {
 
 // Read implements io.Reader for billy.File
 func (f *s3ReadFile) Read(p []byte) (n int, err error) {
+	if f.closed || f.reader == nil {
+		return 0, os.ErrClosed
+	}
 	return f.reader.Read(p)
 }
 
-// ReadAt implements io.ReaderAt for billy.File
+// ReadAt implements io.ReaderAt for billy.File. It returns os.ErrClosed once the
+// file is closed (rather than dereferencing the nil reader and panicking): go-git's
+// packfile.FSObject.Reader probes with a 1-byte ReadAt and reopens the pack when it
+// sees an os.ErrClosed-matching error, so a cache-resident object over a closed pack
+// handle recovers instead of crashing.
 func (f *s3ReadFile) ReadAt(p []byte, off int64) (n int, err error) {
+	if f.closed || f.reader == nil {
+		return 0, os.ErrClosed
+	}
 	return f.reader.ReadAt(p, off)
 }
 
 // Seek implements io.Seeker for billy.File
 func (f *s3ReadFile) Seek(offset int64, whence int) (int64, error) {
+	if f.closed || f.reader == nil {
+		return 0, os.ErrClosed
+	}
 	return f.reader.Seek(offset, whence)
 }
 

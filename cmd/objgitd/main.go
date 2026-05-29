@@ -45,11 +45,9 @@ var (
 	s3CacheTTL     = flag.Duration("s3-cache-ttl", 60*time.Second, "how long a cached S3 directory listing answers Stat/Open before a re-list; 0 disables the listing cache")
 	s3CacheRefresh = flag.Duration("s3-cache-refresh", 30*time.Second, "interval at which the listing-cache warmer re-fills hot prefixes; 0 disables the warmer")
 	s3CacheIdle    = flag.Duration("s3-cache-idle", 10*time.Minute, "drop a prefix from the listing-cache warmer after this long without access")
-	s3CacheSize    = flag.Int64("s3-cache-size", 64<<20, "groupcache LRU budget in bytes for the listing cache")
 
-	groupcacheSelf  = flag.String("groupcache-self", "", "this node's groupcache base URL (e.g. http://10.0.0.1:8000); empty runs the cache single-process")
-	groupcachePeers = flag.String("groupcache-peers", "", "comma-separated groupcache peer base URLs (including self) for cross-process sharing")
-	groupcacheBind  = flag.String("groupcache-bind", "", "TCP address to serve the groupcache peer endpoint; empty disables peer sharing")
+	s3CacheRecursive  = flag.String("s3-cache-recursive-prefixes", "refs/", "comma-separated key prefixes served from one recursive subtree scan instead of a listing per folder; empty disables subtree caching")
+	s3CacheMaxSubtree = flag.Int("s3-cache-max-subtree-keys", 50000, "abandon a recursive subtree scan past this many keys and fall back to per-folder listing")
 )
 
 func main() {
@@ -88,26 +86,25 @@ func main() {
 	var cache *s3fs.ListingCache
 	var fsOpts []s3fs.Option
 	if *s3CacheTTL > 0 {
-		var peers []string
-		if *groupcachePeers != "" {
-			peers = strings.Split(*groupcachePeers, ",")
+		// Non-nil (even empty) so an empty flag explicitly disables subtree
+		// caching rather than falling back to the {"refs/"} default.
+		recursive := []string{}
+		if *s3CacheRecursive != "" {
+			recursive = strings.Split(*s3CacheRecursive, ",")
 		}
 		cache = s3fs.NewListingCache(s3fs.CacheConfig{
-			TTL:             *s3CacheTTL,
-			RefreshInterval: *s3CacheRefresh,
-			IdleTTL:         *s3CacheIdle,
-			SizeBytes:       *s3CacheSize,
-			Self:            *groupcacheSelf,
-			Peers:           peers,
+			TTL:               *s3CacheTTL,
+			RefreshInterval:   *s3CacheRefresh,
+			IdleTTL:           *s3CacheIdle,
+			RecursivePrefixes: recursive,
+			MaxSubtreeKeys:    *s3CacheMaxSubtree,
 		}, client, *bucket, "/")
 		fsOpts = append(fsOpts, s3fs.WithListingCache(cache))
 		metrics.RegisterListingCache(func() metrics.ListingCacheStats {
 			s := cache.Stats()
 			return metrics.ListingCacheStats{
-				Gets: s.Gets, CacheHits: s.CacheHits, Loads: s.Loads,
-				LocalLoads: s.LocalLoads, PeerLoads: s.PeerLoads, LocalLoadErrs: s.LocalLoadErrs,
-				MainBytes: s.MainBytes, MainItems: s.MainItems, MainEvictions: s.MainEvictions,
-				HotBytes: s.HotBytes, HotItems: s.HotItems,
+				Hits: s.Hits, Misses: s.Misses,
+				ListingItems: s.ListingItems, SubtreeItems: s.SubtreeItems, HeadItems: s.HeadItems,
 			}
 		})
 	}
@@ -136,7 +133,7 @@ func main() {
 		"allow_hooks", *allowHooks,
 		"s3_cache_ttl", *s3CacheTTL,
 		"s3_cache_refresh", *s3CacheRefresh,
-		"groupcache_self", *groupcacheSelf,
+		"s3_cache_recursive_prefixes", *s3CacheRecursive,
 	)
 
 	g, gCtx := errgroup.WithContext(ctx)
@@ -146,32 +143,6 @@ func main() {
 			cache.RunWarmer(gCtx)
 			return nil
 		})
-
-		if *groupcacheBind != "" {
-			handler := cache.PoolHandler()
-			if handler == nil {
-				slog.Error("-groupcache-bind set without -groupcache-self; peer sharing is disabled")
-				os.Exit(1)
-			}
-			ln, err := net.Listen("tcp", *groupcacheBind)
-			if err != nil {
-				slog.Error("can't listen", "groupcache_bind", *groupcacheBind, "err", err)
-				os.Exit(1)
-			}
-			srv := &http.Server{Handler: handler}
-			g.Go(func() error {
-				if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-					return err
-				}
-				return nil
-			})
-			g.Go(func() error {
-				<-gCtx.Done()
-				shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
-				return srv.Shutdown(shutdownCtx)
-			})
-		}
 	}
 
 	if *metricsBind != "" {
