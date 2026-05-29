@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -19,7 +20,7 @@ import (
 )
 
 func TestGitServiceFor(t *testing.T) {
-	tt := []struct {
+	tests := []struct {
 		name    string
 		command string
 		service string
@@ -56,14 +57,14 @@ func TestGitServiceFor(t *testing.T) {
 			ok:      false,
 		},
 	}
-	for _, tc := range tt {
-		t.Run(tc.name, func(t *testing.T) {
-			got, ok := gitServiceFor(tc.command)
-			if ok != tc.ok {
-				t.Errorf("gitServiceFor(%q) ok=%v, want %v", tc.command, ok, tc.ok)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := gitServiceFor(tt.command)
+			if ok != tt.ok {
+				t.Errorf("gitServiceFor(%q) ok=%v, want %v", tt.command, ok, tt.ok)
 			}
-			if got != tc.service {
-				t.Errorf("gitServiceFor(%q) service=%q, want %q", tc.command, got, tc.service)
+			if got != tt.service {
+				t.Errorf("gitServiceFor(%q) service=%q, want %q", tt.command, got, tt.service)
 			}
 		})
 	}
@@ -142,7 +143,7 @@ func startSSHServer(t *testing.T, allowPush, allowHooks bool) (string, billy.Fil
 		t.Fatalf("listen: %v", err)
 	}
 	go srv.Serve(ln) //nolint:errcheck // returns when ln closes
-	t.Cleanup(func() { srv.Close() })
+	t.Cleanup(func() { srv.Close(); ln.Close() })
 	return ln.Addr().String(), fs
 }
 
@@ -156,10 +157,7 @@ func gitSSHEnv(t *testing.T) []string {
 	if out, err := exec.Command("ssh-keygen", "-t", "ed25519", "-N", "", "-f", key).CombinedOutput(); err != nil {
 		t.Fatalf("ssh-keygen: %v\n%s", err, out)
 	}
-	sshCmd := "ssh -i " + key +
-		" -o IdentitiesOnly=yes" +
-		" -o StrictHostKeyChecking=no" +
-		" -o UserKnownHostsFile=/dev/null"
+	sshCmd := fmt.Sprintf("ssh -i %q -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null", key)
 	return append(os.Environ(),
 		"GIT_SSH_COMMAND="+sshCmd,
 		"GIT_TERMINAL_PROMPT=0",
@@ -216,7 +214,7 @@ func TestSSH(t *testing.T) {
 			remote := "ssh://git@" + addr + "/test.git"
 
 			// Confirm no repo exists before any push.
-			_, preStatErr := fs.Stat("test.git/config")
+			_, preStatErr := fs.Stat("/test.git/config")
 			if preStatErr == nil {
 				t.Fatal("test.git must not exist before any push")
 			}
@@ -237,7 +235,7 @@ func TestSSH(t *testing.T) {
 			}
 
 			// The bare repo must exist iff a push was expected to land.
-			_, statErr := fs.Stat("test.git/config")
+			_, statErr := fs.Stat("/test.git/config")
 			pushLanded := tt.doPush && !tt.wantPushErr
 			if pushLanded && statErr != nil {
 				t.Fatalf("expected repo to be created on push, but config missing: %v", statErr)
