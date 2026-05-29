@@ -110,8 +110,8 @@ ls /src
 
 # Read a file out of the push.
 if [ -f /src/go.mod ]; then
-	module="$(head -n 1 /src/go.mod | cut -d' ' -f2)"
-	echo "go module: ${module}"
+  module="$(head -n 1 /src/go.mod | cut -d' ' -f2)"
+  echo "go module: ${module}"
 fi
 
 # Scratch work goes in /tmp.

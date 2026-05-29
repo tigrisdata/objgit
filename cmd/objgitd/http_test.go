@@ -14,8 +14,8 @@ import (
 )
 
 // TestSmartHTTP drives a real git client against the smart-HTTP handler over an
-// in-memory filesystem, covering push (create-on-demand), the allowPush gate,
-// and clone round-trips.
+// in-memory filesystem, covering push (create-on-demand), the write-gate
+// enforced by the authorizer, and clone round-trips.
 func TestSmartHTTP(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
@@ -123,8 +123,12 @@ func TestSmartHTTPAnonymousReadWhilePushDisabled(t *testing.T) {
 
 	// Seed a repo via a push-enabled server over a shared filesystem.
 	fs := memfs.New()
-	seed := httptest.NewServer(&daemon{fs: fs, loader: transport.NewFilesystemLoader(fs, false), authz: auth.AllowAnonymous{AllowWrite: true}})
-	defer seed.Close()
+	seed := httptest.NewServer(&daemon{
+		fs:     fs,
+		loader: transport.NewFilesystemLoader(fs, false),
+		authz:  auth.AllowAnonymous{AllowWrite: true},
+	})
+	t.Cleanup(seed.Close)
 
 	work := seedRepo(t)
 	srcHead := strings.TrimSpace(runGit(t, work, "rev-parse", "HEAD"))
@@ -133,8 +137,12 @@ func TestSmartHTTPAnonymousReadWhilePushDisabled(t *testing.T) {
 	}
 
 	// Serve the same filesystem with push disabled and clone from it.
-	ro := httptest.NewServer(&daemon{fs: fs, loader: transport.NewFilesystemLoader(fs, false), authz: auth.AllowAnonymous{AllowWrite: false}})
-	defer ro.Close()
+	ro := httptest.NewServer(&daemon{
+		fs:     fs,
+		loader: transport.NewFilesystemLoader(fs, false),
+		authz:  auth.AllowAnonymous{AllowWrite: false},
+	})
+	t.Cleanup(ro.Close)
 
 	dst := t.TempDir()
 	if out, err := tryGit(dst, "clone", ro.URL+"/test.git", "cloned"); err != nil {
