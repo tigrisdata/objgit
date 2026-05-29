@@ -9,6 +9,7 @@ import (
 	"os"
 	pathpkg "path"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -29,12 +30,14 @@ func (fs3 *S3FS) ReadDir(dir string) ([]fs.DirEntry, error) {
 	var dirs []fs.DirEntry
 	var files []fs.DirEntry
 	for {
+		start := time.Now()
 		res, err := fs3.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:            &fs3.bucket,
 			Prefix:            &prefix,
 			ContinuationToken: ct,
 			Delimiter:         &fs3.separator,
 		})
+		observeS3("ListObjectsV2", start, err)
 		if err != nil {
 			return nil, err
 		}
@@ -80,11 +83,13 @@ func (fs3 *S3FS) ReadDir(dir string) ([]fs.DirEntry, error) {
 // perm are used for all directories that MkdirAll creates. If path is/
 // already a directory, MkdirAll does nothing and returns nil.
 func (fs3 *S3FS) MkdirAll(filename string, perm os.FileMode) error {
+	start := time.Now()
 	_, err := fs3.client.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket: new(fs3.bucket),
 		Key:    new(filename),
 		Body:   bytes.NewBuffer(nil),
 	})
+	observeS3("PutObject", start, err)
 
 	return err
 }

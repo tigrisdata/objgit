@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/memfs"
@@ -20,6 +21,7 @@ import (
 	"tangled.org/xeiaso.net/kefka/command/registry"
 	"tangled.org/xeiaso.net/kefka/command/registry/coreutils"
 	"tangled.org/xeiaso.net/objgit/internal/kefkash"
+	"tangled.org/xeiaso.net/objgit/internal/metrics"
 	"tangled.org/xeiaso.net/objgit/internal/mountfs"
 	"tangled.org/xeiaso.net/objgit/internal/treefs"
 )
@@ -222,7 +224,9 @@ func (d *daemon) runHook(repoPath, service string, st storage.Storer, u refUpdat
 	}
 
 	log.Info("hook: running")
+	runStart := time.Now()
 	runErr := sh.Run(ctx, prog)
+	metrics.ObserveHook(hookStatus(ctx, runErr), time.Since(runStart))
 
 	var exit interp.ExitStatus
 	isExit := errors.As(runErr, &exit)
@@ -239,4 +243,18 @@ func (d *daemon) runHook(repoPath, service string, st storage.Storer, u refUpdat
 		return
 	}
 	log.Info("hook: finished", attrs...)
+}
+
+// hookStatus classifies a hook run for metrics: "timeout" when the hook's
+// deadline fired, "error" for any other failure (including a non-zero exit), and
+// "ok" otherwise.
+func hookStatus(ctx context.Context, runErr error) string {
+	switch {
+	case ctx.Err() != nil:
+		return "timeout"
+	case runErr != nil:
+		return "error"
+	default:
+		return "ok"
+	}
 }

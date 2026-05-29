@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	ssh "github.com/gliderlabs/ssh"
 	"github.com/go-git/go-billy/v6"
@@ -19,6 +20,7 @@ import (
 	"github.com/go-git/go-git/v6/utils/ioutil"
 	gossh "golang.org/x/crypto/ssh"
 	"tangled.org/xeiaso.net/objgit/internal/auth"
+	"tangled.org/xeiaso.net/objgit/internal/metrics"
 )
 
 const hostKeyPath = ".objgit/ssh_host_ed25519_key"
@@ -141,12 +143,17 @@ func (d *daemon) handleSSH(s ssh.Session) {
 	if key := s.PublicKey(); key != nil {
 		cred = auth.PublicKey{Key: key}
 	}
-	if d.authz.Authorize(s.Context(), auth.Request{
+
+	defer metrics.TrackInFlight("ssh")()
+	start := time.Now()
+
+	if d.authorize(s.Context(), auth.Request{
 		Repo:      repoPath,
 		Operation: operationFor(service),
 		Cred:      cred,
 		Transport: "ssh",
 	}) != auth.Allow {
+		metrics.ObserveGitOp("ssh", service, "denied", start)
 		fmt.Fprintln(s.Stderr(), "objgitd: access denied")
 		_ = s.Exit(1)
 		return
@@ -158,6 +165,19 @@ func (d *daemon) handleSSH(s ssh.Session) {
 		"remote", s.RemoteAddr().String(),
 	)
 
+	status := "ok"
+	if err := d.serveSSH(s, service, repoPath); err != nil {
+		status = "error"
+	}
+	metrics.ObserveGitOp("ssh", service, status, start)
+}
+
+// serveSSH dispatches an authorized git-over-SSH request to the matching go-git
+// transport command. It returns an error for metric classification; when a
+// repository cannot be opened it also writes a client-facing message and sets a
+// non-zero exit status, matching git's behavior. A mid-transfer error is logged
+// (the exit status is left to the session default, as before).
+func (d *daemon) serveSSH(s ssh.Session, service, repoPath string) error {
 	// SSH is a persistent stream like git://: the transport commands call Close
 	// between negotiation rounds, which would tear down the channel, so wrap the
 	// session in no-op closers.
@@ -173,10 +193,11 @@ func (d *daemon) handleSSH(s ssh.Session) {
 		if err != nil {
 			fmt.Fprintf(s.Stderr(), "objgitd: repository %q not found\n", repoPath)
 			_ = s.Exit(1)
-			return
+			return fmt.Errorf("loading %q: %w", repoPath, err)
 		}
 		if err := transport.UploadPack(ctx, st, r, w, &transport.UploadPackRequest{}); err != nil {
 			slog.Error("ssh upload-pack failed", "path", repoPath, "err", err)
+			return err
 		}
 
 	case transport.UploadArchiveService:
@@ -184,10 +205,11 @@ func (d *daemon) handleSSH(s ssh.Session) {
 		if err != nil {
 			fmt.Fprintf(s.Stderr(), "objgitd: repository %q not found\n", repoPath)
 			_ = s.Exit(1)
-			return
+			return fmt.Errorf("loading %q: %w", repoPath, err)
 		}
 		if err := transport.UploadArchive(ctx, st, r, w, &transport.UploadArchiveRequest{}); err != nil {
 			slog.Error("ssh upload-archive failed", "path", repoPath, "err", err)
+			return err
 		}
 
 	case transport.ReceivePackService:
@@ -195,12 +217,14 @@ func (d *daemon) handleSSH(s ssh.Session) {
 		if err != nil {
 			fmt.Fprintf(s.Stderr(), "objgitd: cannot open repository %q\n", repoPath)
 			_ = s.Exit(1)
-			return
+			return fmt.Errorf("opening %q for push: %w", repoPath, err)
 		}
 		// streamingStorer hides PackfileWriter (the io.CopyBuffer-until-EOF path
 		// deadlocks on a live socket); d.receivePack runs push hooks afterward.
 		if err := d.receivePack(ctx, streamingStorer{Storer: st}, st, repoPath, r, w, &transport.ReceivePackRequest{}); err != nil {
 			slog.Error("ssh receive-pack failed", "path", repoPath, "err", err)
+			return err
 		}
 	}
+	return nil
 }

@@ -16,22 +16,25 @@ import (
 	"github.com/facebookgo/flagenv"
 	"github.com/gliderlabs/ssh"
 	"github.com/go-git/go-git/v6/plumbing/transport"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/tigrisdata/storage-go"
 	"golang.org/x/sync/errgroup"
 	"tangled.org/xeiaso.net/objgit/internal"
 	"tangled.org/xeiaso.net/objgit/internal/auth"
+	"tangled.org/xeiaso.net/objgit/internal/metrics"
 	"tangled.org/xeiaso.net/objgit/internal/s3fs"
 
 	_ "github.com/joho/godotenv/autoload"
 )
 
 var (
-	gitBind   = flag.String("git-bind", ":9418", "TCP address to listen on for the git:// protocol; empty disables it")
-	httpBind  = flag.String("http-bind", ":8080", "TCP address to listen on for the git smart-HTTP protocol; empty disables it")
-	sshBind   = flag.String("ssh-bind", "", "TCP address to listen on for the git-over-SSH protocol; empty disables it")
-	bucket    = flag.String("bucket", "", "Tigris bucket that holds the git repositories")
-	allowPush = flag.Bool("allow-push", false, "allow unauthenticated git-receive-pack (push) requests")
-	slogLevel = flag.String("slog-level", "INFO", "log level (DEBUG, INFO, WARN, ERROR)")
+	gitBind     = flag.String("git-bind", ":9418", "TCP address to listen on for the git:// protocol; empty disables it")
+	httpBind    = flag.String("http-bind", ":8080", "TCP address to listen on for the git smart-HTTP protocol; empty disables it")
+	sshBind     = flag.String("ssh-bind", "", "TCP address to listen on for the git-over-SSH protocol; empty disables it")
+	metricsBind = flag.String("metrics-bind", ":9090", "TCP address to serve the Prometheus /metrics endpoint; empty disables it")
+	bucket      = flag.String("bucket", "", "Tigris bucket that holds the git repositories")
+	allowPush   = flag.Bool("allow-push", false, "allow unauthenticated git-receive-pack (push) requests")
+	slogLevel   = flag.String("slog-level", "INFO", "log level (DEBUG, INFO, WARN, ERROR)")
 
 	allowHooks  = flag.Bool("allow-hooks", false, "run .objgit/hooks/receive-pack in a sandbox after a successful push")
 	hookTimeout = flag.Duration("hook-timeout", 60*time.Second, "wall-clock limit for a single hook run")
@@ -61,6 +64,9 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// Route s3fs S3 round-trips into Prometheus before any filesystem use.
+	s3fs.SetMetricsObserver(metrics.ObserveS3)
+
 	client, err := storage.New(ctx)
 	if err != nil {
 		slog.Error("can't create Tigris storage client", "err", err)
@@ -85,12 +91,36 @@ func main() {
 		"git_bind", *gitBind,
 		"http_bind", *httpBind,
 		"ssh_bind", *sshBind,
+		"metrics_bind", *metricsBind,
 		"bucket", *bucket,
 		"allow_push", *allowPush,
 		"allow_hooks", *allowHooks,
 	)
 
 	g, gCtx := errgroup.WithContext(ctx)
+
+	if *metricsBind != "" {
+		ln, err := net.Listen("tcp", *metricsBind)
+		if err != nil {
+			slog.Error("can't listen", "metrics_bind", *metricsBind, "err", err)
+			os.Exit(1)
+		}
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		srv := &http.Server{Handler: mux}
+		g.Go(func() error {
+			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return err
+			}
+			return nil
+		})
+		g.Go(func() error {
+			<-gCtx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			return srv.Shutdown(shutdownCtx)
+		})
+	}
 
 	if *gitBind != "" {
 		ln, err := net.Listen("tcp", *gitBind)

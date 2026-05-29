@@ -21,6 +21,7 @@ import (
 	"github.com/go-git/go-git/v6/storage"
 	"github.com/go-git/go-git/v6/storage/filesystem"
 	"tangled.org/xeiaso.net/objgit/internal/auth"
+	"tangled.org/xeiaso.net/objgit/internal/metrics"
 )
 
 // handshakeTimeout bounds how long a client has to send its git-proto-request.
@@ -50,6 +51,17 @@ func operationFor(service string) auth.Operation {
 		return auth.Write
 	}
 	return auth.Read
+}
+
+// authorize is the single seam every transport routes authorization through: it
+// times the underlying Authorizer and records the decision (by transport,
+// operation, and outcome) before returning it. Each transport still renders the
+// Decision in its own dialect.
+func (d *daemon) authorize(ctx context.Context, req auth.Request) auth.Decision {
+	start := time.Now()
+	dec := d.authz.Authorize(ctx, req)
+	metrics.ObserveAuth(req.Transport, req.Operation, dec, start)
+	return dec
 }
 
 // daemon serves the git:// (TCP) protocol out of a billy filesystem.
@@ -120,16 +132,32 @@ func (d *daemon) handle(ctx context.Context, conn net.Conn) error {
 	// writer is the raw conn: its final Close() ends the connection.
 	r := io.NopCloser(conn)
 
-	if d.authz.Authorize(ctx, auth.Request{
+	defer metrics.TrackInFlight("git")()
+	start := time.Now()
+
+	if d.authorize(ctx, auth.Request{
 		Repo:      req.Pathname,
 		Operation: operationFor(req.RequestCommand),
 		Cred:      auth.Anonymous{},
 		Transport: "git",
 	}) != auth.Allow {
+		metrics.ObserveGitOp("git", req.RequestCommand, "denied", start)
 		_, _ = pktline.WriteError(conn, fmt.Errorf("access denied"))
 		return fmt.Errorf("access denied for %q (%s)", req.Pathname, req.RequestCommand)
 	}
 
+	err := d.serveGit(ctx, conn, r, req, gitProtocol)
+	status := "ok"
+	if err != nil {
+		status = "error"
+	}
+	metrics.ObserveGitOp("git", req.RequestCommand, status, start)
+	return err
+}
+
+// serveGit dispatches a parsed, authorized git:// request to the matching
+// go-git transport command.
+func (d *daemon) serveGit(ctx context.Context, conn net.Conn, r io.ReadCloser, req packp.GitProtoRequest, gitProtocol string) error {
 	switch req.RequestCommand {
 	case transport.UploadPackService:
 		st, err := d.loader.Load(&url.URL{Path: req.Pathname})
@@ -187,6 +215,7 @@ func (d *daemon) loadOrInit(repoPath string) (storage.Storer, error) {
 		return nil, fmt.Errorf("init bare repo: %w", err)
 	}
 
+	metrics.ReposCreated()
 	slog.Info("created repository", "path", repoPath)
 	return st, nil
 }

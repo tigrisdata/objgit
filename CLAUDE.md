@@ -12,6 +12,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 All three funnel authorization through one pluggable `internal/auth.Authorizer` (see [The auth seam](#the-auth-seam-internalauth)).
 
+A fourth listener serves **Prometheus metrics** at `/metrics` (`-metrics-bind`, default `:9090`, empty disables) — see [Metrics](#metrics-internalmetrics).
+
 Module path: `tangled.org/xeiaso.net/objgit`. Go 1.26.
 
 ## Commands
@@ -75,6 +77,35 @@ its own dialect (pktline error / `401`/`403` / stderr + non-zero exit). The lone
 implementation today is `auth.AllowAnonymous{AllowWrite}`: read for everyone,
 write only when set — wired in `main.go` as `AllowAnonymous{AllowWrite: *allowPush}`,
 so `-allow-push` is now just this default's config rather than a field on `daemon`.
+
+### Metrics (`internal/metrics`)
+
+`internal/metrics` defines every Prometheus vector via `promauto` against the
+**default registry**, so client_golang's Go-runtime and process collectors are
+exported alongside them. `main.go` serves `promhttp.Handler()` on its own
+listener (`-metrics-bind`, default `:9090`) under the same errgroup Serve/Shutdown
+idiom as the HTTP transport. All series are prefixed `objgit_`. Per the operator's
+call there is **no `repo` label** (unbounded cardinality); git operations are
+keyed by `protocol`+`service`+`status` only.
+
+The package exposes thin helpers so call sites carry no label plumbing:
+`ObserveS3` (the s3fs observer), `ObserveGitOp`, `TrackInFlight` (returns a
+deferred decrement), `ObserveAuth` (maps the `auth` enums to labels), `ObserveHook`,
+and `ReposCreated`. Three instrumentation seams feed them:
+
+- **s3fs** reports each S3 round-trip at the API-call level (GetObject, PutObject,
+  …). s3fs stays prometheus-free: it holds a process-level `func(op, dur, err)`
+  observer set via `s3fs.SetMetricsObserver`, which `main` wires to
+  `metrics.ObserveS3`. (It is a package-level setter, not an instance Option,
+  because the S3 calls live in standalone constructors that don't hold the `S3FS`.)
+- **auth** routes through one chokepoint, `(*daemon).authorize` in `git_protocol.go`,
+  which times `d.authz.Authorize` and records the decision before returning it —
+  all three transports call it instead of `d.authz` directly.
+- **repo ops** are wrapped once per transport handler (`handleRPC`, `handle`,
+  `handleSSH`): an in-flight gauge plus a duration/count keyed by protocol+service.
+  HTTP rolls an authorization denial into the `error` git status (the precise
+  denial is still visible in `objgit_auth_requests_total`); git:// and SSH record
+  `denied` directly.
 
 ### Git over SSH (`ssh.go`)
 

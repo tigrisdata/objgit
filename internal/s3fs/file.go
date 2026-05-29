@@ -65,19 +65,23 @@ func newS3ReadFile(client *storage.Client, bucket, key, name string) (*s3ReadFil
 	// Create the context
 	ctx := context.TODO() // TODO: How can user-supplied contexts be supported?
 
+	start := time.Now()
 	ho, err := client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: new(bucket),
 		Key:    new(key),
 	})
+	observeS3("HeadObject", start, err)
 	if err != nil {
 		return nil, &os.PathError{Op: "read", Path: key, Err: err}
 	}
 
 	// Run the GetObject operation
+	start = time.Now()
 	res, err := client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: &bucket,
 		Key:    &key,
 	})
+	observeS3("GetObject", start, err)
 	if err != nil {
 		return nil, fmt.Errorf("unable to perform GetObject operation: %w", err)
 	}
@@ -246,12 +250,14 @@ func (f *s3WriteFile) Close() error {
 
 	// Run the GetObject operation
 	// TODO: Currently `res` is not used. Should it be?
+	start := time.Now()
 	_, err := f.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:   &f.bucket,
 		Key:      &f.key,
 		Body:     body,
 		Metadata: newFileMetadata(f.unixMeta),
 	})
+	observeS3("PutObject", start, err)
 	if err != nil {
 		return fmt.Errorf("unable to perform GetObject operation: %w", err)
 	}
@@ -301,11 +307,13 @@ func newS3MultipartUploadFile(client *storage.Client, bucket, key, name string, 
 
 	// Run the GetObject operation. POSIX attributes (if enabled) must be set
 	// now: CompleteMultipartUpload cannot attach user metadata.
+	start := time.Now()
 	res, err := client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket:   &bucket,
 		Key:      &key,
 		Metadata: newFileMetadata(cfg),
 	})
+	observeS3("CreateMultipartUpload", start, err)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create multipart upload: %w", err)
 	}
@@ -339,6 +347,7 @@ func (f *s3MultipartUploadFile) Write(p []byte) (n int, err error) {
 	pn := f.uploadN.Load()
 
 	// Run the UploadPart operation
+	start := time.Now()
 	_, err = f.client.UploadPart(ctx, &s3.UploadPartInput{
 		Bucket:     &f.bucket,
 		Key:        &f.key,
@@ -346,6 +355,7 @@ func (f *s3MultipartUploadFile) Write(p []byte) (n int, err error) {
 		PartNumber: new(pn),
 		Body:       r,
 	})
+	observeS3("UploadPart", start, err)
 	if err != nil {
 		return 0, fmt.Errorf("unable to upload part %d: %w", pn, err)
 	}
@@ -391,11 +401,13 @@ func (f *s3MultipartUploadFile) Close() error {
 
 	// Complete the multipart upload
 	// TODO: Currently `res` is not used. Should it be?
+	start := time.Now()
 	_, err := f.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 		Bucket:   &f.bucket,
 		Key:      &f.key,
 		UploadId: &f.uploadID,
 	})
+	observeS3("CompleteMultipartUpload", start, err)
 	if err != nil {
 		return fmt.Errorf("unable to complete multipart upload: %w", err)
 	}
@@ -446,10 +458,12 @@ func (f *s3DirFile) Seek(offset int64, whence int) (int64, error) { return 0, f.
 func (f *s3DirFile) Truncate(size int64) error                    { return f.eisdir("truncate") }
 
 func (f *s3DirFile) Stat() (fs.FileInfo, error) {
+	start := time.Now()
 	ho, err := f.cli.HeadObject(context.Background(), &s3.HeadObjectInput{
 		Bucket: new(f.bucket),
 		Key:    new(f.name),
 	})
+	observeS3("HeadObject", start, err)
 	if err != nil {
 		return nil, err
 	}

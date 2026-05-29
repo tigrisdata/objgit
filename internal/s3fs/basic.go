@@ -94,12 +94,14 @@ func (fs3 *S3FS) OpenFile(filename string, flag int, perm os.FileMode) (billy.Fi
 		ctx := context.TODO()
 		prefix := key + "/"
 		maxKeys := int32(1)
+		start := time.Now()
 		list, lerr := fs3.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:    &fs3.bucket,
 			Prefix:    &prefix,
 			Delimiter: &fs3.separator,
 			MaxKeys:   &maxKeys,
 		})
+		observeS3("ListObjectsV2", start, lerr)
 		if lerr != nil {
 			return nil, lerr
 		}
@@ -134,10 +136,12 @@ func (fs3 *S3FS) Stat(filename string) (os.FileInfo, error) {
 
 	ctx := context.TODO()
 
+	start := time.Now()
 	head, err := fs3.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: &fs3.bucket,
 		Key:    &key,
 	})
+	observeS3("HeadObject", start, err)
 	if err == nil {
 		return newFileInfoFromHead(path.Base(key), head, fs3.unixMeta), nil
 	}
@@ -155,12 +159,14 @@ func (fs3 *S3FS) Stat(filename string) (os.FileInfo, error) {
 
 	prefix := key + "/"
 	maxKeys := int32(1)
+	start = time.Now()
 	list, lerr := fs3.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 		Bucket:    &fs3.bucket,
 		Prefix:    &prefix,
 		Delimiter: &fs3.separator,
 		MaxKeys:   &maxKeys,
 	})
+	observeS3("ListObjectsV2", start, lerr)
 	if lerr != nil {
 		return nil, lerr
 	}
@@ -183,11 +189,13 @@ func (fs3 *S3FS) Rename(oldpath, newpath string) error {
 
 	if buf, ok := fs3.detachTemp(oldpath); ok {
 		data := buf.snapshot()
+		start := time.Now()
 		_, err := fs3.client.PutObject(ctx, &s3.PutObjectInput{
 			Bucket: &fs3.bucket,
 			Key:    &dst,
 			Body:   bytes.NewReader(data),
 		})
+		observeS3("PutObject", start, err)
 		if err != nil {
 			return fmt.Errorf("failed to upload temp %q to %q: %w", oldpath, newpath, err)
 		}
@@ -198,11 +206,13 @@ func (fs3 *S3FS) Rename(oldpath, newpath string) error {
 	// so we don't need a separate CopyObject + DeleteObject. CopySource is
 	// bucket-qualified; Key is the destination key.
 	copySource := fs3.bucket + "/" + src
+	start := time.Now()
 	_, err := fs3.client.RenameObject(ctx, &s3.CopyObjectInput{
 		Bucket:     &fs3.bucket,
 		CopySource: &copySource,
 		Key:        &dst,
 	})
+	observeS3("RenameObject", start, err)
 	if err != nil {
 		return fmt.Errorf("failed to rename %q to %q: %w", oldpath, newpath, err)
 	}
@@ -223,10 +233,12 @@ func (fs3 *S3FS) Remove(filename string) error {
 
 	// Send the request
 	// TODO: Parse the response?
+	start := time.Now()
 	_, err := fs3.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: &fs3.bucket,
 		Key:    &key,
 	})
+	observeS3("DeleteObject", start, err)
 	if err != nil {
 		return fmt.Errorf("failed to remove file: %w", err)
 	}

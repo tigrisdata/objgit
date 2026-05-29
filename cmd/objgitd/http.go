@@ -9,11 +9,13 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/storage"
 	"github.com/go-git/go-git/v6/utils/ioutil"
 	"tangled.org/xeiaso.net/objgit/internal/auth"
+	"tangled.org/xeiaso.net/objgit/internal/metrics"
 )
 
 // ServeHTTP speaks the git smart-HTTP protocol. It dispatches on the URL suffix
@@ -87,8 +89,15 @@ func (d *daemon) handleInfoRefs(w http.ResponseWriter, r *http.Request, repoPath
 // handleRPC serves a stateless negotiation round:
 // POST /{repo}/git-(upload|receive)-pack.
 func (d *daemon) handleRPC(w http.ResponseWriter, r *http.Request, service, repoPath string) {
+	defer metrics.TrackInFlight("http")()
+	start := time.Now()
+
 	st, ok := d.resolve(w, r, service, repoPath)
 	if !ok {
+		// resolve has already written the HTTP error; a denied authorization is
+		// recorded by d.authorize in auth_requests_total. Count the failed op
+		// here so request totals stay consistent across transports.
+		metrics.ObserveGitOp("http", service, "error", start)
 		return
 	}
 
@@ -138,17 +147,20 @@ func (d *daemon) handleRPC(w http.ResponseWriter, r *http.Request, service, repo
 			GitProtocol:  gitProtocol,
 		})
 	}
+	status := "ok"
 	if err != nil {
 		// The status line is already sent, so this can only be logged.
 		slog.Error("smart-http rpc failed", "service", service, "path", repoPath, "err", err)
+		status = "error"
 	}
+	metrics.ObserveGitOp("http", service, status, start)
 }
 
 // resolve loads the storer for an HTTP request, authorizing via the daemon's
 // Authorizer before touching the repository. It writes an HTTP error and
 // returns ok=false when the request cannot proceed.
 func (d *daemon) resolve(w http.ResponseWriter, r *http.Request, service, repoPath string) (storage.Storer, bool) {
-	switch d.authz.Authorize(r.Context(), auth.Request{
+	switch d.authorize(r.Context(), auth.Request{
 		Repo:      repoPath,
 		Operation: operationFor(service),
 		Cred:      credFromRequest(r),
