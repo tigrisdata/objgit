@@ -144,15 +144,6 @@ func main() {
 
 	err = g.Wait()
 
-	// Let in-flight async hooks finish before exiting, but don't hang forever.
-	drained := make(chan struct{})
-	go func() { d.hookWG.Wait(); close(drained) }()
-	select {
-	case <-drained:
-	case <-time.After(10 * time.Second):
-		slog.Warn("shutdown: gave up waiting for in-flight hooks")
-	}
-
 	if err != nil {
 		slog.Error("server stopped", "err", err)
 		os.Exit(1)

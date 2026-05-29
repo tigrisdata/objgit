@@ -60,18 +60,18 @@ func TestExampleHookRuns(t *testing.T) {
 	writeFile(t, filepath.Join(work, ".objgit", "hooks", "receive-pack"), string(example))
 	runGit(t, work, "add", ".")
 	runGit(t, work, "commit", "-m", "example")
-	runGit(t, work, "push", remote, "main")
+	pushOut := runGit(t, work, "push", remote, "main")
 
-	waitForLog(t, &logBuf, "hook: finished", 30*time.Second)
-
+	// Hooks run synchronously and stream stdout/stderr to the client over the
+	// sideband, so the example hook's output appears in the push output.
 	logs := logBuf.String()
 	if strings.Contains(logs, "with errors") {
 		t.Fatalf("example hook errored; logs:\n%s", logs)
 	}
 	for _, want := range []string{"go module: example.test/thing", "hook done", "manifest"} {
-		if !strings.Contains(logs, want) {
-			t.Errorf("example hook output missing %q; logs:\n%s", want, logs)
+		if !strings.Contains(pushOut, want) {
+			t.Errorf("example hook output missing %q; push output:\n%s", want, pushOut)
 		}
 	}
-	t.Logf("logs:\n%s", logs)
+	t.Logf("push output:\n%s\nlogs:\n%s", pushOut, logs)
 }

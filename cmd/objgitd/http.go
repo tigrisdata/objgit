@@ -116,6 +116,13 @@ func (d *daemon) handleRPC(w http.ResponseWriter, r *http.Request, service, repo
 	// response writer must survive that, so both are wrapped as no-op closers.
 	in := io.NopCloser(body)
 	out := ioutil.WriteNopCloser(w)
+	// receive-pack streams hook output over the sideband; net/http buffers
+	// writes, so flush after each one to deliver "remote:" lines live.
+	if service == transport.ReceivePackService {
+		if fl, ok := w.(http.Flusher); ok {
+			out = ioutil.WriteNopCloser(flushWriter{w: w, f: fl})
+		}
+	}
 	gitProtocol := r.Header.Get("Git-Protocol")
 
 	var err error
@@ -179,6 +186,20 @@ func (d *daemon) resolve(w http.ResponseWriter, r *http.Request, service, repoPa
 		return nil, false
 	}
 	return st, true
+}
+
+// flushWriter flushes the underlying http.ResponseWriter after every write so
+// sideband progress (hook output) reaches the client incrementally instead of
+// being buffered until the handler returns.
+type flushWriter struct {
+	w io.Writer
+	f http.Flusher
+}
+
+func (fw flushWriter) Write(p []byte) (int, error) {
+	n, err := fw.w.Write(p)
+	fw.f.Flush()
+	return n, err
 }
 
 // credFromRequest extracts an auth credential from an HTTP request: HTTP Basic

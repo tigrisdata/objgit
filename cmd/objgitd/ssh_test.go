@@ -267,7 +267,8 @@ func TestSSH(t *testing.T) {
 }
 
 // TestSSHHookFires pushes a repo carrying .objgit/hooks/receive-pack over SSH
-// and asserts the hook runs asynchronously after the push response.
+// and asserts the hook runs synchronously, streaming its output to the client
+// over the sideband.
 func TestSSHHookFires(t *testing.T) {
 	checkSSHBinaries(t)
 
@@ -294,20 +295,23 @@ func TestSSHHookFires(t *testing.T) {
 	runGit(t, work, "add", ".")
 	runGit(t, work, "commit", "-m", "with hook")
 
-	if out, err := gitWithEnv(work, env, "push", remote, "main"); err != nil {
+	out, err := gitWithEnv(work, env, "push", remote, "main")
+	if err != nil {
 		t.Fatalf("push failed: %v\n%s", err, out)
 	}
 
-	// The hook runs asynchronously; wait for the terminal log line.
-	waitForLog(t, &logBuf, "hook: finished", 30*time.Second)
-
+	// Hooks run synchronously and stream over the sideband, so by the time push
+	// returns the hook output rides along in the push output as "remote:" lines.
 	logs := logBuf.String()
 	if !strings.Contains(logs, "hook: running") {
 		t.Fatalf("hook did not run; logs:\n%s", logs)
 	}
 	for _, want := range []string{"hello from ssh repo", "hook_ran"} {
-		if !strings.Contains(logs, want) {
-			t.Errorf("hook output missing %q; logs:\n%s", want, logs)
+		if !strings.Contains(out, want) {
+			t.Errorf("push output missing streamed hook output %q; output:\n%s", want, out)
 		}
+	}
+	if !strings.Contains(out, "remote:") {
+		t.Errorf("hook output not streamed as remote progress; output:\n%s", out)
 	}
 }

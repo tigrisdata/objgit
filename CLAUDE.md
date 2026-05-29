@@ -101,13 +101,28 @@ stream (reader + writer).
 ### Push hooks (`hooks.go`, sandboxed via kefka)
 
 When `-allow-hooks` is set, a successful `receive-pack` runs the repository's
-`.objgit/hooks/receive-pack` script. Because `transport.ReceivePack` does not
-report which refs it changed, `receivePack` (the wrapper both transports call
-instead of `transport.ReceivePack` directly) snapshots branch refs before and
-after and diffs them (`snapshotRefs`/`diffRefs`). For each created/updated
-branch it spawns an **async** goroutine (tracked by `daemon.hookWG`, drained on
-shutdown) — hooks run after the client already has its response and **cannot
-reject a push**. Deleted branches are skipped.
+`.objgit/hooks/receive-pack` script. The hook output is **streamed to the
+pushing client live**, rendered as `remote: ...` lines, so hooks run
+**synchronously**: the client waits for them to finish (bounded by
+`-hook-timeout`) before the push completes. They still **cannot reject a push** —
+they run after refs are updated and report-status is sent (post-receive
+semantics). Deleted branches are skipped.
+
+The streaming forces a small fork of go-git's `transport.ReceivePack` into
+`cmd/objgitd/receivepack.go` (`receivePackStreaming`): go-git constructs the
+sideband `Muxer` internally and sends the closing flush-pkt before returning, so
+there is no public seam to inject `remote:` progress. The fork adds one
+`onUpdated(progress io.Writer)` callback, invoked after report-status but before
+that final flush; `progress` writes to the sideband `ProgressMessage` channel
+(band 2) when the client negotiated sideband, or is `nil` otherwise (hooks then
+fall back to `slog`-only output). All three transports call `d.receivePack`
+(`hooks.go`), which drives the fork: because `transport.ReceivePack` does not
+report which refs it changed, it snapshots branch refs before and after and
+diffs them (`snapshotRefs`/`diffRefs`) inside `onUpdated`, then runs each hook
+synchronously, streaming through `progress`. **HTTP** additionally wraps its
+`ResponseWriter` in a flush-on-write writer (`flushWriter` in `http.go`) so
+`net/http` buffering doesn't hold the `remote:` lines back; git:// and SSH write
+through a live socket and need no such wrapper.
 
 The script is read from the pushed commit's tree, so a branch carries its own
 hook. It runs in a **kefka** virtual shell (`tangled.org/xeiaso.net/kefka`),

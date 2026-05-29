@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-git/go-billy/v6"
@@ -62,8 +61,6 @@ type daemon struct {
 	// allowHooks gates running .objgit/hooks/receive-pack after a push.
 	allowHooks  bool
 	hookTimeout time.Duration
-	// hookWG tracks in-flight async hooks so shutdown can drain them.
-	hookWG sync.WaitGroup
 }
 
 // Serve accepts connections on l until ctx is cancelled or Accept fails.

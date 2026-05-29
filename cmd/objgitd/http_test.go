@@ -1,11 +1,13 @@
 package main
 
 import (
+	"log/slog"
 	"net/http/httptest"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/memfs"
@@ -151,6 +153,64 @@ func TestSmartHTTPAnonymousReadWhilePushDisabled(t *testing.T) {
 	gotHead := strings.TrimSpace(runGit(t, filepath.Join(dst, "cloned"), "rev-parse", "HEAD"))
 	if gotHead != srcHead {
 		t.Errorf("cloned HEAD %q != seeded HEAD %q", gotHead, srcHead)
+	}
+}
+
+// TestSmartHTTPHookStreams pushes a repo carrying .objgit/hooks/receive-pack
+// over smart-HTTP and asserts the hook runs synchronously and streams its
+// output to the client over the sideband (rendered as "remote:" lines). This
+// exercises the flush-on-write wrapper that delivers band-2 progress live
+// instead of letting net/http buffer it.
+func TestSmartHTTPHookStreams(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+
+	var logBuf syncBuffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(prev)
+
+	fs := memfs.New()
+	ts := httptest.NewServer(&daemon{
+		fs:          fs,
+		loader:      transport.NewFilesystemLoader(fs, false),
+		authz:       auth.AllowAnonymous{AllowWrite: true},
+		allowHooks:  true,
+		hookTimeout: 30 * time.Second,
+	})
+	t.Cleanup(ts.Close)
+
+	work := t.TempDir()
+	runGit(t, work, "init", "-b", "main")
+	runGit(t, work, "config", "user.email", "test@example.com")
+	runGit(t, work, "config", "user.name", "Test")
+
+	hook := strings.Join([]string{
+		"cat README.md",
+		"echo hook_ran",
+	}, "\n") + "\n"
+	writeFile(t, filepath.Join(work, "README.md"), "hello from http repo\n")
+	writeFile(t, filepath.Join(work, ".objgit", "hooks", "receive-pack"), hook)
+	runGit(t, work, "add", ".")
+	runGit(t, work, "commit", "-m", "with hook")
+
+	out, err := tryGit(work, "push", ts.URL+"/hooked.git", "main")
+	if err != nil {
+		t.Fatalf("push failed: %v\n%s", err, out)
+	}
+
+	logs := logBuf.String()
+	if !strings.Contains(logs, "hook: running") {
+		t.Fatalf("hook did not run; logs:\n%s", logs)
+	}
+	for _, want := range []string{"hello from http repo", "hook_ran"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("push output missing streamed hook output %q; output:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, "remote:") {
+		t.Errorf("hook output not streamed as remote progress; output:\n%s", out)
 	}
 }
 

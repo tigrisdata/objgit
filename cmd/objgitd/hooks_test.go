@@ -144,28 +144,31 @@ func TestReceivePackHook(t *testing.T) {
 	runGit(t, work, "add", ".")
 	runGit(t, work, "commit", "-m", "with hook")
 
-	runGit(t, work, "push", remote, "main")
+	pushOut := runGit(t, work, "push", remote, "main")
 
-	// The hook runs asynchronously after the push response; wait for it to
-	// finish (it ends with an error because of the /src write attempt).
-	waitForLog(t, &logBuf, "hook: finished", 30*time.Second)
-
+	// Hooks now run synchronously and stream stdout/stderr to the client over
+	// the sideband, so by the time push returns the hook has finished and its
+	// output rides along in the push output as "remote:" lines.
 	logs := logBuf.String()
 	if !strings.Contains(logs, "hook: running") {
 		t.Fatalf("hook did not run; logs:\n%s", logs)
 	}
-	// /src is readable and /tmp is writable.
+	// /src is readable and /tmp is writable; their output streamed to the client.
 	for _, want := range []string{"hello from repo", "built"} {
-		if !strings.Contains(logs, want) {
-			t.Errorf("hook output missing %q; logs:\n%s", want, logs)
+		if !strings.Contains(pushOut, want) {
+			t.Errorf("push output missing streamed hook output %q; output:\n%s", want, pushOut)
 		}
 	}
-	// Writing to /src is rejected and aborts the script.
+	// Output reaches the client over the sideband, rendered with a "remote:" prefix.
+	if !strings.Contains(pushOut, "remote:") {
+		t.Errorf("hook output not streamed as remote progress; output:\n%s", pushOut)
+	}
+	// Writing to /src is rejected and aborts the script (logged, not streamed).
 	if !strings.Contains(logs, "read-only filesystem") {
 		t.Errorf("expected read-only error when writing /src; logs:\n%s", logs)
 	}
-	if strings.Contains(logs, "WROTE_SRC") {
-		t.Errorf("hook was able to write to read-only /src; logs:\n%s", logs)
+	if strings.Contains(pushOut, "WROTE_SRC") {
+		t.Errorf("hook was able to write to read-only /src; output:\n%s", pushOut)
 	}
 }
 
@@ -226,9 +229,7 @@ func writeFile(t *testing.T, path, content string) {
 }
 
 // waitForLog blocks until the captured log output contains substr, or fails the
-// test after timeout. Hooks run asynchronously, so tests synchronize on a
-// terminal log line rather than the daemon's WaitGroup (which the push response
-// can outrun, racing Add against Wait).
+// test after timeout.
 func waitForLog(t *testing.T, buf *syncBuffer, substr string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

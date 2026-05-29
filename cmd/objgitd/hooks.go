@@ -75,60 +75,60 @@ func diffRefs(before, after map[plumbing.ReferenceName]plumbing.Hash) []refUpdat
 	return updates
 }
 
-// receivePack runs transport.ReceivePack and, when hooks are enabled, fires the
-// repository's receive-pack hook for each updated branch once the push succeeds.
-// rpStorer is what ReceivePack writes through (the git:// path hides the
-// PackfileWriter capability via streamingStorer); readStorer is the underlying
-// storer used for ref snapshots and hook checkouts.
+// receivePack runs the receive-pack service and, when hooks are enabled, fires
+// the repository's receive-pack hook for each updated branch once the push
+// succeeds — synchronously, streaming hook output to the client over the
+// sideband progress channel (rendered as "remote: " lines) before the response
+// stream is closed. rpStorer is what the service writes through (the git:// and
+// SSH paths hide the PackfileWriter capability via streamingStorer); readStorer
+// is the underlying storer used for ref snapshots and hook checkouts.
 func (d *daemon) receivePack(ctx context.Context, rpStorer, readStorer storage.Storer, repoPath string, r io.ReadCloser, w io.WriteCloser, req *transport.ReceivePackRequest) error {
-	var before map[plumbing.ReferenceName]plumbing.Hash
-	if d.allowHooks {
-		var err error
-		if before, err = snapshotRefs(readStorer); err != nil {
-			slog.Warn("hook: ref snapshot before push failed", "path", repoPath, "err", err)
-		}
-	}
-
-	if err := transport.ReceivePack(ctx, rpStorer, r, w, req); err != nil {
-		return err
-	}
 	if !d.allowHooks {
-		return nil
+		return receivePackStreaming(ctx, rpStorer, r, w, req, nil)
 	}
 
-	after, err := snapshotRefs(readStorer)
+	before, err := snapshotRefs(readStorer)
 	if err != nil {
-		slog.Error("hook: ref snapshot after push failed", "path", repoPath, "err", err)
-		return nil
+		slog.Warn("hook: ref snapshot before push failed", "path", repoPath, "err", err)
 	}
 
-	updates := diffRefs(before, after)
-	if len(updates) == 0 {
-		return nil
+	// onUpdated runs after refs are updated and report-status is sent, but
+	// before the response stream closes, so hook output reaches the client live.
+	// progress is the sideband band-2 writer, or nil when the client did not
+	// negotiate sideband (hooks then fall back to logging only).
+	onUpdated := func(progress io.Writer) {
+		after, err := snapshotRefs(readStorer)
+		if err != nil {
+			slog.Error("hook: ref snapshot after push failed", "path", repoPath, "err", err)
+			return
+		}
+		updates := diffRefs(before, after)
+		if len(updates) == 0 {
+			return
+		}
+		d.runHooks(repoPath, "receive-pack", readStorer, updates, progress)
 	}
 
-	d.hookWG.Add(1)
-	go func() {
-		defer d.hookWG.Done()
-		d.runHooks(repoPath, "receive-pack", readStorer, updates)
-	}()
-	return nil
+	return receivePackStreaming(ctx, rpStorer, r, w, req, onUpdated)
 }
 
-// runHooks executes the receive-pack hook once per non-deleted branch update.
-func (d *daemon) runHooks(repoPath, service string, st storage.Storer, updates []refUpdate) {
+// runHooks executes the receive-pack hook once per non-deleted branch update,
+// streaming each hook's output to progress (nil = log only).
+func (d *daemon) runHooks(repoPath, service string, st storage.Storer, updates []refUpdate, progress io.Writer) {
 	for _, u := range updates {
 		if u.New.IsZero() {
 			continue // branch deletion: nothing to check out
 		}
-		d.runHook(repoPath, service, st, u)
+		d.runHook(repoPath, service, st, u, progress)
 	}
 }
 
 // runHook looks up .objgit/hooks/<service> in the updated commit's tree and, if
 // present, runs it in a kefka shell with /src bound to a read-only view of that
-// tree and /tmp to writable scratch. Output and exit status are logged only.
-func (d *daemon) runHook(repoPath, service string, st storage.Storer, u refUpdate) {
+// tree and /tmp to writable scratch. When progress is non-nil, hook stdout and
+// stderr stream to it (the client's sideband, rendered as "remote: " lines);
+// otherwise output is buffered and logged. Exit status is always logged.
+func (d *daemon) runHook(repoPath, service string, st storage.Storer, u refUpdate, progress io.Writer) {
 	log := slog.With("repo", repoPath, "service", service, "ref", u.Name.String(), "sha", u.New.String())
 
 	commit, err := object.GetCommit(st, u.New)
@@ -161,7 +161,15 @@ func (d *daemon) runHook(repoPath, service string, st storage.Storer, u refUpdat
 	ctx, cancel := context.WithTimeout(context.Background(), d.hookTimeout)
 	defer cancel()
 
+	// When the client negotiated sideband, stream stdout+stderr straight to it
+	// ("remote: " lines); otherwise buffer for the log. git does not distinguish
+	// the two streams on the wire, so both go to the same place.
 	var outBuf, errBuf bytes.Buffer
+	stdout, stderr := io.Writer(&outBuf), io.Writer(&errBuf)
+	streaming := progress != nil
+	if streaming {
+		stdout, stderr = progress, progress
+	}
 
 	reg := registry.New()
 	coreutils.Register(reg)
@@ -195,9 +203,9 @@ func (d *daemon) runHook(repoPath, service string, st storage.Storer, u refUpdat
 	}
 	sh, err = interp.New(
 		interp.Env(env),
-		interp.StdIO(stdin, &outBuf, &errBuf),
+		interp.StdIO(stdin, stdout, stderr),
 		interp.ExecHandlers(middleware),
-		interp.CallHandler(kefkash.CallHandler(reg, fsys, &outBuf, &errBuf)),
+		interp.CallHandler(kefkash.CallHandler(reg, fsys, stdout, stderr)),
 		interp.StatHandler(kefkash.FsysStatHandler(reg, fsys)),
 		interp.OpenHandler(kefkash.FsysOpenHandler(reg, fsys)),
 		interp.ReadDirHandler2(kefkash.FsysReadDirHandler(reg, fsys)),
@@ -218,7 +226,11 @@ func (d *daemon) runHook(repoPath, service string, st storage.Storer, u refUpdat
 
 	var exit interp.ExitStatus
 	isExit := errors.As(runErr, &exit)
-	attrs := []any{"exit", int(exit), "stdout", outBuf.String(), "stderr", errBuf.String()}
+	attrs := []any{"exit", int(exit)}
+	if !streaming {
+		// When streaming, output already reached the client; don't duplicate it.
+		attrs = append(attrs, "stdout", outBuf.String(), "stderr", errBuf.String())
+	}
 	if runErr != nil {
 		if !isExit {
 			attrs = append(attrs, "err", runErr)
