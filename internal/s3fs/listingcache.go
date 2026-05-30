@@ -149,7 +149,11 @@ type ListingCache struct {
 	client    s3Client
 	bucket    string
 	separator string
-	roots     []string // normalised RecursivePrefixes, longest first
+
+	// roots is the set of recursive subtree prefixes (normalised, longest
+	// first), held behind an atomic so S3FS.Chroot can register a repo's root at
+	// runtime without locking the hot recursiveRoot read path. See registerRoot.
+	roots atomic.Pointer[[]string]
 
 	clock func() time.Time // overridable in tests
 
@@ -179,16 +183,54 @@ func NewListingCache(cfg CacheConfig, client s3Client, bucket, separator string)
 	if cfg.RecursivePrefixes == nil {
 		cfg.RecursivePrefixes = []string{"refs/"}
 	}
-	return &ListingCache{
+	c := &ListingCache{
 		ttl:       cfg.TTL,
 		cfg:       cfg,
 		client:    client,
 		bucket:    bucket,
 		separator: separator,
-		roots:     normalizeRoots(cfg.RecursivePrefixes),
 		clock:     time.Now,
 		gens:      map[string]uint64{},
 		seen:      map[string]time.Time{},
+	}
+	roots := normalizeRoots(cfg.RecursivePrefixes)
+	c.roots.Store(&roots)
+	return c
+}
+
+// registerRoot adds root — a chroot repo root, normalised to a trailing
+// separator — to the recursive subtree prefixes, so the whole repo is served
+// from one delimiter-less scan instead of a delimited listing per folder (which
+// is what collapses git's per-object loose lookups under objects/<xx>/ and its
+// per-folder refs enumeration into a single ListObjectsV2). It is a no-op for an
+// empty root or one already registered, and is safe for concurrent callers:
+// S3FS.Chroot calls it the first time each repo's storer is built.
+func (c *ListingCache) registerRoot(root string) {
+	if c == nil || root == "" {
+		return
+	}
+	if !strings.HasSuffix(root, c.separator) {
+		root += c.separator
+	}
+	for {
+		cur := c.roots.Load()
+		var existing []string
+		if cur != nil {
+			existing = *cur
+			for _, r := range existing {
+				if r == root {
+					return
+				}
+			}
+		}
+		next := make([]string, len(existing), len(existing)+1)
+		copy(next, existing)
+		next = append(next, root)
+		sort.Slice(next, func(i, j int) bool { return len(next[i]) > len(next[j]) })
+		if c.roots.CompareAndSwap(cur, &next) {
+			return
+		}
+		// Lost a race with another registrar; reload and retry.
 	}
 }
 
@@ -288,7 +330,11 @@ func (c *ListingCache) fillSubtree(ctx context.Context, root string, gen uint64)
 
 // recursiveRoot reports the longest configured recursive root at or above prefix.
 func (c *ListingCache) recursiveRoot(prefix string) (string, bool) {
-	for _, r := range c.roots { // longest first
+	rp := c.roots.Load()
+	if rp == nil {
+		return "", false
+	}
+	for _, r := range *rp { // longest first
 		if prefix == r || strings.HasPrefix(prefix, r) {
 			return r, true
 		}

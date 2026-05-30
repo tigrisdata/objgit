@@ -28,6 +28,15 @@ func (fs3 *S3FS) Chroot(path string) (billy.Filesystem, error) {
 		packCache: fs3.packCache,
 		temps:     make(map[string]*tempBuffer),
 	}
+
+	// A chroot is one repository. Register its root as a recursive subtree prefix
+	// so the whole repo is answered from one delimiter-less scan: this is what
+	// makes subtree caching actually engage for the canonical "<repo>/refs/...",
+	// "<repo>/objects/..." keys (a bucket-root prefix like "refs/" never matches
+	// them), collapsing git's per-object and per-folder listings into one.
+	if fs3.cache != nil && p != "" && p != "." {
+		fs3.cache.registerRoot(p)
+	}
 	return nfs, nil
 }
 

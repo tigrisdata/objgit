@@ -463,25 +463,87 @@ func TestListingCacheChrootShares(t *testing.T) {
 	cache := newTestCache(stub, time.Hour)
 	rootfs := newCachedFS(t, stub, cache)
 
-	// Populate the listing for repo/objects/ab/ via the root view.
-	if _, err := rootfs.Stat("repo/objects/ab/missing1"); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("root Stat: want ErrNotExist, got %v", err)
-	}
-	if stub.lists.Load() != 1 {
-		t.Fatalf("root Stat lists = %d, want 1", stub.lists.Load())
-	}
-
-	// A chroot view shares the same cache keyed by canonical prefix, so a Stat
-	// under it hits the cached listing with no further S3.
+	// A chroot is one repository: it registers its root as a recursive subtree
+	// prefix, so the first lookup under it does one delimiter-less scan of the
+	// whole repo and every later lookup anywhere in it is served from that scan.
 	sub, err := rootfs.Chroot("repo")
 	if err != nil {
 		t.Fatalf("Chroot: %v", err)
 	}
-	l0 := stub.lists.Load()
-	if _, err := sub.Stat("objects/ab/missing2"); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := sub.Stat("objects/ab/missing1"); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("chroot Stat: want ErrNotExist, got %v", err)
 	}
+	if got := stub.lists.Load(); got != 1 {
+		t.Fatalf("first chroot Stat: lists = %d, want 1 (one subtree scan)", got)
+	}
+
+	// A second lookup — different folder, via the shared root view's canonical
+	// key — is answered from the cached subtree with no further S3.
+	l0 := stub.lists.Load()
+	if _, err := rootfs.Stat("repo/objects/ab/missing2"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("shared Stat: want ErrNotExist, got %v", err)
+	}
 	if stub.lists.Load() != l0 {
-		t.Fatalf("chroot Stat re-listed: %d->%d", l0, stub.lists.Load())
+		t.Fatalf("shared Stat re-listed: %d->%d", l0, stub.lists.Load())
+	}
+}
+
+// TestListingCacheChrootSubtreeCollapsesLooseLookups is the regression guard for
+// the ListObjectsV2 reduction: git probes many absent loose objects under
+// distinct objects/<xx>/ prefixes plus several refs folders, and on a chrooted
+// repo all of it must resolve from one subtree scan rather than a list per
+// folder. A push (write + invalidate) costs exactly one re-scan on the next read.
+func TestListingCacheChrootSubtreeCollapsesLooseLookups(t *testing.T) {
+	stub := newStub(
+		"myrepo.git/HEAD",
+		"myrepo.git/refs/heads/main",
+		"myrepo.git/objects/pack/pack-1.pack",
+		"myrepo.git/objects/pack/pack-1.idx",
+	)
+	cache := newTestCache(stub, time.Hour)
+	rootfs := newCachedFS(t, stub, cache)
+
+	repo, err := rootfs.Chroot("myrepo.git")
+	if err != nil {
+		t.Fatalf("Chroot: %v", err)
+	}
+
+	// Drive git's access pattern: many absent loose objects across distinct
+	// two-hex prefixes, then the pack and refs folders.
+	for _, xx := range []string{"00", "ab", "cd", "ef", "12", "9f"} {
+		p := "objects/" + xx + "/0123456789012345678901234567890123456789"
+		if _, err := repo.Stat(p); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("Stat %q: want ErrNotExist, got %v", p, err)
+		}
+	}
+	if _, err := repo.ReadDir("objects/pack"); err != nil {
+		t.Fatalf("ReadDir objects/pack: %v", err)
+	}
+	if _, err := repo.ReadDir("refs/heads"); err != nil {
+		t.Fatalf("ReadDir refs/heads: %v", err)
+	}
+
+	// All of the above is one subtree scan. Pre-fix this was one list per
+	// distinct objects/<xx>/ prefix plus one per refs/pack folder.
+	if got := stub.lists.Load(); got != 1 {
+		t.Fatalf("loose-lookup storm: lists = %d, want 1", got)
+	}
+
+	// A push mutates the repo and bumps its generation; the next read re-scans
+	// the subtree exactly once, then is free again.
+	if err := repo.Remove("objects/pack/pack-1.pack"); err != nil {
+		t.Fatalf("Remove (write): %v", err)
+	}
+	if _, err := repo.ReadDir("objects/pack"); err != nil {
+		t.Fatalf("ReadDir after write: %v", err)
+	}
+	if got := stub.lists.Load(); got != 2 {
+		t.Fatalf("after write: lists = %d, want 2 (one re-scan)", got)
+	}
+	if _, err := repo.Stat("objects/ab/0123456789012345678901234567890123456789"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("post-write Stat: want ErrNotExist, got %v", err)
+	}
+	if got := stub.lists.Load(); got != 2 {
+		t.Fatalf("post-write cached Stat re-listed: lists = %d, want 2", got)
 	}
 }
