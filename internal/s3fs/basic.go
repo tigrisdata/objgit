@@ -74,6 +74,15 @@ func (fs3 *S3FS) OpenFile(filename string, flag int, perm os.FileMode) (billy.Fi
 			return &tempReadFile{buf: buf, name: filename}, nil
 		}
 
+		// Immutable pack-directory files are re-read with random access
+		// thousands of times while serving a clone. Download each once to a
+		// local temp file and serve from disk, instead of one S3 round-trip per
+		// access (which makes clones of real repos never finish). See
+		// docs/plans/pack-temp-file-cache.md.
+		if fs3.packCache != nil && isPackCacheable(key) {
+			return fs3.packCache.open(context.TODO(), fs3.client, fs3.bucket, key, filename)
+		}
+
 		// If the parent folder's listing is cached, resolve the open without a
 		// negotiation round-trip: absent → not-exist, a sub-prefix → directory.
 		// For a present file the head cache (seeded from the listing) lets

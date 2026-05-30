@@ -51,6 +51,11 @@ type S3FS struct {
 	// shared by pointer across this filesystem and all of its Chroot children.
 	cache *ListingCache
 
+	// packCache, when non-nil, serves reads of immutable pack-directory files
+	// (.pack/.idx/.rev) from a local temp file downloaded once, instead of one
+	// S3 round-trip per object access. Shared by pointer across Chroot children.
+	packCache *PackCache
+
 	// temps holds TempFile-backed buffers keyed by canonical S3 key, so a
 	// subsequent Open of the same path returns a reader over the same bytes
 	// the writer is still appending to. See tempfs.go.
@@ -78,6 +83,15 @@ func WithUnixMetadata(uid, gid uint32, umask os.FileMode) Option {
 func WithListingCache(c *ListingCache) Option {
 	return func(fs3 *S3FS) {
 		fs3.cache = c
+	}
+}
+
+// WithPackCache attaches a local temp-file cache for immutable pack-directory
+// files. The same *PackCache is carried into every Chroot child so the whole
+// tree shares it. Construct it with NewPackCache and defer its Cleanup.
+func WithPackCache(c *PackCache) Option {
+	return func(fs3 *S3FS) {
+		fs3.packCache = c
 	}
 }
 

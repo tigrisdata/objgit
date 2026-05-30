@@ -48,6 +48,9 @@ var (
 
 	s3CacheRecursive  = flag.String("s3-cache-recursive-prefixes", "refs/", "comma-separated key prefixes served from one recursive subtree scan instead of a listing per folder; empty disables subtree caching")
 	s3CacheMaxSubtree = flag.Int("s3-cache-max-subtree-keys", 50000, "abandon a recursive subtree scan past this many keys and fall back to per-folder listing")
+
+	packCacheBytes = flag.Int64("pack-cache-bytes", 2<<30, "local disk budget for cached pack files (.pack/.idx/.rev), downloaded once and served from a temp file so a clone doesn't re-fetch pack objects per access; 0 disables the cache")
+	packCacheDir   = flag.String("pack-cache-dir", "", "parent directory for the pack-file cache; empty uses the OS temp dir")
 )
 
 func main() {
@@ -77,11 +80,15 @@ func main() {
 	// Route s3fs S3 round-trips into Prometheus before any filesystem use.
 	s3fs.SetMetricsObserver(metrics.ObserveS3)
 
-	client, err := storage.New(ctx)
+	rawClient, err := storage.New(ctx)
 	if err != nil {
 		slog.Error("can't create Tigris storage client", "err", err)
 		os.Exit(1)
 	}
+	// Harden the client's HTTP path so stale keep-alive connections to Tigris
+	// fail fast and retry on a fresh connection instead of hanging the request
+	// forever (see internal/s3fs/resilient.go).
+	client := s3fs.Harden(rawClient)
 
 	var cache *s3fs.ListingCache
 	var fsOpts []s3fs.Option
@@ -107,6 +114,16 @@ func main() {
 				ListingItems: s.ListingItems, SubtreeItems: s.SubtreeItems, HeadItems: s.HeadItems,
 			}
 		})
+	}
+
+	if *packCacheBytes != 0 {
+		packCache, err := s3fs.NewPackCache(*packCacheDir, *packCacheBytes)
+		if err != nil {
+			slog.Error("can't create pack cache", "err", err)
+			os.Exit(1)
+		}
+		defer packCache.Cleanup()
+		fsOpts = append(fsOpts, s3fs.WithPackCache(packCache))
 	}
 
 	fsys, err := s3fs.NewS3FS(client, *bucket, fsOpts...)
