@@ -1,0 +1,9 @@
+# Keep the build context small — the build only needs the Go module + source.
+.git
+.env
+*.env
+docker/
+docs/
+var/
+objgitd
+*.md
