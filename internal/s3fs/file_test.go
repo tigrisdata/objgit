@@ -16,7 +16,7 @@ import (
 // (e.g. a post-receive hook reading the just-pushed commit).
 func TestS3ReadFileClosed(t *testing.T) {
 	newClosed := func() *s3ReadFile {
-		f := &s3ReadFile{name: "k", reader: bytes.NewReader([]byte("hello"))}
+		f := &s3ReadFile{name: "k", size: 5}
 		if err := f.Close(); err != nil {
 			t.Fatalf("Close: %v", err)
 		}

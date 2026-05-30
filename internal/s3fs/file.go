@@ -5,14 +5,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
-	"io/ioutil"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 	"go.uber.org/atomic"
 	"tangled.org/xeiaso.net/objgit/internal/s3fs/unixmeta"
 )
@@ -45,44 +49,74 @@ var (
 	ErrCantReadFromWriteOnly = errors.New("can't read from write-only file")
 )
 
-// s3ReadFile implements billy.File for S3, and represents a file opened in read mode.
+// readChunkSize is the amount ReadAt fetches per Range request on a window
+// miss. The fetched chunk is cached so the many small, sequential ReadAt calls
+// go-git issues (zlib reads ~512B at a time; idx fanout/hash lookups) coalesce
+// into a handful of GETs instead of one request per call. RAM per open handle
+// is bounded to one chunk (plus at most one in-flight streaming body), not the
+// whole object.
+const readChunkSize = 1 << 20 // 1 MiB
+
+// s3ReadFile implements billy.File for S3, representing a file opened in read
+// mode. It fetches lazily: no object bytes are buffered at Open. Sequential
+// Read streams a GetObject body read on demand; ReadAt issues Range requests
+// backed by a small read-ahead window. See docs/plans and CLAUDE.md.
 //
-// Upon creation, the file is loaded from S3.
+// All mutable state is guarded by mu. The io.ReaderAt contract (ReadAt is
+// independent of the read cursor and safe for concurrent use) is honoured:
+// ReadAt never touches pos/body, and a ReadAt drops any open sequential body so
+// a later Read reopens it at pos.
 type s3ReadFile struct {
-	client s3Client             // S3 SDK client
-	bucket string               // S3 bucket name
-	key    string               // File object's key in S3
-	name   string               // Root-relative path as presented to Open
+	client s3Client // S3 SDK client
+	bucket string   // S3 bucket name
+	key    string   // File object's key in S3
+	name   string   // Root-relative path as presented to Open
+
+	mu     sync.Mutex
 	closed bool                 // Is the file closed?
-	reader *bytes.Reader        // Buffer for file contents
-	head   *s3.HeadObjectOutput // File metadata from S3
+	head   *s3.HeadObjectOutput // File metadata; nil until first fetch (or cache-supplied)
+	size   int64                // Full object size; -1 until known
+
+	// Sequential streaming path (Read/Seek).
+	pos     int64         // Logical read cursor.
+	body    io.ReadCloser // Open GetObject body, nil until first Read (or set at open on the uncached path).
+	bodyPos int64         // Object offset the body currently sits at.
+
+	// Random-access read-ahead window (ReadAt).
+	win      []byte // Cached chunk, nil until the first ReadAt miss.
+	winStart int64  // Object offset of win[0].
 }
 
 // newS3ReadFile creates a new s3ReadFile. key is the full S3 object key; name
-// is the root-relative path the caller passed to Open (returned by Name). When
-// head is non-nil it is used as-is — the caller already has the object's
-// metadata (e.g. from the listing-cache head precache) so the redundant
-// HeadObject round-trip is skipped; pass nil to fetch it here.
+// is the root-relative path the caller passed to Open (returned by Name).
+//
+// When head is non-nil the caller already resolved the object's existence and
+// metadata (e.g. from the listing cache), so no I/O happens here — the body is
+// fetched lazily on the first Read. When head is nil a GetObject is issued now:
+// it both confirms existence (callers rely on a NoSuchKey error to fall back to
+// a directory probe) and supplies the metadata via its response headers, so the
+// redundant HeadObject round-trip is gone. The body is kept for streaming, not
+// read into memory.
 func newS3ReadFile(client s3Client, bucket, key, name string, head *s3.HeadObjectOutput) (*s3ReadFile, error) {
-	// Create the context
-	ctx := context.TODO() // TODO: How can user-supplied contexts be supported?
-
-	if head == nil {
-		start := time.Now()
-		ho, err := client.HeadObject(ctx, &s3.HeadObjectInput{
-			Bucket: new(bucket),
-			Key:    new(key),
-		})
-		observeS3("HeadObject", start, err)
-		if err != nil {
-			return nil, &os.PathError{Op: "read", Path: key, Err: err}
-		}
-		head = ho
+	f := &s3ReadFile{
+		client: client,
+		bucket: bucket,
+		key:    key,
+		name:   name,
+		size:   -1,
 	}
 
-	// Run the GetObject operation
+	if head != nil {
+		f.head = head
+		f.size = aws.ToInt64(head.ContentLength)
+		return f, nil
+	}
+
+	// No cached metadata: open the object now. This GetObject is the existence
+	// check (its error drives the caller's directory probe) and the metadata
+	// source; the body streams lazily.
 	start := time.Now()
-	res, err := client.GetObject(ctx, &s3.GetObjectInput{
+	res, err := client.GetObject(context.TODO(), &s3.GetObjectInput{
 		Bucket: &bucket,
 		Key:    &key,
 	})
@@ -90,23 +124,68 @@ func newS3ReadFile(client s3Client, bucket, key, name string, head *s3.HeadObjec
 	if err != nil {
 		return nil, fmt.Errorf("unable to perform GetObject operation: %w", err)
 	}
+	f.adoptMeta(res, false)
+	f.body = res.Body
+	f.bodyPos = 0
+	return f, nil
+}
 
-	// Read the file contents and store in a bytes reader
-	buf, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		return nil, fmt.Errorf("unable to read file body: %w", err)
+// adoptMeta records the object's full size and a synthetic HeadObjectOutput from
+// a GetObject response the first time one is seen. ranged reports whether the
+// response answered a Range request: a ranged response's ContentLength is the
+// range length, so the full size comes from its Content-Range header instead. If
+// the full size cannot be determined (an unparseable ranged response), head is
+// left nil so Stat falls back to a HeadObject.
+func (f *s3ReadFile) adoptMeta(out *s3.GetObjectOutput, ranged bool) {
+	if f.head != nil {
+		return
 	}
-	reader := bytes.NewReader(buf)
+	size := aws.ToInt64(out.ContentLength)
+	if ranged {
+		size = parseContentRange(out.ContentRange)
+	}
+	if size < 0 {
+		return
+	}
+	f.size = size
+	lastMod := out.LastModified
+	if lastMod == nil {
+		lastMod = aws.Time(time.Time{})
+	}
+	f.head = &s3.HeadObjectOutput{
+		ContentLength: aws.Int64(size),
+		LastModified:  lastMod,
+		Metadata:      out.Metadata,
+		ETag:          out.ETag,
+		ContentType:   out.ContentType,
+	}
+}
 
-	// Return the file
-	return &s3ReadFile{
-		client: client,
-		bucket: bucket,
-		key:    key,
-		name:   name,
-		reader: reader,
-		head:   head,
-	}, nil
+// parseContentRange extracts the total object size from a Content-Range header
+// of the form "bytes <start>-<end>/<total>". It returns -1 when the header is
+// absent, uses an unknown total ("*"), or cannot be parsed.
+func parseContentRange(s *string) int64 {
+	if s == nil {
+		return -1
+	}
+	i := strings.LastIndex(*s, "/")
+	if i < 0 {
+		return -1
+	}
+	total, err := strconv.ParseInt((*s)[i+1:], 10, 64)
+	if err != nil {
+		return -1
+	}
+	return total
+}
+
+// rangeHeader formats an HTTP Range header value. A negative end means
+// open-ended ("bytes=start-").
+func rangeHeader(start, end int64) string {
+	if end < 0 {
+		return fmt.Sprintf("bytes=%d-", start)
+	}
+	return fmt.Sprintf("bytes=%d-%d", start, end)
 }
 
 // Name returns the name of the file as presented to Open.
@@ -124,47 +203,183 @@ func (f *s3ReadFile) WriteAt(p []byte, off int64) (n int, err error) {
 	return 0, ErrCantWriteToReadOnly
 }
 
-// Read implements io.Reader for billy.File
+// Read implements io.Reader for billy.File. The first Read (or the first after a
+// Seek/ReadAt dropped the body) opens a GetObject body at the current position;
+// subsequent reads stream from it.
 func (f *s3ReadFile) Read(p []byte) (n int, err error) {
-	if f.closed || f.reader == nil {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
 		return 0, os.ErrClosed
 	}
-	return f.reader.Read(p)
+	if f.size >= 0 && f.pos >= f.size {
+		return 0, io.EOF
+	}
+	if f.body == nil {
+		if err := f.openBodyLocked(f.pos); err != nil {
+			return 0, err
+		}
+	}
+	n, err = f.body.Read(p)
+	f.pos += int64(n)
+	f.bodyPos += int64(n)
+	return n, err
 }
 
-// ReadAt implements io.ReaderAt for billy.File. It returns os.ErrClosed once the
-// file is closed (rather than dereferencing the nil reader and panicking): go-git's
-// packfile.FSObject.Reader probes with a 1-byte ReadAt and reopens the pack when it
-// sees an os.ErrClosed-matching error, so a cache-resident object over a closed pack
-// handle recovers instead of crashing.
+// openBodyLocked starts a GetObject whose body begins at offset at. Callers hold
+// f.mu.
+func (f *s3ReadFile) openBodyLocked(at int64) error {
+	in := &s3.GetObjectInput{Bucket: &f.bucket, Key: &f.key}
+	if at > 0 {
+		in.Range = aws.String(rangeHeader(at, -1))
+	}
+	start := time.Now()
+	out, err := f.client.GetObject(context.TODO(), in)
+	observeS3("GetObject", start, err)
+	if err != nil {
+		return fmt.Errorf("unable to perform GetObject operation: %w", err)
+	}
+	f.adoptMeta(out, at > 0)
+	f.body = out.Body
+	f.bodyPos = at
+	return nil
+}
+
+// ReadAt implements io.ReaderAt for billy.File. It serves from a read-ahead
+// window when possible and otherwise fetches a chunk via a Range request. It
+// returns os.ErrClosed once the file is closed (rather than dereferencing a nil
+// reader and panicking): go-git's packfile.FSObject.Reader probes with a 1-byte
+// ReadAt and reopens the pack when it sees an os.ErrClosed-matching error, so a
+// cache-resident object over a closed pack handle recovers instead of crashing.
 func (f *s3ReadFile) ReadAt(p []byte, off int64) (n int, err error) {
-	if f.closed || f.reader == nil {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
 		return 0, os.ErrClosed
 	}
-	return f.reader.ReadAt(p, off)
+	if off < 0 {
+		return 0, fmt.Errorf("s3fs: ReadAt negative offset %d", off)
+	}
+
+	// Random access abandons any sequential stream; Read reopens it lazily.
+	if f.body != nil {
+		f.body.Close()
+		f.body = nil
+	}
+
+	if f.size >= 0 && off >= f.size {
+		return 0, io.EOF
+	}
+
+	// Serve fully-covered requests straight from the window.
+	end := off + int64(len(p))
+	if f.win != nil && off >= f.winStart && end <= f.winStart+int64(len(f.win)) {
+		copy(p, f.win[off-f.winStart:end-f.winStart])
+		return len(p), nil
+	}
+
+	// Window miss: fetch a chunk (at least len(p)) starting at off.
+	chunk := max(int64(len(p)), readChunkSize)
+	last := off + chunk - 1
+	if f.size >= 0 && last > f.size-1 {
+		last = f.size - 1
+	}
+
+	in := &s3.GetObjectInput{
+		Bucket: &f.bucket,
+		Key:    &f.key,
+		Range:  aws.String(rangeHeader(off, last)),
+	}
+	start := time.Now()
+	out, gerr := f.client.GetObject(context.TODO(), in)
+	observeS3("GetObject", start, gerr)
+	if gerr != nil {
+		// A range starting at or past EOF is InvalidRange; treat as EOF.
+		if isInvalidRange(gerr) {
+			return 0, io.EOF
+		}
+		return 0, fmt.Errorf("unable to perform GetObject operation: %w", gerr)
+	}
+	f.adoptMeta(out, true)
+	buf, rerr := io.ReadAll(out.Body)
+	out.Body.Close()
+	if rerr != nil {
+		return 0, fmt.Errorf("unable to read range body: %w", rerr)
+	}
+
+	f.win = buf
+	f.winStart = off
+	n = copy(p, buf)
+	if n < len(p) {
+		// The range hit EOF before filling p.
+		return n, io.EOF
+	}
+	return n, nil
 }
 
-// Seek implements io.Seeker for billy.File
+// isInvalidRange reports whether err is S3's 416 InvalidRange response, returned
+// for a Range whose start is at or beyond the object's end.
+func isInvalidRange(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.ErrorCode() == "InvalidRange"
+	}
+	return false
+}
+
+// Seek implements io.Seeker for billy.File. Seeking away from the body's current
+// position drops it; the next Read reopens at the new offset.
 func (f *s3ReadFile) Seek(offset int64, whence int) (int64, error) {
-	if f.closed || f.reader == nil {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
 		return 0, os.ErrClosed
 	}
-	return f.reader.Seek(offset, whence)
+
+	var np int64
+	switch whence {
+	case io.SeekStart:
+		np = offset
+	case io.SeekCurrent:
+		np = f.pos + offset
+	case io.SeekEnd:
+		if f.size < 0 {
+			if err := f.headLocked(); err != nil {
+				return 0, err
+			}
+		}
+		np = f.size + offset
+	default:
+		return 0, fmt.Errorf("s3fs: Seek invalid whence %d", whence)
+	}
+	if np < 0 {
+		return 0, fmt.Errorf("s3fs: Seek negative position %d", np)
+	}
+
+	if f.body != nil && np != f.pos {
+		f.body.Close()
+		f.body = nil
+	}
+	f.pos = np
+	return np, nil
 }
 
 // Close implements io.Closer for billy.File
 func (f *s3ReadFile) Close() error {
-	// Was the file already closed?
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.closed {
 		return ErrFileClosed
 	}
-
-	// Close the underlying file
-	f.reader = nil
-
-	// Mark the file as closed
+	if f.body != nil {
+		f.body.Close()
+		f.body = nil
+	}
+	f.win = nil
 	f.closed = true
-
 	return nil
 }
 
@@ -185,11 +400,37 @@ func (f *s3ReadFile) Truncate(size int64) error {
 }
 
 func (f *s3ReadFile) Stat() (fs.FileInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.head == nil {
+		if err := f.headLocked(); err != nil {
+			return nil, err
+		}
+	}
 	return enrichedFileInfo{
 		HeadObjectOutput: *f.head,
 		key:              f.key,
 		mode:             fs.ModePerm,
 	}, nil
+}
+
+// headLocked fetches object metadata via HeadObject and records it. It is the
+// sole remaining HeadObject path, reached only when no fetch has populated head
+// yet (e.g. Stat or SeekEnd before any read on a cache-supplied-less handle).
+// Callers hold f.mu.
+func (f *s3ReadFile) headLocked() error {
+	start := time.Now()
+	ho, err := f.client.HeadObject(context.TODO(), &s3.HeadObjectInput{
+		Bucket: &f.bucket,
+		Key:    &f.key,
+	})
+	observeS3("HeadObject", start, err)
+	if err != nil {
+		return &os.PathError{Op: "stat", Path: f.key, Err: err}
+	}
+	f.head = ho
+	f.size = aws.ToInt64(ho.ContentLength)
+	return nil
 }
 
 // s3WriteFile stores a file opened in write mode and implements billy.File
