@@ -87,7 +87,9 @@ func diffRefs(before, after map[plumbing.ReferenceName]plumbing.Hash) []refUpdat
 // a capability-hiding wrapper.
 func (d *daemon) receivePack(ctx context.Context, st storage.Storer, repoPath string, r io.ReadCloser, w io.WriteCloser, req *transport.ReceivePackRequest) error {
 	if !d.allowHooks {
-		return receivePackStreaming(ctx, st, r, w, req, nil)
+		err := receivePackStreaming(ctx, st, r, w, req, nil)
+		d.healHEADAfterPush(err, st, repoPath)
+		return err
 	}
 
 	before, err := snapshotRefs(st)
@@ -112,7 +114,23 @@ func (d *daemon) receivePack(ctx context.Context, st storage.Storer, repoPath st
 		d.runHooks(repoPath, "receive-pack", st, updates, progress)
 	}
 
-	return receivePackStreaming(ctx, st, r, w, req, onUpdated)
+	err = receivePackStreaming(ctx, st, r, w, req, onUpdated)
+	d.healHEADAfterPush(err, st, repoPath)
+	return err
+}
+
+// healHEADAfterPush repoints a dangling HEAD once a push succeeds, so the first
+// push to a repo whose default branch is not main (e.g. golang/go uses master)
+// leaves HEAD resolvable for the next clone. The HEAD write thus lands during the
+// push rather than during a later clone. No-op when the receive failed or HEAD is
+// already valid (see ensureHEAD).
+func (d *daemon) healHEADAfterPush(recvErr error, st storage.Storer, repoPath string) {
+	if recvErr != nil {
+		return
+	}
+	if err := ensureHEAD(st); err != nil {
+		slog.Warn("could not repoint HEAD after push", "path", repoPath, "err", err)
+	}
 }
 
 // runHooks executes the receive-pack hook once per non-deleted branch update,

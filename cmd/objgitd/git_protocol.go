@@ -144,7 +144,7 @@ func (d *daemon) handle(ctx context.Context, conn net.Conn) error {
 func (d *daemon) serveGit(ctx context.Context, conn net.Conn, r io.ReadCloser, req packp.GitProtoRequest, gitProtocol string) error {
 	switch req.RequestCommand {
 	case transport.UploadPackService:
-		st, err := d.loader.Load(&url.URL{Path: req.Pathname})
+		st, err := d.load(req.Pathname)
 		if err != nil {
 			_, _ = pktline.WriteError(conn, fmt.Errorf("repository %q not found", req.Pathname))
 			return fmt.Errorf("loading %q: %w", req.Pathname, err)
@@ -154,7 +154,7 @@ func (d *daemon) serveGit(ctx context.Context, conn net.Conn, r io.ReadCloser, r
 		})
 
 	case transport.UploadArchiveService:
-		st, err := d.loader.Load(&url.URL{Path: req.Pathname})
+		st, err := d.load(req.Pathname)
 		if err != nil {
 			_, _ = pktline.WriteError(conn, fmt.Errorf("repository %q not found", req.Pathname))
 			return fmt.Errorf("loading %q: %w", req.Pathname, err)
@@ -177,11 +177,97 @@ func (d *daemon) serveGit(ctx context.Context, conn net.Conn, r io.ReadCloser, r
 	}
 }
 
+// load opens the storer for repoPath and heals a dangling HEAD before returning
+// it (see ensureHEAD). It preserves the loader's error verbatim — notably
+// transport.ErrRepositoryNotFound, which callers map to a 404 — and treats a
+// heal failure as non-fatal so a clone is never broken by a transient HEAD write.
+func (d *daemon) load(repoPath string) (storage.Storer, error) {
+	st, err := d.loader.Load(&url.URL{Path: repoPath})
+	if err != nil {
+		return nil, err
+	}
+	if err := ensureHEAD(st); err != nil {
+		slog.Warn("could not repoint dangling HEAD", "path", repoPath, "err", err)
+	}
+	return st, nil
+}
+
+// ensureHEAD repoints a repository's HEAD at an existing branch when its symbolic
+// target is missing. objgitd initializes every repo with HEAD -> refs/heads/main
+// (loadOrInit), but a repo populated by pushing a project whose default branch
+// differs — golang/go uses master — leaves HEAD dangling: clients fetch every
+// object yet cannot check out a worktree ("remote HEAD refers to nonexistent
+// ref"). Git hosts repoint HEAD on push; we heal idempotently on every load and
+// after each push, so repos already in the bucket recover on their next clone
+// without a re-push. A detached or already-valid HEAD, or a repo with no branches
+// yet, is left untouched.
+func ensureHEAD(st storage.Storer) error {
+	head, err := st.Reference(plumbing.HEAD)
+	if err != nil {
+		return err
+	}
+	if head.Type() != plumbing.SymbolicReference {
+		return nil // detached HEAD: nothing to repoint
+	}
+	if _, err := st.Reference(head.Target()); err == nil {
+		return nil // target exists: HEAD is already valid
+	} else if !errors.Is(err, plumbing.ErrReferenceNotFound) {
+		return err
+	}
+	target, err := pickDefaultBranch(st)
+	if err != nil || target == "" {
+		return err // no branches yet (target == ""): leave HEAD as-is
+	}
+	return st.SetReference(plumbing.NewSymbolicReference(plumbing.HEAD, target))
+}
+
+// pickDefaultBranch chooses a branch for HEAD: prefer refs/heads/main, then
+// master, then trunk; otherwise the lexicographically smallest branch so the
+// choice is deterministic. Returns "" when the repo has no branches.
+func pickDefaultBranch(st storage.Storer) (plumbing.ReferenceName, error) {
+	iter, err := st.IterReferences()
+	if err != nil {
+		return "", err
+	}
+	defer iter.Close()
+
+	rank := map[plumbing.ReferenceName]int{
+		plumbing.Main:                            0,
+		plumbing.Master:                          1,
+		plumbing.NewBranchReferenceName("trunk"): 2,
+	}
+	var (
+		first    plumbing.ReferenceName
+		best     plumbing.ReferenceName
+		bestRank = len(rank)
+	)
+	err = iter.ForEach(func(r *plumbing.Reference) error {
+		if r.Type() != plumbing.HashReference || !r.Name().IsBranch() {
+			return nil
+		}
+		name := r.Name()
+		if first == "" || name < first {
+			first = name
+		}
+		if rk, ok := rank[name]; ok && rk < bestRank {
+			best, bestRank = name, rk
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	if best != "" {
+		return best, nil
+	}
+	return first, nil
+}
+
 // loadOrInit returns the storer for repoPath, creating an empty bare repository
 // on demand. Git's daemon never auto-creates; objgitd does, so a first push to
 // a new path just works.
 func (d *daemon) loadOrInit(repoPath string) (storage.Storer, error) {
-	st, err := d.loader.Load(&url.URL{Path: repoPath})
+	st, err := d.load(repoPath)
 	if err == nil {
 		return st, nil
 	}

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -189,7 +188,7 @@ func (d *daemon) serveSSH(s ssh.Session, service, repoPath string) error {
 	// forwarded yet; v0/v1 is sufficient. See plan.
 	switch service {
 	case transport.UploadPackService:
-		st, err := d.loader.Load(&url.URL{Path: repoPath})
+		st, err := d.load(repoPath)
 		if err != nil {
 			fmt.Fprintf(s.Stderr(), "objgitd: repository %q not found\n", repoPath)
 			_ = s.Exit(1)
@@ -201,7 +200,7 @@ func (d *daemon) serveSSH(s ssh.Session, service, repoPath string) error {
 		}
 
 	case transport.UploadArchiveService:
-		st, err := d.loader.Load(&url.URL{Path: repoPath})
+		st, err := d.load(repoPath)
 		if err != nil {
 			fmt.Fprintf(s.Stderr(), "objgitd: repository %q not found\n", repoPath)
 			_ = s.Exit(1)

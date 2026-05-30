@@ -7,7 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -187,7 +186,7 @@ func (d *daemon) resolve(w http.ResponseWriter, r *http.Request, service, repoPa
 		return st, true
 	}
 
-	st, err := d.loader.Load(&url.URL{Path: repoPath})
+	st, err := d.load(repoPath)
 	if err != nil {
 		if errors.Is(err, transport.ErrRepositoryNotFound) {
 			http.Error(w, "repository not found", http.StatusNotFound)
