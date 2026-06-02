@@ -14,7 +14,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"tangled.org/xeiaso.net/objgit/internal/auth"
+	"github.com/tigrisdata/objgit/internal/auth"
 )
 
 const namespace = "objgit"

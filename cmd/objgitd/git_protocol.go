@@ -20,8 +20,8 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/storage"
 	"github.com/go-git/go-git/v6/storage/filesystem"
-	"tangled.org/xeiaso.net/objgit/internal/auth"
-	"tangled.org/xeiaso.net/objgit/internal/metrics"
+	"github.com/tigrisdata/objgit/internal/auth"
+	"github.com/tigrisdata/objgit/internal/metrics"
 )
 
 // handshakeTimeout bounds how long a client has to send its git-proto-request.

@@ -15,7 +15,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/cache"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/storage/filesystem"
-	"tangled.org/xeiaso.net/objgit/internal/auth"
+	"github.com/tigrisdata/objgit/internal/auth"
 )
 
 // dummyHash is a stand-in object id for branch refs in unit tests; ensureHEAD

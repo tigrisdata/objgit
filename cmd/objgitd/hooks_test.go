@@ -16,7 +16,7 @@ import (
 	"github.com/go-git/go-billy/v6/memfs"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/transport"
-	"tangled.org/xeiaso.net/objgit/internal/auth"
+	"github.com/tigrisdata/objgit/internal/auth"
 )
 
 func TestDiffRefs(t *testing.T) {

@@ -22,10 +22,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/tigrisdata/storage-go"
 	"golang.org/x/sync/errgroup"
-	"tangled.org/xeiaso.net/objgit/internal"
-	"tangled.org/xeiaso.net/objgit/internal/auth"
-	"tangled.org/xeiaso.net/objgit/internal/metrics"
-	"tangled.org/xeiaso.net/objgit/internal/s3fs"
+	"github.com/tigrisdata/objgit/internal"
+	"github.com/tigrisdata/objgit/internal/auth"
+	"github.com/tigrisdata/objgit/internal/metrics"
+	"github.com/tigrisdata/objgit/internal/s3fs"
 
 	_ "github.com/joho/godotenv/autoload"
 )

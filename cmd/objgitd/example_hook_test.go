@@ -13,7 +13,7 @@ import (
 
 	"github.com/go-git/go-billy/v6/memfs"
 	"github.com/go-git/go-git/v6/plumbing/transport"
-	"tangled.org/xeiaso.net/objgit/internal/auth"
+	"github.com/tigrisdata/objgit/internal/auth"
 )
 
 // TestExampleHookRuns pushes the repository's own example hook

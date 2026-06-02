@@ -1,4 +1,4 @@
-module tangled.org/xeiaso.net/objgit
+module github.com/tigrisdata/objgit
 
 go 1.26.3
 
@@ -18,6 +18,7 @@ require (
 	golang.org/x/sync v0.20.0
 	mvdan.cc/sh/v3 v3.13.1
 	tangled.org/xeiaso.net/kefka v0.0.6-0.20260528192045-e0a84e40ceb8
+	tangled.org/xeiaso.net/objgit v0.0.0-20260530231516-c1dfb0ede488
 )
 
 require (
@@ -43,9 +44,6 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cloudflare/circl v1.6.3 // indirect
 	github.com/emirpasic/gods v1.18.1 // indirect
-	github.com/facebookgo/ensure v0.0.0-20200202191622-63f1cf65ac4c // indirect
-	github.com/facebookgo/stack v0.0.0-20160209184415-751773369052 // indirect
-	github.com/facebookgo/subset v0.0.0-20200203212716-c811ad88dec4 // indirect
 	github.com/go-git/gcfg/v2 v2.0.2 // indirect
 	github.com/kevinburke/ssh_config v1.6.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect

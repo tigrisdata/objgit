@@ -13,8 +13,8 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/storage"
 	"github.com/go-git/go-git/v6/utils/ioutil"
-	"tangled.org/xeiaso.net/objgit/internal/auth"
-	"tangled.org/xeiaso.net/objgit/internal/metrics"
+	"github.com/tigrisdata/objgit/internal/auth"
+	"github.com/tigrisdata/objgit/internal/metrics"
 )
 
 // ServeHTTP speaks the git smart-HTTP protocol. It dispatches on the URL suffix

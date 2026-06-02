@@ -20,10 +20,10 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 	"tangled.org/xeiaso.net/kefka/command/registry"
 	"tangled.org/xeiaso.net/kefka/command/registry/coreutils"
-	"tangled.org/xeiaso.net/objgit/internal/kefkash"
-	"tangled.org/xeiaso.net/objgit/internal/metrics"
-	"tangled.org/xeiaso.net/objgit/internal/mountfs"
-	"tangled.org/xeiaso.net/objgit/internal/treefs"
+	"github.com/tigrisdata/objgit/internal/kefkash"
+	"github.com/tigrisdata/objgit/internal/metrics"
+	"github.com/tigrisdata/objgit/internal/mountfs"
+	"github.com/tigrisdata/objgit/internal/treefs"
 )
 
 // refUpdate records a single branch ref change observed across a receive-pack.

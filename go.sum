@@ -152,3 +152,5 @@ mvdan.cc/sh/v3 v3.13.1 h1:DP3TfgZhDkT7lerUdnp6PTGKyxxzz6T+cOlY/xEvfWk=
 mvdan.cc/sh/v3 v3.13.1/go.mod h1:lXJ8SexMvEVcHCoDvAGLZgFJ9Wsm2sulmoNEXGhYZD0=
 tangled.org/xeiaso.net/kefka v0.0.6-0.20260528192045-e0a84e40ceb8 h1:R008zBlWio3SXRZUaEDDDzzEf82X6e6KLvqhNddXprI=
 tangled.org/xeiaso.net/kefka v0.0.6-0.20260528192045-e0a84e40ceb8/go.mod h1:p474Le4nfwuwnuAWowRhXMsTYfkpOMscchuaFvDa2zM=
+tangled.org/xeiaso.net/objgit v0.0.0-20260530231516-c1dfb0ede488 h1:+Pnow/gNPleY6uQCi7fTrYfn0AJOkNZ5DYLnFRmhi8o=
+tangled.org/xeiaso.net/objgit v0.0.0-20260530231516-c1dfb0ede488/go.mod h1:OHVq2l1qvm7CbeWdMZDChawvZZeX8CluFQqt/x4/W/w=

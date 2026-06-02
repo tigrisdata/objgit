@@ -18,8 +18,8 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/utils/ioutil"
 	gossh "golang.org/x/crypto/ssh"
-	"tangled.org/xeiaso.net/objgit/internal/auth"
-	"tangled.org/xeiaso.net/objgit/internal/metrics"
+	"github.com/tigrisdata/objgit/internal/auth"
+	"github.com/tigrisdata/objgit/internal/metrics"
 )
 
 const hostKeyPath = ".objgit/ssh_host_ed25519_key"

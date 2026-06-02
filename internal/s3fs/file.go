@@ -17,8 +17,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
+	"github.com/tigrisdata/objgit/internal/s3fs/unixmeta"
 	"go.uber.org/atomic"
-	"tangled.org/xeiaso.net/objgit/internal/s3fs/unixmeta"
 )
 
 // newFileMetadata returns the x-amz-meta-* map to attach to a newly written
