@@ -19,7 +19,7 @@ jobs:
 
       - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
         with:
-          node-version: "latest" # does not matter for our needs
+          node-version: "lts/*" # pin to LTS; Node 26's undici breaks octokit/semantic-release
 
       - uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
         with:
