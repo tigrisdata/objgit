@@ -1,0 +1,78 @@
+name: Cut Release
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: true
+          fetch-tags: true
+          fetch-depth: 0
+          token: ${{ secrets.WRITE_GH_TOKEN }}
+
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
+        with:
+          node-version: "latest" # does not matter for our needs
+
+      - uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: "stable"
+
+      - name: Setup Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create release branch and run semantic-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          npm ci
+
+          # Create a unique release branch
+          TIMESTAMP=$(date +%s)
+          BRANCH_NAME="release-${TIMESTAMP}"
+
+          # Create and checkout release branch
+          git checkout -b "${BRANCH_NAME}"
+
+          # Run semantic-release on the release branch
+          npx semantic-release --debug
+
+          # Check if semantic-release made changes
+          if git diff --quiet origin/main HEAD 2>/dev/null || [ $(git rev-list --count HEAD ^origin/main) -eq 0 ]; then
+            echo "No release created"
+            exit 0
+          fi
+
+          # Push the release branch
+          git push origin "${BRANCH_NAME}"
+
+          # Get the version from the commit message or package.json
+          VERSION=$(node -p "require('./package.json').version" 2>/dev/null || echo "unknown")
+
+          # Create pull request
+          gh pr create \
+            --title "chore(release): ${VERSION}" \
+            --body "Automated release PR for version ${VERSION}. This PR includes updates to CHANGELOG.md and package.json. Once this PR is merged to main, the GitHub release will be created automatically." \
+            --base main \
+            --head "${BRANCH_NAME}" \
+            --label "release"
+
+      - name: Clean up old release branches
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get all release branches except the current one
+          for branch in $(git ls-remote --heads origin "release-*" | awk '{print $2}' | sed 's|refs/heads/||' | grep -v "^${BRANCH_NAME}$"); do
+            echo "Deleting old release branch: ${branch}"
+            git push origin --delete "${branch}" || true
+          done
