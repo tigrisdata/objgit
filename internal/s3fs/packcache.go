@@ -225,15 +225,18 @@ func (c *PackCache) start(ctx context.Context, client s3Client, bucket, key stri
 // dropFailed records a terminal error on the entry, wakes any waiters, and
 // removes it from the map so a later open re-fetches.
 func (c *PackCache) dropFailed(e *packEntry, err error) {
-	e.mu.Lock()
-	e.err = err
-	e.cond.Broadcast()
-	e.mu.Unlock()
+	// Remove from the map before publishing the error, for the same reason as
+	// failStream: a waiter woken by the broadcast must not find this dead entry
+	// still mapped when it reopens.
 	c.mu.Lock()
 	if c.entries[e.key] == e {
 		delete(c.entries, e.key)
 	}
 	c.mu.Unlock()
+	e.mu.Lock()
+	e.err = err
+	e.cond.Broadcast()
+	e.mu.Unlock()
 }
 
 // pump streams body into the entry's temp file, advancing the watermark and the
@@ -298,6 +301,17 @@ func (c *PackCache) pump(e *packEntry, body io.ReadCloser) {
 // file, and drops the entry. Already-open readers see the error on their next
 // blocked or out-of-range read.
 func (c *PackCache) failStream(e *packEntry, err error) {
+	// Drop the entry from the map before the error becomes visible to readers
+	// below. A reader woken by the broadcast can race ahead and reopen the same
+	// key; if the map still held this dead entry it would hand back the terminal
+	// error instead of re-downloading. Removing it first guarantees the reopen
+	// sees an empty slot and starts a fresh fetch.
+	c.mu.Lock()
+	if c.entries[e.key] == e {
+		delete(c.entries, e.key)
+	}
+	c.mu.Unlock()
+
 	e.mu.Lock()
 	if e.wfd != nil {
 		e.wfd.Close()
@@ -317,9 +331,6 @@ func (c *PackCache) failStream(e *packEntry, err error) {
 
 	c.mu.Lock()
 	c.curBytes -= reserved
-	if c.entries[e.key] == e {
-		delete(c.entries, e.key)
-	}
 	c.mu.Unlock()
 }
 
