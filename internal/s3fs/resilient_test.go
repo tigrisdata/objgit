@@ -10,10 +10,9 @@ import (
 
 // optRecorder is an s3Client that records the per-call option functions it
 // receives for each method, so a test can confirm Harden injects its hardened
-// HTTP client on every S3 round-trip. The embedded nil s3Client is never used:
-// the wrapper calls only the methods overridden below.
+// HTTP client on every S3 round-trip. It implements every s3Client method
+// directly (see below), so it needs no embedded delegate.
 type optRecorder struct {
-	s3Client
 	last []func(*s3.Options)
 }
 
