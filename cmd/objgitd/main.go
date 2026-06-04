@@ -20,12 +20,13 @@ import (
 	"github.com/gliderlabs/ssh"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/tigrisdata/storage-go"
-	"golang.org/x/sync/errgroup"
+	"github.com/tigrisdata/objgit"
 	"github.com/tigrisdata/objgit/internal"
 	"github.com/tigrisdata/objgit/internal/auth"
 	"github.com/tigrisdata/objgit/internal/metrics"
 	"github.com/tigrisdata/objgit/internal/s3fs"
+	"github.com/tigrisdata/storage-go"
+	"golang.org/x/sync/errgroup"
 
 	_ "github.com/joho/godotenv/autoload"
 )
@@ -141,6 +142,7 @@ func main() {
 	}
 
 	slog.Info("objgitd listening",
+		"version", objgit.Version,
 		"git_bind", *gitBind,
 		"http_bind", *httpBind,
 		"ssh_bind", *sshBind,
