@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -12,9 +15,130 @@ import (
 
 	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/memfs"
+	"github.com/go-git/go-git/v6/plumbing/format/pktline"
+	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/tigrisdata/objgit/internal/auth"
+	"github.com/tigrisdata/objgit/internal/metrics"
 )
+
+// ServeGitProtocol accepts connections on l until ctx is cancelled or Accept fails.
+func (d *daemon) ServeGitProtocol(ctx context.Context, l net.Listener) error {
+	go func() {
+		<-ctx.Done()
+		_ = l.Close()
+	}()
+
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("objgitd: accept: %w", err)
+		}
+
+		go func() {
+			if err := d.handleGitProtocol(ctx, conn); err != nil {
+				slog.Error("connection failed",
+					"remote", conn.RemoteAddr().String(),
+					"err", err,
+				)
+			}
+		}()
+	}
+}
+
+// handleGitProtocol services a single git:// connection: decode the request line, resolve
+// the repository, and hand the socket to the matching server command.
+func (d *daemon) handleGitProtocol(ctx context.Context, conn net.Conn) error {
+	defer conn.Close()
+
+	// A silent client must not be able to pin a goroutine forever.
+	_ = conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
+
+	var req packp.GitProtoRequest
+	if err := req.Decode(conn); err != nil {
+		return fmt.Errorf("decoding git-proto-request: %w", err)
+	}
+
+	// The transfer that follows can take a while; drop the handshake deadline.
+	_ = conn.SetReadDeadline(time.Time{})
+
+	slog.Info("serving request",
+		"service", req.RequestCommand,
+		"path", req.Pathname,
+		"remote", conn.RemoteAddr().String(),
+	)
+
+	// ExtraParams carries e.g. "version=2"; transport.ProtocolVersion splits on ":".
+	gitProtocol := strings.Join(req.ExtraParams, ":")
+
+	// UploadPack/ReceivePack call r.Close() between negotiation rounds, so the
+	// reader must be a no-op closer or the socket dies mid-conversation. The
+	// writer is the raw conn: its final Close() ends the connection.
+	r := io.NopCloser(conn)
+
+	defer metrics.TrackInFlight("git")()
+	start := time.Now()
+
+	if d.authorize(ctx, auth.Request{
+		Repo:      req.Pathname,
+		Operation: operationFor(req.RequestCommand),
+		Cred:      auth.Anonymous{},
+		Transport: "git",
+	}) != auth.Allow {
+		metrics.ObserveGitOp("git", req.RequestCommand, "denied", start)
+		_, _ = pktline.WriteError(conn, fmt.Errorf("access denied"))
+		return fmt.Errorf("access denied for %q (%s)", req.Pathname, req.RequestCommand)
+	}
+
+	err := d.serveGit(ctx, conn, r, req, gitProtocol)
+	status := "ok"
+	if err != nil {
+		status = "error"
+	}
+	metrics.ObserveGitOp("git", req.RequestCommand, status, start)
+	return err
+}
+
+// serveGit dispatches a parsed, authorized git:// request to the matching
+// go-git transport command.
+func (d *daemon) serveGit(ctx context.Context, conn net.Conn, r io.ReadCloser, req packp.GitProtoRequest, gitProtocol string) error {
+	switch req.RequestCommand {
+	case transport.UploadPackService:
+		st, err := d.load(req.Pathname)
+		if err != nil {
+			_, _ = pktline.WriteError(conn, fmt.Errorf("repository %q not found", req.Pathname))
+			return fmt.Errorf("loading %q: %w", req.Pathname, err)
+		}
+		return transport.UploadPack(ctx, st, r, conn, &transport.UploadPackRequest{
+			GitProtocol: gitProtocol,
+		})
+
+	case transport.UploadArchiveService:
+		st, err := d.load(req.Pathname)
+		if err != nil {
+			_, _ = pktline.WriteError(conn, fmt.Errorf("repository %q not found", req.Pathname))
+			return fmt.Errorf("loading %q: %w", req.Pathname, err)
+		}
+		return transport.UploadArchive(ctx, st, r, conn, &transport.UploadArchiveRequest{})
+
+	case transport.ReceivePackService:
+		st, err := d.loadOrInit(req.Pathname)
+		if err != nil {
+			_, _ = pktline.WriteError(conn, fmt.Errorf("cannot open repository %q", req.Pathname))
+			return fmt.Errorf("opening %q for push: %w", req.Pathname, err)
+		}
+		return d.receivePack(ctx, st, req.Pathname, r, conn, &transport.ReceivePackRequest{
+			GitProtocol: gitProtocol,
+		})
+
+	default:
+		_, _ = pktline.WriteError(conn, fmt.Errorf("unsupported service %q", req.RequestCommand))
+		return fmt.Errorf("unsupported service: %s", req.RequestCommand)
+	}
+}
 
 // TestDaemonPushCreatesRepo reproduces "git push git://host/new.git" against a
 // path that does not exist yet. The daemon must create the bare repository on
@@ -40,7 +164,7 @@ func TestDaemonPushCreatesRepo(t *testing.T) {
 	}
 
 	srvErr := make(chan error, 1)
-	go func() { srvErr <- d.Serve(ctx, ln) }()
+	go func() { srvErr <- d.ServeGitProtocol(ctx, ln) }()
 
 	remote := "git://" + ln.Addr().String() + "/test.git"
 
@@ -95,7 +219,7 @@ func TestDaemonPushDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	go func() { _ = d.Serve(ctx, ln) }()
+	go func() { _ = d.ServeGitProtocol(ctx, ln) }()
 
 	remote := "git://" + ln.Addr().String() + "/test.git"
 
@@ -139,7 +263,7 @@ func TestDaemonPushKeepsPack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	go func() { _ = d.Serve(ctx, ln) }()
+	go func() { _ = d.ServeGitProtocol(ctx, ln) }()
 
 	remote := "git://" + ln.Addr().String() + "/test.git"
 

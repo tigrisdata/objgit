@@ -32,7 +32,6 @@ import (
 )
 
 var (
-	gitBind     = flag.String("git-bind", ":9418", "TCP address to listen on for the git:// protocol; empty disables it")
 	httpBind    = flag.String("http-bind", ":8080", "TCP address to listen on for the git smart-HTTP protocol; empty disables it")
 	sshBind     = flag.String("ssh-bind", "", "TCP address to listen on for the git-over-SSH protocol; empty disables it")
 	metricsBind = flag.String("metrics-bind", ":9090", "TCP address to serve the Prometheus /metrics endpoint; empty disables it")
@@ -70,8 +69,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *gitBind == "" && *httpBind == "" && *sshBind == "" {
-		slog.Error("at least one of -git-bind, -http-bind, or -ssh-bind must be set")
+	if *httpBind == "" && *sshBind == "" {
+		slog.Error("at least one of -http-bind or -ssh-bind must be set")
 		os.Exit(1)
 	}
 
@@ -143,7 +142,6 @@ func main() {
 
 	slog.Info("objgitd listening",
 		"version", objgit.Version,
-		"git_bind", *gitBind,
 		"http_bind", *httpBind,
 		"ssh_bind", *sshBind,
 		"metrics_bind", *metricsBind,
@@ -191,15 +189,6 @@ func main() {
 			defer cancel()
 			return srv.Shutdown(shutdownCtx)
 		})
-	}
-
-	if *gitBind != "" {
-		ln, err := net.Listen("tcp", *gitBind)
-		if err != nil {
-			slog.Error("can't listen", "git_bind", *gitBind, "err", err)
-			os.Exit(1)
-		}
-		g.Go(func() error { return d.Serve(gCtx, ln) })
 	}
 
 	if *httpBind != "" {
