@@ -120,7 +120,7 @@ func TestReceivePackHook(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	go func() { _ = d.Serve(ctx, ln) }()
+	go func() { _ = d.ServeGitProtocol(ctx, ln) }()
 
 	remote := "git://" + ln.Addr().String() + "/hooked.git"
 
@@ -200,7 +200,7 @@ func TestReceivePackHookAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	go func() { _ = d.Serve(ctx, ln) }()
+	go func() { _ = d.ServeGitProtocol(ctx, ln) }()
 
 	remote := "git://" + ln.Addr().String() + "/plain.git"
 	work := t.TempDir()

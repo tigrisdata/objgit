@@ -49,7 +49,7 @@ func TestExampleHookRuns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	go func() { _ = d.Serve(ctx, ln) }()
+	go func() { _ = d.ServeGitProtocol(ctx, ln) }()
 
 	remote := "git://" + ln.Addr().String() + "/example.git"
 	work := t.TempDir()
