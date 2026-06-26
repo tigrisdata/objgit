@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v6/memfs"
-	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/tigrisdata/objgit/internal/auth"
+	"github.com/tigrisdata/objgit/internal/repofs"
 )
 
 // TestExampleHookRuns pushes the repository's own example hook
@@ -37,8 +37,8 @@ func TestExampleHookRuns(t *testing.T) {
 
 	fs := memfs.New()
 	d := &daemon{
-		fs:          fs,
-		loader:      transport.NewFilesystemLoader(fs, false),
+		sysFS:       fs,
+		resolver:    repofs.BucketResolver{Base: fs},
 		authz:       auth.AllowAnonymous{AllowWrite: true},
 		allowHooks:  true,
 		hookTimeout: 30 * time.Second,
@@ -51,7 +51,7 @@ func TestExampleHookRuns(t *testing.T) {
 	}
 	go func() { _ = d.ServeGitProtocol(ctx, ln) }()
 
-	remote := "git://" + ln.Addr().String() + "/example.git"
+	remote := "git://" + ln.Addr().String() + "/acme/example.git"
 	work := t.TempDir()
 	runGit(t, work, "init", "-b", "main")
 	runGit(t, work, "config", "user.email", "test@example.com")

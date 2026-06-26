@@ -13,9 +13,9 @@ import (
 	"github.com/go-git/go-billy/v6/memfs"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/cache"
-	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/storage/filesystem"
 	"github.com/tigrisdata/objgit/internal/auth"
+	"github.com/tigrisdata/objgit/internal/repofs"
 )
 
 // dummyHash is a stand-in object id for branch refs in unit tests; ensureHEAD
@@ -148,11 +148,11 @@ func TestSmartHTTPHealsDanglingHEAD(t *testing.T) {
 	}
 
 	fs := memfs.New()
-	ts := httptest.NewServer(&daemon{
-		fs:     fs,
-		loader: transport.NewFilesystemLoader(fs, false),
-		authz:  auth.AllowAnonymous{AllowWrite: true},
-	})
+	ts := httptest.NewServer((&daemon{
+		sysFS:    fs,
+		resolver: repofs.BucketResolver{Base: fs},
+		authz:    auth.AllowAnonymous{AllowWrite: true},
+	}).httpHandler())
 	t.Cleanup(ts.Close)
 
 	// Push a single "master" branch (no "main"), like a project whose default
@@ -164,7 +164,7 @@ func TestSmartHTTPHealsDanglingHEAD(t *testing.T) {
 	writeFile(t, filepath.Join(work, "README.md"), "hello\n")
 	runGit(t, work, "add", ".")
 	runGit(t, work, "commit", "-m", "initial")
-	if out, err := tryGit(work, "push", ts.URL+"/go.git", "master"); err != nil {
+	if out, err := tryGit(work, "push", ts.URL+"/acme/go.git", "master"); err != nil {
 		t.Fatalf("push failed: %v\n%s", err, out)
 	}
 
@@ -172,10 +172,10 @@ func TestSmartHTTPHealsDanglingHEAD(t *testing.T) {
 	// would otherwise have already fixed it): point HEAD back at the dangling
 	// refs/heads/main directly in the backing store. The very next load (this
 	// clone) must heal it on the way to serving the advertisement.
-	breakHEAD(t, fs, "/go.git")
+	breakHEAD(t, fs, "/acme/go")
 
 	dst := t.TempDir()
-	out, err := tryGit(dst, "clone", ts.URL+"/go.git", "cloned")
+	out, err := tryGit(dst, "clone", ts.URL+"/acme/go.git", "cloned")
 	if err != nil {
 		t.Fatalf("clone failed: %v\n%s", err, out)
 	}
@@ -195,7 +195,7 @@ func TestSmartHTTPHealsDanglingHEAD(t *testing.T) {
 	}
 
 	// After a load-healed clone, the advertisement now carries the symref.
-	if body := getInfoRefs(t, ts.URL+"/go.git"); !strings.Contains(body, "symref=HEAD:refs/heads/master") {
+	if body := getInfoRefs(t, ts.URL+"/acme/go.git"); !strings.Contains(body, "symref=HEAD:refs/heads/master") {
 		t.Errorf("expected symref=HEAD:refs/heads/master after heal; advertisement:\n%q", body)
 	}
 }

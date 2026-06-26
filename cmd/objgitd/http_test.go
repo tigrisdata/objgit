@@ -1,18 +1,21 @@
 package main
 
 import (
+	"context"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/memfs"
-	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/tigrisdata/objgit/internal/auth"
+	"github.com/tigrisdata/objgit/internal/repofs"
 )
 
 // TestSmartHTTP drives a real git client against the smart-HTTP handler over an
@@ -51,7 +54,7 @@ func TestSmartHTTP(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			ts, fs := newHTTPServer(t, tt.allowPush)
-			remote := ts.URL + "/test.git"
+			remote := ts.URL + "/acme/test.git"
 
 			var srcHead string
 			if tt.doPush {
@@ -69,7 +72,7 @@ func TestSmartHTTP(t *testing.T) {
 			}
 
 			// The bare repo must exist on disk iff a push was expected to land.
-			_, statErr := fs.Stat("/test.git/config")
+			_, statErr := fs.Stat("/acme/test/config")
 			pushLanded := tt.doPush && !tt.wantPushErr
 			if pushLanded && statErr != nil {
 				t.Fatalf("expected repo to be created on push, but config missing: %v", statErr)
@@ -106,11 +109,11 @@ func newHTTPServer(t *testing.T, allowPush bool) (*httptest.Server, billy.Filesy
 	t.Helper()
 	fs := memfs.New()
 	d := &daemon{
-		fs:     fs,
-		loader: transport.NewFilesystemLoader(fs, false),
-		authz:  auth.AllowAnonymous{AllowWrite: allowPush},
+		sysFS:    fs,
+		resolver: repofs.BucketResolver{Base: fs},
+		authz:    auth.AllowAnonymous{AllowWrite: allowPush},
 	}
-	ts := httptest.NewServer(d)
+	ts := httptest.NewServer(d.httpHandler())
 	t.Cleanup(ts.Close)
 	return ts, fs
 }
@@ -125,29 +128,29 @@ func TestSmartHTTPAnonymousReadWhilePushDisabled(t *testing.T) {
 
 	// Seed a repo via a push-enabled server over a shared filesystem.
 	fs := memfs.New()
-	seed := httptest.NewServer(&daemon{
-		fs:     fs,
-		loader: transport.NewFilesystemLoader(fs, false),
-		authz:  auth.AllowAnonymous{AllowWrite: true},
-	})
+	seed := httptest.NewServer((&daemon{
+		sysFS:    fs,
+		resolver: repofs.BucketResolver{Base: fs},
+		authz:    auth.AllowAnonymous{AllowWrite: true},
+	}).httpHandler())
 	t.Cleanup(seed.Close)
 
 	work := seedRepo(t)
 	srcHead := strings.TrimSpace(runGit(t, work, "rev-parse", "HEAD"))
-	if out, err := tryGit(work, "push", seed.URL+"/test.git", "main"); err != nil {
+	if out, err := tryGit(work, "push", seed.URL+"/acme/test.git", "main"); err != nil {
 		t.Fatalf("seed push failed: %v\n%s", err, out)
 	}
 
 	// Serve the same filesystem with push disabled and clone from it.
-	ro := httptest.NewServer(&daemon{
-		fs:     fs,
-		loader: transport.NewFilesystemLoader(fs, false),
-		authz:  auth.AllowAnonymous{AllowWrite: false},
-	})
+	ro := httptest.NewServer((&daemon{
+		sysFS:    fs,
+		resolver: repofs.BucketResolver{Base: fs},
+		authz:    auth.AllowAnonymous{AllowWrite: false},
+	}).httpHandler())
 	t.Cleanup(ro.Close)
 
 	dst := t.TempDir()
-	if out, err := tryGit(dst, "clone", ro.URL+"/test.git", "cloned"); err != nil {
+	if out, err := tryGit(dst, "clone", ro.URL+"/acme/test.git", "cloned"); err != nil {
 		t.Fatalf("anonymous clone should succeed with push disabled: %v\n%s", err, out)
 	}
 	gotHead := strings.TrimSpace(runGit(t, filepath.Join(dst, "cloned"), "rev-parse", "HEAD"))
@@ -172,13 +175,13 @@ func TestSmartHTTPHookStreams(t *testing.T) {
 	defer slog.SetDefault(prev)
 
 	fs := memfs.New()
-	ts := httptest.NewServer(&daemon{
-		fs:          fs,
-		loader:      transport.NewFilesystemLoader(fs, false),
+	ts := httptest.NewServer((&daemon{
+		sysFS:       fs,
+		resolver:    repofs.BucketResolver{Base: fs},
 		authz:       auth.AllowAnonymous{AllowWrite: true},
 		allowHooks:  true,
 		hookTimeout: 30 * time.Second,
-	})
+	}).httpHandler())
 	t.Cleanup(ts.Close)
 
 	work := t.TempDir()
@@ -195,7 +198,7 @@ func TestSmartHTTPHookStreams(t *testing.T) {
 	runGit(t, work, "add", ".")
 	runGit(t, work, "commit", "-m", "with hook")
 
-	out, err := tryGit(work, "push", ts.URL+"/hooked.git", "main")
+	out, err := tryGit(work, "push", ts.URL+"/acme/hooked.git", "main")
 	if err != nil {
 		t.Fatalf("push failed: %v\n%s", err, out)
 	}
@@ -223,4 +226,76 @@ func seedRepo(t *testing.T) string {
 	runGit(t, work, "config", "user.name", "Test")
 	runGit(t, work, "commit", "--allow-empty", "-m", "initial")
 	return work
+}
+
+// recordingResolver wraps a Resolver and records the last credential it saw, so
+// a test can assert the HTTP Basic-auth credential reached filesystem resolution.
+type recordingResolver struct {
+	inner    repofs.Resolver
+	mu       sync.Mutex
+	lastCred repofs.Credential
+}
+
+func (r *recordingResolver) Resolve(ctx context.Context, ref repofs.RepoRef, cred repofs.Credential, create bool) (billy.Filesystem, error) {
+	r.mu.Lock()
+	r.lastCred = cred
+	r.mu.Unlock()
+	return r.inner.Resolve(ctx, ref, cred, create)
+}
+
+func (r *recordingResolver) credential() repofs.Credential {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastCred
+}
+
+// TestHTTPRejectsNonOrgRepoPath verifies the {orgID}/{repoName} shape is enforced
+// by the router: a single-segment path matches no pattern and is a 404.
+func TestHTTPRejectsNonOrgRepoPath(t *testing.T) {
+	fs := memfs.New()
+	d := &daemon{
+		sysFS:    fs,
+		resolver: repofs.BucketResolver{Base: fs},
+		authz:    auth.AllowAnonymous{AllowWrite: true},
+	}
+	ts := httptest.NewServer(d.httpHandler())
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Get(ts.URL + "/single.git/info/refs?service=git-upload-pack")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("single-segment path: status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
+// TestHTTPCredentialReachesResolver verifies the HTTP Basic-auth username and
+// password are threaded into the filesystem resolver.
+func TestHTTPCredentialReachesResolver(t *testing.T) {
+	fs := memfs.New()
+	rec := &recordingResolver{inner: repofs.BucketResolver{Base: fs}}
+	d := &daemon{
+		sysFS:    fs,
+		resolver: rec,
+		authz:    auth.AllowAnonymous{AllowWrite: true},
+	}
+	ts := httptest.NewServer(d.httpHandler())
+	t.Cleanup(ts.Close)
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/acme/widgets.git/info/refs?service=git-upload-pack", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.SetBasicAuth("alice", "s3cret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got, want := rec.credential(), (repofs.Credential{Username: "alice", Password: "s3cret"}); got != want {
+		t.Errorf("resolver credential = %+v, want %+v", got, want)
+	}
 }

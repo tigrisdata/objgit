@@ -17,6 +17,7 @@ import (
 	"github.com/go-git/go-billy/v6/memfs"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/tigrisdata/objgit/internal/auth"
+	"github.com/tigrisdata/objgit/internal/repofs"
 )
 
 func TestGitServiceFor(t *testing.T) {
@@ -128,8 +129,8 @@ func startSSHServer(t *testing.T, allowPush, allowHooks bool) (string, billy.Fil
 	t.Helper()
 	fs := memfs.New()
 	d := &daemon{
-		fs:          fs,
-		loader:      transport.NewFilesystemLoader(fs, false),
+		sysFS:       fs,
+		resolver:    repofs.BucketResolver{Base: fs},
 		authz:       auth.AllowAnonymous{AllowWrite: allowPush},
 		allowHooks:  allowHooks,
 		hookTimeout: 30 * time.Second,
@@ -211,10 +212,10 @@ func TestSSH(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			addr, fs := startSSHServer(t, tt.allowPush, false)
 			env := gitSSHEnv(t)
-			remote := "ssh://git@" + addr + "/test.git"
+			remote := "ssh://git@" + addr + "/acme/test.git"
 
 			// Confirm no repo exists before any push.
-			_, preStatErr := fs.Stat("/test.git/config")
+			_, preStatErr := fs.Stat("/acme/test/config")
 			if preStatErr == nil {
 				t.Fatal("test.git must not exist before any push")
 			}
@@ -235,7 +236,7 @@ func TestSSH(t *testing.T) {
 			}
 
 			// The bare repo must exist iff a push was expected to land.
-			_, statErr := fs.Stat("/test.git/config")
+			_, statErr := fs.Stat("/acme/test/config")
 			pushLanded := tt.doPush && !tt.wantPushErr
 			if pushLanded && statErr != nil {
 				t.Fatalf("expected repo to be created on push, but config missing: %v", statErr)
@@ -246,7 +247,7 @@ func TestSSH(t *testing.T) {
 			if pushLanded {
 				// SSH shares the Scanner-bounded PackfileWriter path: the push
 				// must land as a packfile, not loose objects.
-				assertPackedRepo(t, fs, "/test.git")
+				assertPackedRepo(t, fs, "/acme/test")
 			}
 
 			dst := t.TempDir()
@@ -284,7 +285,7 @@ func TestSSHHookFires(t *testing.T) {
 
 	addr, _ := startSSHServer(t, true, true)
 	env := gitSSHEnv(t)
-	remote := "ssh://git@" + addr + "/hooked.git"
+	remote := "ssh://git@" + addr + "/acme/hooked.git"
 
 	work := t.TempDir()
 	runGit(t, work, "init", "-b", "main")
