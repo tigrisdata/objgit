@@ -18,13 +18,13 @@ import (
 
 	"github.com/facebookgo/flagenv"
 	"github.com/gliderlabs/ssh"
-	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/tigrisdata/objgit"
 	"github.com/tigrisdata/objgit/internal"
 	"github.com/tigrisdata/objgit/internal/auth"
 	"github.com/tigrisdata/objgit/internal/metrics"
 	"github.com/tigrisdata/objgit/internal/s3fs"
+	"github.com/tigrisdata/objgit/internal/tigrisfs"
 	"github.com/tigrisdata/storage-go"
 	"golang.org/x/sync/errgroup"
 
@@ -35,7 +35,7 @@ var (
 	httpBind    = flag.String("http-bind", ":8080", "TCP address to listen on for the git smart-HTTP protocol; empty disables it")
 	sshBind     = flag.String("ssh-bind", "", "TCP address to listen on for the git-over-SSH protocol; empty disables it")
 	metricsBind = flag.String("metrics-bind", ":9090", "TCP address to serve the Prometheus /metrics endpoint; empty disables it")
-	bucket      = flag.String("bucket", "", "Tigris bucket that holds the git repositories")
+	bucket      = flag.String("bucket", "", "Tigris bucket for daemon system state (the SSH host key); repositories live in per-keypair buckets, not here")
 	allowPush   = flag.Bool("allow-push", false, "allow unauthenticated git-receive-pack (push) requests")
 	slogLevel   = flag.String("slog-level", "INFO", "log level (DEBUG, INFO, WARN, ERROR)")
 
@@ -132,9 +132,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Repositories live in per-keypair Tigris buckets resolved at request time
+	// (one bucket per repo, created on first push). The -bucket fsys above backs
+	// only daemon system state (the SSH host key). The per-keypair model can't
+	// share the single-bucket listing/pack caches, so repo-side caching is off.
+	if cache != nil || *packCacheBytes != 0 {
+		slog.Info("per-keypair resolver active: repo-side S3 caching is disabled (caches apply to the system bucket only)")
+	}
+
 	d := &daemon{
-		fs:          fsys,
-		loader:      transport.NewFilesystemLoader(fsys, false),
+		sysFS:       fsys,
+		resolver:    tigrisfs.New(),
 		authz:       auth.AllowAnonymous{AllowWrite: *allowPush},
 		allowHooks:  *allowHooks,
 		hookTimeout: *hookTimeout,
@@ -197,7 +205,7 @@ func main() {
 			slog.Error("can't listen", "http_bind", *httpBind, "err", err)
 			os.Exit(1)
 		}
-		srv := &http.Server{Handler: d}
+		srv := &http.Server{Handler: d.httpHandler()}
 		g.Go(func() error {
 			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				return err

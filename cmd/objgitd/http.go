@@ -7,7 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
+	"path"
 	"time"
 
 	"github.com/go-git/go-git/v6/plumbing/transport"
@@ -15,29 +15,40 @@ import (
 	"github.com/go-git/go-git/v6/utils/ioutil"
 	"github.com/tigrisdata/objgit/internal/auth"
 	"github.com/tigrisdata/objgit/internal/metrics"
+	"github.com/tigrisdata/objgit/internal/repofs"
 )
 
-// ServeHTTP speaks the git smart-HTTP protocol. It dispatches on the URL suffix
-// the way git-http-backend does: repository paths are variable-depth (e.g.
-// /foo/bar.git) and precede a fixed endpoint suffix, which http.ServeMux's
-// wildcards cannot express.
-func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	p := r.URL.Path
-	switch {
-	case r.Method == http.MethodGet && strings.HasSuffix(p, "/info/refs"):
-		d.handleInfoRefs(w, r, strings.TrimSuffix(p, "/info/refs"))
-	case r.Method == http.MethodPost && strings.HasSuffix(p, "/git-upload-pack"):
-		d.handleRPC(w, r, transport.UploadPackService, strings.TrimSuffix(p, "/git-upload-pack"))
-	case r.Method == http.MethodPost && strings.HasSuffix(p, "/git-receive-pack"):
-		d.handleRPC(w, r, transport.ReceivePackService, strings.TrimSuffix(p, "/git-receive-pack"))
-	default:
-		http.NotFound(w, r)
+// httpHandler builds the smart-HTTP router. Repository paths are now a fixed
+// {orgID}/{repoName} depth, so http.ServeMux wildcards express the routes
+// directly (the captured repoName still carries a ".git" the ref parser strips).
+// Anything that is not exactly two segments before the endpoint suffix never
+// matches a pattern and falls through to ServeMux's 404.
+func (d *daemon) httpHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{orgID}/{repoName}/info/refs", d.handleInfoRefs)
+	mux.HandleFunc("POST /{orgID}/{repoName}/git-upload-pack", func(w http.ResponseWriter, r *http.Request) {
+		d.handleRPC(w, r, transport.UploadPackService)
+	})
+	mux.HandleFunc("POST /{orgID}/{repoName}/git-receive-pack", func(w http.ResponseWriter, r *http.Request) {
+		d.handleRPC(w, r, transport.ReceivePackService)
+	})
+	return mux
+}
+
+// repoRef builds a RepoRef from the {orgID}/{repoName} path wildcards. It writes
+// a 400 and returns ok=false when the pair is not a valid repository path.
+func repoRef(w http.ResponseWriter, r *http.Request) (repofs.RepoRef, bool) {
+	ref, err := repofs.Parse(path.Join(r.PathValue("orgID"), r.PathValue("repoName")))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return repofs.RepoRef{}, false
 	}
+	return ref, true
 }
 
 // handleInfoRefs serves the reference-discovery phase:
-// GET /{repo}/info/refs?service=git-(upload|receive)-pack.
-func (d *daemon) handleInfoRefs(w http.ResponseWriter, r *http.Request, repoPath string) {
+// GET /{orgID}/{repoName}/info/refs?service=git-(upload|receive)-pack.
+func (d *daemon) handleInfoRefs(w http.ResponseWriter, r *http.Request) {
 	service := r.URL.Query().Get("service")
 	switch service {
 	case transport.UploadPackService, transport.ReceivePackService:
@@ -46,14 +57,19 @@ func (d *daemon) handleInfoRefs(w http.ResponseWriter, r *http.Request, repoPath
 		return
 	}
 
-	st, ok := d.resolve(w, r, service, repoPath)
+	ref, ok := repoRef(w, r)
+	if !ok {
+		return
+	}
+
+	st, ok := d.resolve(w, r, service, ref)
 	if !ok {
 		return
 	}
 
 	slog.Info("serving smart-http advertisement",
 		"service", service,
-		"path", repoPath,
+		"repo", ref.Path(),
 		"remote", r.RemoteAddr,
 	)
 
@@ -81,17 +97,23 @@ func (d *daemon) handleInfoRefs(w http.ResponseWriter, r *http.Request, repoPath
 		})
 	}
 	if err != nil {
-		slog.Error("smart-http advertisement failed", "service", service, "path", repoPath, "err", err)
+		slog.Error("smart-http advertisement failed", "service", service, "repo", ref.Path(), "err", err)
 	}
 }
 
 // handleRPC serves a stateless negotiation round:
-// POST /{repo}/git-(upload|receive)-pack.
-func (d *daemon) handleRPC(w http.ResponseWriter, r *http.Request, service, repoPath string) {
+// POST /{orgID}/{repoName}/git-(upload|receive)-pack.
+func (d *daemon) handleRPC(w http.ResponseWriter, r *http.Request, service string) {
 	defer metrics.TrackInFlight("http")()
 	start := time.Now()
 
-	st, ok := d.resolve(w, r, service, repoPath)
+	ref, ok := repoRef(w, r)
+	if !ok {
+		metrics.ObserveGitOp("http", service, "error", start)
+		return
+	}
+
+	st, ok := d.resolve(w, r, service, ref)
 	if !ok {
 		// resolve has already written the HTTP error; a denied authorization is
 		// recorded by d.authorize in auth_requests_total. Count the failed op
@@ -113,7 +135,7 @@ func (d *daemon) handleRPC(w http.ResponseWriter, r *http.Request, service, repo
 
 	slog.Info("serving smart-http rpc",
 		"service", service,
-		"path", repoPath,
+		"repo", ref.Path(),
 		"remote", r.RemoteAddr,
 	)
 
@@ -141,7 +163,7 @@ func (d *daemon) handleRPC(w http.ResponseWriter, r *http.Request, service, repo
 			GitProtocol:  gitProtocol,
 		})
 	case transport.ReceivePackService:
-		err = d.receivePack(r.Context(), st, repoPath, in, out, &transport.ReceivePackRequest{
+		err = d.receivePack(r.Context(), st, ref.Path(), in, out, &transport.ReceivePackRequest{
 			StatelessRPC: true,
 			GitProtocol:  gitProtocol,
 		})
@@ -149,7 +171,7 @@ func (d *daemon) handleRPC(w http.ResponseWriter, r *http.Request, service, repo
 	status := "ok"
 	if err != nil {
 		// The status line is already sent, so this can only be logged.
-		slog.Error("smart-http rpc failed", "service", service, "path", repoPath, "err", err)
+		slog.Error("smart-http rpc failed", "service", service, "repo", ref.Path(), "err", err)
 		status = "error"
 	}
 	metrics.ObserveGitOp("http", service, status, start)
@@ -157,46 +179,79 @@ func (d *daemon) handleRPC(w http.ResponseWriter, r *http.Request, service, repo
 
 // resolve loads the storer for an HTTP request, authorizing via the daemon's
 // Authorizer before touching the repository. It writes an HTTP error and
-// returns ok=false when the request cannot proceed.
-func (d *daemon) resolve(w http.ResponseWriter, r *http.Request, service, repoPath string) (storage.Storer, bool) {
-	switch d.authorize(r.Context(), auth.Request{
-		Repo:      repoPath,
-		Operation: operationFor(service),
-		Cred:      credFromRequest(r),
+// returns ok=false when the request cannot proceed. The Basic-auth credential
+// is threaded into the filesystem resolver so a backend can route per caller.
+func (d *daemon) resolve(w http.ResponseWriter, r *http.Request, service string, ref repofs.RepoRef) (storage.Storer, bool) {
+	authCred, fsCred := credFromRequest(r)
+	op := operationFor(service)
+	user, _, hasBasicAuth := r.BasicAuth()
+	decision := d.authorize(r.Context(), auth.Request{
+		Repo:      ref.Path(),
+		Operation: op,
+		Cred:      authCred,
 		Transport: "http",
-	}) {
+	})
+	slog.Debug("authorizing smart-http request",
+		"repo", ref.Path(),
+		"service", service,
+		"operation", op,
+		"decision", decision,
+		"basic_auth", hasBasicAuth,
+		"user", user,
+		"remote", r.RemoteAddr,
+	)
+	switch decision {
 	case auth.Allow:
 		// authorized; fall through to repo resolution
 	case auth.Unauthenticated:
+		slog.Info("smart-http request needs authentication",
+			"repo", ref.Path(), "service", service, "operation", op,
+			"basic_auth", hasBasicAuth, "remote", r.RemoteAddr,
+		)
 		w.Header().Set("WWW-Authenticate", `Basic realm="objgit"`)
 		http.Error(w, "authentication required", http.StatusUnauthorized)
 		return nil, false
 	default: // auth.Deny
+		// The most common cause is a push (receive-pack -> Write) while the
+		// authorizer's write gate is closed (e.g. -allow-push unset).
+		slog.Warn("smart-http request denied by authorizer",
+			"repo", ref.Path(), "service", service, "operation", op,
+			"basic_auth", hasBasicAuth, "user", user, "remote", r.RemoteAddr,
+		)
 		http.Error(w, "access denied", http.StatusForbidden)
 		return nil, false
 	}
 
 	if service == transport.ReceivePackService {
-		st, err := d.loadOrInit(repoPath)
+		st, err := d.loadOrInit(r.Context(), ref, fsCred)
 		if err != nil {
-			slog.Error("opening repository for push", "path", repoPath, "err", err)
-			http.Error(w, "cannot open repository", http.StatusInternalServerError)
-			return nil, false
+			return nil, writeResolveError(w, ref, "opening repository for push", err)
 		}
 		return st, true
 	}
 
-	st, err := d.load(repoPath)
+	st, err := d.load(r.Context(), ref, fsCred)
 	if err != nil {
-		if errors.Is(err, transport.ErrRepositoryNotFound) {
-			http.Error(w, "repository not found", http.StatusNotFound)
-			return nil, false
-		}
-		slog.Error("loading repository", "path", repoPath, "err", err)
-		http.Error(w, "cannot open repository", http.StatusInternalServerError)
-		return nil, false
+		return nil, writeResolveError(w, ref, "loading repository", err)
 	}
 	return st, true
+}
+
+// writeResolveError renders a repository-resolution error in HTTP terms: a
+// missing credential is a 401 challenge, a missing repository is a 404, and
+// anything else is a logged 500. It always returns false (resolution failed).
+func writeResolveError(w http.ResponseWriter, ref repofs.RepoRef, action string, err error) bool {
+	switch {
+	case errors.Is(err, repofs.ErrUnauthenticated):
+		w.Header().Set("WWW-Authenticate", `Basic realm="objgit"`)
+		http.Error(w, "authentication required", http.StatusUnauthorized)
+	case errors.Is(err, transport.ErrRepositoryNotFound):
+		http.Error(w, "repository not found", http.StatusNotFound)
+	default:
+		slog.Error(action, "repo", ref.Path(), "err", err)
+		http.Error(w, "cannot open repository", http.StatusInternalServerError)
+	}
+	return false
 }
 
 // flushWriter flushes the underlying http.ResponseWriter after every write so
@@ -213,12 +268,14 @@ func (fw flushWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// credFromRequest extracts an auth credential from an HTTP request: HTTP Basic
-// if present, otherwise anonymous. It does not validate — the Authorizer owns
-// the user store.
-func credFromRequest(r *http.Request) auth.Credential {
+// credFromRequest extracts the credential from an HTTP request: HTTP Basic if
+// present, otherwise anonymous. It returns both the auth.Credential for the
+// Authorizer and the repofs.Credential for the filesystem resolver. Neither is
+// validated — the Authorizer owns the user store and the Resolver decides what
+// to do with the credential.
+func credFromRequest(r *http.Request) (auth.Credential, repofs.Credential) {
 	if u, p, ok := r.BasicAuth(); ok {
-		return auth.BasicAuth{Username: u, Password: p}
+		return auth.BasicAuth{Username: u, Password: p}, repofs.Credential{Username: u, Password: p}
 	}
-	return auth.Anonymous{}
+	return auth.Anonymous{}, repofs.Credential{}
 }

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
@@ -58,11 +59,23 @@ type resilientClient struct {
 // client that fails fast on stale keep-alive connections rather than hanging
 // forever. Pass the result to NewS3FS and NewListingCache. See the package
 // constants above for the rationale.
+//
+// It also opts the request/response checksum workflow back to "when required".
+// aws-sdk-go-v2 (s3 >= v1.73) defaults to "when supported", which adds a CRC32
+// trailing checksum and sends the body with Content-Encoding: aws-chunked. Some
+// S3-compatible endpoints mishandle that framing and store an empty or corrupt
+// object even though PutObject returns 200 — which surfaces here as go-git
+// reading a just-written ref back as zero bytes ("ref file is empty"). Forcing
+// the legacy behavior sends a plain body that every S3 implementation accepts.
 func Harden(c s3Client) s3Client {
 	hc := newHardenedHTTPClient()
 	return resilientClient{
 		s3Client: c,
-		opt:      func(o *s3.Options) { o.HTTPClient = hc },
+		opt: func(o *s3.Options) {
+			o.HTTPClient = hc
+			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+			o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
+		},
 	}
 }
 

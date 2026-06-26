@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	ssh "github.com/gliderlabs/ssh"
@@ -20,6 +19,7 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 	"github.com/tigrisdata/objgit/internal/auth"
 	"github.com/tigrisdata/objgit/internal/metrics"
+	"github.com/tigrisdata/objgit/internal/repofs"
 )
 
 const hostKeyPath = ".objgit/ssh_host_ed25519_key"
@@ -100,7 +100,7 @@ func gitServiceFor(command string) (string, bool) {
 // newSSHServer builds the git-over-SSH server. It accepts every public key at
 // connect time and defers real authorization to handleSSH via daemon.authz.
 func newSSHServer(d *daemon, addr string) (*ssh.Server, error) {
-	signer, err := loadOrCreateHostKey(d.fs)
+	signer, err := loadOrCreateHostKey(d.sysFS)
 	if err != nil {
 		return nil, fmt.Errorf("ssh host key: %w", err)
 	}
@@ -136,7 +136,12 @@ func (d *daemon) handleSSH(s ssh.Session) {
 	}
 
 	// ssh://host/foo.git sends "/foo.git"; scp-style host:foo.git sends "foo.git".
-	repoPath := strings.TrimPrefix(cmd[1], "/")
+	ref, err := repofs.Parse(cmd[1])
+	if err != nil {
+		fmt.Fprintf(s.Stderr(), "objgitd: %v\n", err)
+		_ = s.Exit(1)
+		return
+	}
 
 	var cred auth.Credential = auth.Anonymous{}
 	if key := s.PublicKey(); key != nil {
@@ -147,7 +152,7 @@ func (d *daemon) handleSSH(s ssh.Session) {
 	start := time.Now()
 
 	if d.authorize(s.Context(), auth.Request{
-		Repo:      repoPath,
+		Repo:      ref.Path(),
 		Operation: operationFor(service),
 		Cred:      cred,
 		Transport: "ssh",
@@ -160,12 +165,12 @@ func (d *daemon) handleSSH(s ssh.Session) {
 
 	slog.Info("serving ssh request",
 		"service", service,
-		"path", repoPath,
+		"repo", ref.Path(),
 		"remote", s.RemoteAddr().String(),
 	)
 
 	status := "ok"
-	if err := d.serveSSH(s, service, repoPath); err != nil {
+	if err := d.serveSSH(s, service, ref); err != nil {
 		status = "error"
 	}
 	metrics.ObserveGitOp("ssh", service, status, start)
@@ -176,7 +181,7 @@ func (d *daemon) handleSSH(s ssh.Session) {
 // repository cannot be opened it also writes a client-facing message and sets a
 // non-zero exit status, matching git's behavior. A mid-transfer error is logged
 // (the exit status is left to the session default, as before).
-func (d *daemon) serveSSH(s ssh.Session, service, repoPath string) error {
+func (d *daemon) serveSSH(s ssh.Session, service string, ref repofs.RepoRef) error {
 	// SSH is a persistent stream like git://: the transport commands call Close
 	// between negotiation rounds, which would tear down the channel, so wrap the
 	// session in no-op closers.
@@ -184,44 +189,47 @@ func (d *daemon) serveSSH(s ssh.Session, service, repoPath string) error {
 	w := ioutil.WriteNopCloser(s)
 	ctx := s.Context()
 
+	// SSH carries no Basic-auth credential into the filesystem resolver.
+	var cred repofs.Credential
+
 	// Protocol v2 negotiation (GIT_PROTOCOL via s.Environ()) is intentionally not
 	// forwarded yet; v0/v1 is sufficient. See plan.
 	switch service {
 	case transport.UploadPackService:
-		st, err := d.load(repoPath)
+		st, err := d.load(ctx, ref, cred)
 		if err != nil {
-			fmt.Fprintf(s.Stderr(), "objgitd: repository %q not found\n", repoPath)
+			fmt.Fprintf(s.Stderr(), "objgitd: repository %q not found\n", ref.Path())
 			_ = s.Exit(1)
-			return fmt.Errorf("loading %q: %w", repoPath, err)
+			return fmt.Errorf("loading %q: %w", ref.Path(), err)
 		}
 		if err := transport.UploadPack(ctx, st, r, w, &transport.UploadPackRequest{}); err != nil {
-			slog.Error("ssh upload-pack failed", "path", repoPath, "err", err)
+			slog.Error("ssh upload-pack failed", "repo", ref.Path(), "err", err)
 			return err
 		}
 
 	case transport.UploadArchiveService:
-		st, err := d.load(repoPath)
+		st, err := d.load(ctx, ref, cred)
 		if err != nil {
-			fmt.Fprintf(s.Stderr(), "objgitd: repository %q not found\n", repoPath)
+			fmt.Fprintf(s.Stderr(), "objgitd: repository %q not found\n", ref.Path())
 			_ = s.Exit(1)
-			return fmt.Errorf("loading %q: %w", repoPath, err)
+			return fmt.Errorf("loading %q: %w", ref.Path(), err)
 		}
 		if err := transport.UploadArchive(ctx, st, r, w, &transport.UploadArchiveRequest{}); err != nil {
-			slog.Error("ssh upload-archive failed", "path", repoPath, "err", err)
+			slog.Error("ssh upload-archive failed", "repo", ref.Path(), "err", err)
 			return err
 		}
 
 	case transport.ReceivePackService:
-		st, err := d.loadOrInit(repoPath)
+		st, err := d.loadOrInit(ctx, ref, cred)
 		if err != nil {
-			fmt.Fprintf(s.Stderr(), "objgitd: cannot open repository %q\n", repoPath)
+			fmt.Fprintf(s.Stderr(), "objgitd: cannot open repository %q\n", ref.Path())
 			_ = s.Exit(1)
-			return fmt.Errorf("opening %q for push: %w", repoPath, err)
+			return fmt.Errorf("opening %q for push: %w", ref.Path(), err)
 		}
 		// d.receivePack stores the pack whole (Scanner-bounded PackfileWriter, see
 		// writePack) and runs push hooks afterward.
-		if err := d.receivePack(ctx, st, repoPath, r, w, &transport.ReceivePackRequest{}); err != nil {
-			slog.Error("ssh receive-pack failed", "path", repoPath, "err", err)
+		if err := d.receivePack(ctx, st, ref.Path(), r, w, &transport.ReceivePackRequest{}); err != nil {
+			slog.Error("ssh receive-pack failed", "repo", ref.Path(), "err", err)
 			return err
 		}
 	}

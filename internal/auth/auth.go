@@ -15,6 +15,18 @@ const (
 	Write
 )
 
+// String renders the operation for logs and metrics.
+func (o Operation) String() string {
+	switch o {
+	case Read:
+		return "read"
+	case Write:
+		return "write"
+	default:
+		return "unknown"
+	}
+}
+
 // Credential is what the client presented. Exactly one concrete type per
 // scheme; a transport constructs the variant it can produce, or Anonymous.
 type Credential interface{ isCredential() }
@@ -51,6 +63,20 @@ const (
 	Allow
 	Unauthenticated
 )
+
+// String renders the decision for logs and metrics.
+func (d Decision) String() string {
+	switch d {
+	case Deny:
+		return "deny"
+	case Allow:
+		return "allow"
+	case Unauthenticated:
+		return "unauthenticated"
+	default:
+		return "unknown"
+	}
+}
 
 // Authorizer decides whether a request may proceed. This is the seam a real
 // authn/authz layer plugs into later.

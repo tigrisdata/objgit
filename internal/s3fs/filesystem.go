@@ -31,6 +31,11 @@ type s3Client interface {
 	CompleteMultipartUpload(context.Context, *s3.CompleteMultipartUploadInput, ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error)
 }
 
+// S3Client is the exported alias for the object-operation client that NewS3FS
+// and Harden accept. Callers that need to hold the value Harden returns (e.g. a
+// per-keypair cache) can name this type without referencing AWS SDK types.
+type S3Client = s3Client
+
 // unixMetaConfig holds the session defaults used when the optional Unix-metadata
 // feature is enabled. A nil *unixMetaConfig means the feature is off and the
 // filesystem behaves as if no POSIX attributes exist.

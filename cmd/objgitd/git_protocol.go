@@ -17,6 +17,7 @@ import (
 	"github.com/go-git/go-git/v6/storage/filesystem"
 	"github.com/tigrisdata/objgit/internal/auth"
 	"github.com/tigrisdata/objgit/internal/metrics"
+	"github.com/tigrisdata/objgit/internal/repofs"
 )
 
 // handshakeTimeout bounds how long a client has to send its git-proto-request.
@@ -43,28 +44,42 @@ func (d *daemon) authorize(ctx context.Context, req auth.Request) auth.Decision 
 	return dec
 }
 
-// daemon serves the git:// (TCP) protocol out of a billy filesystem.
+// daemon serves the git protocols out of billy filesystems resolved per repo.
 type daemon struct {
-	fs     billy.Filesystem
-	loader transport.Loader
-	authz  auth.Authorizer
+	// sysFS holds daemon-level state that is not scoped to a repository (the SSH
+	// host key); repository storage is resolved per request via resolver.
+	sysFS    billy.Filesystem
+	resolver repofs.Resolver
+	authz    auth.Authorizer
 
 	// allowHooks gates running .objgit/hooks/receive-pack after a push.
 	allowHooks  bool
 	hookTimeout time.Duration
 }
 
-// load opens the storer for repoPath and heals a dangling HEAD before returning
-// it (see ensureHEAD). It preserves the loader's error verbatim — notably
+// storerFor returns the bare-repository storer rooted at fs, or
+// transport.ErrRepositoryNotFound when no repository exists there. It reuses
+// go-git's own bare-repo detection (a "config" file at the root) by loading the
+// repository at the filesystem root.
+func storerFor(fs billy.Filesystem) (storage.Storer, error) {
+	return transport.NewFilesystemLoader(fs, false).Load(&url.URL{Path: "/"})
+}
+
+// load resolves the storer for ref and heals a dangling HEAD before returning it
+// (see ensureHEAD). It preserves storerFor's error verbatim — notably
 // transport.ErrRepositoryNotFound, which callers map to a 404 — and treats a
 // heal failure as non-fatal so a clone is never broken by a transient HEAD write.
-func (d *daemon) load(repoPath string) (storage.Storer, error) {
-	st, err := d.loader.Load(&url.URL{Path: repoPath})
+func (d *daemon) load(ctx context.Context, ref repofs.RepoRef, cred repofs.Credential) (storage.Storer, error) {
+	fs, err := d.resolver.Resolve(ctx, ref, cred, false)
+	if err != nil {
+		return nil, err
+	}
+	st, err := storerFor(fs)
 	if err != nil {
 		return nil, err
 	}
 	if err := ensureHEAD(st); err != nil {
-		slog.Warn("could not repoint dangling HEAD", "path", repoPath, "err", err)
+		slog.Warn("could not repoint dangling HEAD", "repo", ref.Path(), "err", err)
 	}
 	return st, nil
 }
@@ -140,21 +155,24 @@ func pickDefaultBranch(st storage.Storer) (plumbing.ReferenceName, error) {
 	return first, nil
 }
 
-// loadOrInit returns the storer for repoPath, creating an empty bare repository
-// on demand. Git's daemon never auto-creates; objgitd does, so a first push to
-// a new path just works.
-func (d *daemon) loadOrInit(repoPath string) (storage.Storer, error) {
-	st, err := d.load(repoPath)
+// loadOrInit returns the storer for ref, creating an empty bare repository on
+// demand. Git's daemon never auto-creates; objgitd does, so a first push to a
+// new path just works.
+func (d *daemon) loadOrInit(ctx context.Context, ref repofs.RepoRef, cred repofs.Credential) (storage.Storer, error) {
+	fs, err := d.resolver.Resolve(ctx, ref, cred, true)
+	if err != nil {
+		return nil, err
+	}
+
+	st, err := storerFor(fs)
 	if err == nil {
+		if err := ensureHEAD(st); err != nil {
+			slog.Warn("could not repoint dangling HEAD", "repo", ref.Path(), "err", err)
+		}
 		return st, nil
 	}
 	if !errors.Is(err, transport.ErrRepositoryNotFound) {
 		return nil, err
-	}
-
-	fs, err := d.fs.Chroot(repoPath)
-	if err != nil {
-		return nil, fmt.Errorf("chroot %q: %w", repoPath, err)
 	}
 
 	st = filesystem.NewStorage(fs, cache.NewObjectLRUDefault())
@@ -163,6 +181,6 @@ func (d *daemon) loadOrInit(repoPath string) (storage.Storer, error) {
 	}
 
 	metrics.ReposCreated()
-	slog.Info("created repository", "path", repoPath)
+	slog.Info("created repository", "repo", ref.Path())
 	return st, nil
 }
