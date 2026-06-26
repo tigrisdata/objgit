@@ -150,15 +150,28 @@ func (fs3 *S3FS) ReadDir(dir string) ([]fs.DirEntry, error) {
 // perm are used for all directories that MkdirAll creates. If path is/
 // already a directory, MkdirAll does nothing and returns nil.
 func (fs3 *S3FS) MkdirAll(filename string, perm os.FileMode) error {
+	key := fs3.key(filename)
+	if key == "" || key == "." {
+		// The bucket root always exists; nothing to create.
+		return nil
+	}
+
+	// S3 has no directories. Write a zero-byte marker whose key ends in the
+	// separator so listings surface it as a CommonPrefix (a directory). Without
+	// the trailing slash the marker lists as an empty regular file, which makes
+	// go-git's reference walker read e.g. "refs/heads" as a ref and fail with
+	// "ref file is empty"; listChildren already skips the trailing-slash
+	// self-marker (full == prefix).
+	markerKey := key + fs3.separator
 	start := time.Now()
 	_, err := fs3.client.PutObject(context.TODO(), &s3.PutObjectInput{
-		Bucket: new(fs3.bucket),
-		Key:    new(filename),
-		Body:   bytes.NewBuffer(nil),
+		Bucket: &fs3.bucket,
+		Key:    &markerKey,
+		Body:   bytes.NewReader(nil),
 	})
 	observeS3("PutObject", start, err)
 	if err == nil && fs3.cache != nil {
-		prefix, _ := splitKey(fs3.key(filename))
+		prefix, _ := splitKey(key)
 		fs3.cache.invalidate(prefix)
 	}
 
