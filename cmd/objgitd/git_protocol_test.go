@@ -20,6 +20,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/tigrisdata/objgit/internal/auth"
 	"github.com/tigrisdata/objgit/internal/metrics"
+	"github.com/tigrisdata/objgit/internal/repofs"
 )
 
 // ServeGitProtocol accepts connections on l until ctx is cancelled or Accept fails.
@@ -71,6 +72,12 @@ func (d *daemon) handleGitProtocol(ctx context.Context, conn net.Conn) error {
 		"remote", conn.RemoteAddr().String(),
 	)
 
+	ref, err := repofs.Parse(req.Pathname)
+	if err != nil {
+		_, _ = pktline.WriteError(conn, err)
+		return fmt.Errorf("invalid repo path %q: %w", req.Pathname, err)
+	}
+
 	// ExtraParams carries e.g. "version=2"; transport.ProtocolVersion splits on ":".
 	gitProtocol := strings.Join(req.ExtraParams, ":")
 
@@ -83,7 +90,7 @@ func (d *daemon) handleGitProtocol(ctx context.Context, conn net.Conn) error {
 	start := time.Now()
 
 	if d.authorize(ctx, auth.Request{
-		Repo:      req.Pathname,
+		Repo:      ref.Path(),
 		Operation: operationFor(req.RequestCommand),
 		Cred:      auth.Anonymous{},
 		Transport: "git",
@@ -93,7 +100,7 @@ func (d *daemon) handleGitProtocol(ctx context.Context, conn net.Conn) error {
 		return fmt.Errorf("access denied for %q (%s)", req.Pathname, req.RequestCommand)
 	}
 
-	err := d.serveGit(ctx, conn, r, req, gitProtocol)
+	err = d.serveGit(ctx, conn, r, req, ref, gitProtocol)
 	status := "ok"
 	if err != nil {
 		status = "error"
@@ -104,10 +111,10 @@ func (d *daemon) handleGitProtocol(ctx context.Context, conn net.Conn) error {
 
 // serveGit dispatches a parsed, authorized git:// request to the matching
 // go-git transport command.
-func (d *daemon) serveGit(ctx context.Context, conn net.Conn, r io.ReadCloser, req packp.GitProtoRequest, gitProtocol string) error {
+func (d *daemon) serveGit(ctx context.Context, conn net.Conn, r io.ReadCloser, req packp.GitProtoRequest, ref repofs.RepoRef, gitProtocol string) error {
 	switch req.RequestCommand {
 	case transport.UploadPackService:
-		st, err := d.load(req.Pathname)
+		st, err := d.load(ctx, ref, repofs.Credential{})
 		if err != nil {
 			_, _ = pktline.WriteError(conn, fmt.Errorf("repository %q not found", req.Pathname))
 			return fmt.Errorf("loading %q: %w", req.Pathname, err)
@@ -117,7 +124,7 @@ func (d *daemon) serveGit(ctx context.Context, conn net.Conn, r io.ReadCloser, r
 		})
 
 	case transport.UploadArchiveService:
-		st, err := d.load(req.Pathname)
+		st, err := d.load(ctx, ref, repofs.Credential{})
 		if err != nil {
 			_, _ = pktline.WriteError(conn, fmt.Errorf("repository %q not found", req.Pathname))
 			return fmt.Errorf("loading %q: %w", req.Pathname, err)
@@ -125,12 +132,12 @@ func (d *daemon) serveGit(ctx context.Context, conn net.Conn, r io.ReadCloser, r
 		return transport.UploadArchive(ctx, st, r, conn, &transport.UploadArchiveRequest{})
 
 	case transport.ReceivePackService:
-		st, err := d.loadOrInit(req.Pathname)
+		st, err := d.loadOrInit(ctx, ref, repofs.Credential{})
 		if err != nil {
 			_, _ = pktline.WriteError(conn, fmt.Errorf("cannot open repository %q", req.Pathname))
 			return fmt.Errorf("opening %q for push: %w", req.Pathname, err)
 		}
-		return d.receivePack(ctx, st, req.Pathname, r, conn, &transport.ReceivePackRequest{
+		return d.receivePack(ctx, st, ref.Path(), r, conn, &transport.ReceivePackRequest{
 			GitProtocol: gitProtocol,
 		})
 
@@ -150,9 +157,9 @@ func TestDaemonPushCreatesRepo(t *testing.T) {
 
 	fs := memfs.New()
 	d := &daemon{
-		fs:     fs,
-		loader: transport.NewFilesystemLoader(fs, false),
-		authz:  auth.AllowAnonymous{AllowWrite: true},
+		sysFS:    fs,
+		resolver: repofs.BucketResolver{Base: fs},
+		authz:    auth.AllowAnonymous{AllowWrite: true},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -166,7 +173,7 @@ func TestDaemonPushCreatesRepo(t *testing.T) {
 	srvErr := make(chan error, 1)
 	go func() { srvErr <- d.ServeGitProtocol(ctx, ln) }()
 
-	remote := "git://" + ln.Addr().String() + "/test.git"
+	remote := "git://" + ln.Addr().String() + "/acme/test.git"
 
 	work := t.TempDir()
 	runGit(t, work, "init", "-b", "main")
@@ -177,8 +184,8 @@ func TestDaemonPushCreatesRepo(t *testing.T) {
 	// The repository does not exist yet; the push must create it.
 	runGit(t, work, "push", remote, "main")
 
-	if _, err := fs.Stat("/test.git/config"); err != nil {
-		t.Fatalf("expected bare repo to be created on push, but %q is missing: %v", "/test.git/config", err)
+	if _, err := fs.Stat("/acme/test/config"); err != nil {
+		t.Fatalf("expected bare repo to be created on push, but %q is missing: %v", "/acme/test/config", err)
 	}
 
 	// Round-trip: a clone must recover the pushed commit.
@@ -207,9 +214,9 @@ func TestDaemonPushDisabled(t *testing.T) {
 
 	fs := memfs.New()
 	d := &daemon{
-		fs:     fs,
-		loader: transport.NewFilesystemLoader(fs, false),
-		authz:  auth.AllowAnonymous{AllowWrite: false},
+		sysFS:    fs,
+		resolver: repofs.BucketResolver{Base: fs},
+		authz:    auth.AllowAnonymous{AllowWrite: false},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -221,7 +228,7 @@ func TestDaemonPushDisabled(t *testing.T) {
 	}
 	go func() { _ = d.ServeGitProtocol(ctx, ln) }()
 
-	remote := "git://" + ln.Addr().String() + "/test.git"
+	remote := "git://" + ln.Addr().String() + "/acme/test.git"
 
 	work := t.TempDir()
 	runGit(t, work, "init", "-b", "main")
@@ -233,7 +240,7 @@ func TestDaemonPushDisabled(t *testing.T) {
 		t.Fatalf("expected push to be rejected when allowPush is false, got success:\n%s", out)
 	}
 
-	if _, err := fs.Stat("/test.git/config"); err == nil {
+	if _, err := fs.Stat("/acme/test/config"); err == nil {
 		t.Fatal("repository must not be created when push is disabled")
 	}
 }
@@ -251,9 +258,9 @@ func TestDaemonPushKeepsPack(t *testing.T) {
 
 	fs := memfs.New()
 	d := &daemon{
-		fs:     fs,
-		loader: transport.NewFilesystemLoader(fs, false),
-		authz:  auth.AllowAnonymous{AllowWrite: true},
+		sysFS:    fs,
+		resolver: repofs.BucketResolver{Base: fs},
+		authz:    auth.AllowAnonymous{AllowWrite: true},
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -265,7 +272,7 @@ func TestDaemonPushKeepsPack(t *testing.T) {
 	}
 	go func() { _ = d.ServeGitProtocol(ctx, ln) }()
 
-	remote := "git://" + ln.Addr().String() + "/test.git"
+	remote := "git://" + ln.Addr().String() + "/acme/test.git"
 
 	work := t.TempDir()
 	runGit(t, work, "init", "-b", "main")
@@ -276,7 +283,7 @@ func TestDaemonPushKeepsPack(t *testing.T) {
 	runGit(t, work, "commit", "-m", "initial") // blob + tree + commit
 	runGit(t, work, "push", remote, "main")
 
-	assertPackedRepo(t, fs, "/test.git")
+	assertPackedRepo(t, fs, "/acme/test")
 }
 
 // assertPackedRepo fails unless repoPath holds at least one packfile and no loose
