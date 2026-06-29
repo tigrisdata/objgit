@@ -1,3 +1,19 @@
+# [1.1.0](https://github.com/tigrisdata/objgit/compare/v1.0.2...v1.1.0) (2026-06-29)
+
+- feat(storage)!: resolve repositories to per-keypair Tigris buckets ([0ee1387](https://github.com/tigrisdata/objgit/commit/0ee13872b4a4ed4aa4f88c5bf0636157b1e578d1))
+
+### Bug Fixes
+
+- **s3fs:** create directory markers as directories, not empty files ([5bb834b](https://github.com/tigrisdata/objgit/commit/5bb834b6b08b037676d07925bb33679594e91c84))
+- **s3fs:** opt out of aws-sdk-go-v2 default request checksums ([bf81a1d](https://github.com/tigrisdata/objgit/commit/bf81a1dc0d5c6ae958bdb79e4103ca334a66cdc5))
+
+### BREAKING CHANGES
+
+- repository URLs must be {orgID}/{repoName}; repositories moved from one shared bucket to a bucket per repo, so repositories created under the old layout no longer resolve.
+
+Assisted-by: Claude Opus 4.8 via Claude Code
+Signed-off-by: Xe Iaso <xe@tigrisdata.com>
+
 ## [1.0.2](https://github.com/tigrisdata/objgit/compare/v1.0.1...v1.0.2) (2026-06-25)
 
 ## [1.0.1](https://github.com/tigrisdata/objgit/compare/v1.0.0...v1.0.1) (2026-06-04)
