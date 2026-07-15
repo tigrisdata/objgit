@@ -1,0 +1,16 @@
+syntax = "proto3";
+package tigrisdata.objgit.meta.v1;
+
+import "buf/validate/validate.proto";
+import "google/protobuf/timestamp.proto";
+
+service WhoAmIService {
+  rpc WhoAmI(WhoAmIRequest) returns (WhoAmIResponse);
+}
+
+message WhoAmIRequest {}
+
+message WhoAmIResponse {
+  string access_key_id = 1;
+  google.protobuf.Timestamp time = 2;
+}

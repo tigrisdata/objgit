@@ -21,6 +21,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/tigrisdata/objgit"
+	"github.com/tigrisdata/objgit/cmd/objgitd/svc"
 	"github.com/tigrisdata/objgit/internal"
 	"github.com/tigrisdata/objgit/internal/auth"
 	"github.com/tigrisdata/objgit/internal/metrics"
@@ -32,6 +33,7 @@ import (
 )
 
 var (
+	apiBind     = flag.String("api-bind", ":8081", "TCP address to listen on for API calls")
 	httpBind    = flag.String("http-bind", ":8080", "TCP address to listen on for the git smart-HTTP protocol; empty disables it")
 	sshBind     = flag.String("ssh-bind", "", "TCP address to listen on for the git-over-SSH protocol; empty disables it")
 	metricsBind = flag.String("metrics-bind", ":9090", "TCP address to serve the Prometheus /metrics endpoint; empty disables it")
@@ -142,6 +144,7 @@ func main() {
 
 	slog.Info("objgitd listening",
 		"version", objgit.Version,
+		"api_bind", *apiBind,
 		"http_bind", *httpBind,
 		"ssh_bind", *sshBind,
 		"metrics_bind", *metricsBind,
@@ -177,6 +180,39 @@ func main() {
 		mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
 		mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
 		srv := &http.Server{Handler: mux}
+		g.Go(func() error {
+			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return err
+			}
+			return nil
+		})
+		g.Go(func() error {
+			<-gCtx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			return srv.Shutdown(shutdownCtx)
+		})
+	}
+
+	if *apiBind != "" {
+		ln, err := net.Listen("tcp", *apiBind)
+		if err != nil {
+			slog.Error("can't listen", "api_bind", *apiBind, "err", err)
+			os.Exit(1)
+		}
+
+		mux, err := svc.Route(gCtx, logger.With("component", "api"))
+		if err != nil {
+			slog.Error("can't construct API server", "err", err)
+			os.Exit(1)
+		}
+		p := new(http.Protocols)
+		p.SetHTTP1(true)
+		p.SetUnencryptedHTTP2(true)
+		srv := &http.Server{
+			Handler:   mux,
+			Protocols: p,
+		}
 		g.Go(func() error {
 			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				return err
