@@ -2,10 +2,13 @@ syntax = "proto3";
 package tigrisdata.objgit.meta.v1;
 
 import "buf/validate/validate.proto";
+import "google/api/annotations.proto";
 import "google/protobuf/timestamp.proto";
 
 service WhoAmIService {
-  rpc WhoAmI(WhoAmIRequest) returns (WhoAmIResponse);
+  rpc WhoAmI(WhoAmIRequest) returns (WhoAmIResponse) {
+    option (google.api.http) = {get: "/v1/whoami"};
+  }
 }
 
 message WhoAmIRequest {}
