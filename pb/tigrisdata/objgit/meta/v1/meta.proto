@@ -3,17 +3,30 @@ package tigrisdata.objgit.meta.v1;
 
 import "buf/validate/validate.proto";
 import "google/api/annotations.proto";
+import "google/api/visibility.proto";
 import "google/protobuf/timestamp.proto";
 
 service WhoAmIService {
+  // Returns information about the currently authenticated user.
+  //
+  // This is intended to be used in debugging your API client to ensure
+  // you are authenticated as the right user.
   rpc WhoAmI(WhoAmIRequest) returns (WhoAmIResponse) {
-    option (google.api.http) = {get: "/v1/whoami"};
+    option (google.api.http).get = "/v1/whoami";
+    option (google.api.method_visibility) = {restriction: "PUBLIC"};
+    option idempotency_level = NO_SIDE_EFFECTS;
   }
 }
 
-message WhoAmIRequest {}
+// This message is intentionally blank.
+message WhoAmIRequest {
+  option (google.api.message_visibility).restriction = "PUBLIC";
+}
 
+// Information about the currently authenticated user and the current time.
 message WhoAmIResponse {
+  option (google.api.message_visibility).restriction = "PUBLIC";
+
   string access_key_id = 1;
   google.protobuf.Timestamp time = 2;
 }

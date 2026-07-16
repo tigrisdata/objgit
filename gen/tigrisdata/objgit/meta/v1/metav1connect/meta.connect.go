@@ -39,6 +39,10 @@ const (
 
 // WhoAmIServiceClient is a client for the tigrisdata.objgit.meta.v1.WhoAmIService service.
 type WhoAmIServiceClient interface {
+	// Returns information about the currently authenticated user.
+	//
+	// This is intended to be used in debugging your API client to ensure
+	// you are authenticated as the right user.
 	WhoAmI(context.Context, *connect.Request[v1.WhoAmIRequest]) (*connect.Response[v1.WhoAmIResponse], error)
 }
 
@@ -57,6 +61,7 @@ func NewWhoAmIServiceClient(httpClient connect.HTTPClient, baseURL string, opts 
 			httpClient,
 			baseURL+WhoAmIServiceWhoAmIProcedure,
 			connect.WithSchema(whoAmIServiceMethods.ByName("WhoAmI")),
+			connect.WithIdempotency(connect.IdempotencyNoSideEffects),
 			connect.WithClientOptions(opts...),
 		),
 	}
@@ -74,6 +79,10 @@ func (c *whoAmIServiceClient) WhoAmI(ctx context.Context, req *connect.Request[v
 
 // WhoAmIServiceHandler is an implementation of the tigrisdata.objgit.meta.v1.WhoAmIService service.
 type WhoAmIServiceHandler interface {
+	// Returns information about the currently authenticated user.
+	//
+	// This is intended to be used in debugging your API client to ensure
+	// you are authenticated as the right user.
 	WhoAmI(context.Context, *connect.Request[v1.WhoAmIRequest]) (*connect.Response[v1.WhoAmIResponse], error)
 }
 
@@ -88,6 +97,7 @@ func NewWhoAmIServiceHandler(svc WhoAmIServiceHandler, opts ...connect.HandlerOp
 		WhoAmIServiceWhoAmIProcedure,
 		svc.WhoAmI,
 		connect.WithSchema(whoAmIServiceMethods.ByName("WhoAmI")),
+		connect.WithIdempotency(connect.IdempotencyNoSideEffects),
 		connect.WithHandlerOptions(opts...),
 	)
 	return "/tigrisdata.objgit.meta.v1.WhoAmIService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

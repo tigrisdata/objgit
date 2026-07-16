@@ -9,6 +9,7 @@ package metav1
 import (
 	_ "buf.build/gen/go/bufbuild/protovalidate/protocolbuffers/go/buf/validate"
 	_ "google.golang.org/genproto/googleapis/api/annotations"
+	_ "google.golang.org/genproto/googleapis/api/visibility"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
@@ -24,6 +25,7 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// This message is intentionally blank.
 type WhoAmIRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -60,6 +62,7 @@ func (*WhoAmIRequest) Descriptor() ([]byte, []int) {
 	return file_tigrisdata_objgit_meta_v1_meta_proto_rawDescGZIP(), []int{0}
 }
 
+// Information about the currently authenticated user and the current time.
 type WhoAmIResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	AccessKeyId   string                 `protobuf:"bytes,1,opt,name=access_key_id,json=accessKeyId,proto3" json:"access_key_id,omitempty"`
@@ -116,14 +119,14 @@ var File_tigrisdata_objgit_meta_v1_meta_proto protoreflect.FileDescriptor
 
 const file_tigrisdata_objgit_meta_v1_meta_proto_rawDesc = "" +
 	"\n" +
-	"$tigrisdata/objgit/meta/v1/meta.proto\x12\x19tigrisdata.objgit.meta.v1\x1a\x1bbuf/validate/validate.proto\x1a\x1cgoogle/api/annotations.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\x0f\n" +
-	"\rWhoAmIRequest\"d\n" +
+	"$tigrisdata/objgit/meta/v1/meta.proto\x12\x19tigrisdata.objgit.meta.v1\x1a\x1bbuf/validate/validate.proto\x1a\x1cgoogle/api/annotations.proto\x1a\x1bgoogle/api/visibility.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"\x1f\n" +
+	"\rWhoAmIRequest:\x0e\xfa\xd2\xe4\x93\x02\b\x12\x06PUBLIC\"t\n" +
 	"\x0eWhoAmIResponse\x12\"\n" +
 	"\raccess_key_id\x18\x01 \x01(\tR\vaccessKeyId\x12.\n" +
-	"\x04time\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\x04time2\x82\x01\n" +
-	"\rWhoAmIService\x12q\n" +
-	"\x06WhoAmI\x12(.tigrisdata.objgit.meta.v1.WhoAmIRequest\x1a).tigrisdata.objgit.meta.v1.WhoAmIResponse\"\x12\x82\xd3\xe4\x93\x02\f\x12\n" +
-	"/v1/whoamiB\xf4\x01\n" +
+	"\x04time\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\x04time:\x0e\xfa\xd2\xe4\x93\x02\b\x12\x06PUBLIC2\x94\x01\n" +
+	"\rWhoAmIService\x12\x82\x01\n" +
+	"\x06WhoAmI\x12(.tigrisdata.objgit.meta.v1.WhoAmIRequest\x1a).tigrisdata.objgit.meta.v1.WhoAmIResponse\"#\xfa\xd2\xe4\x93\x02\b\x12\x06PUBLIC\x82\xd3\xe4\x93\x02\f\x12\n" +
+	"/v1/whoami\x90\x02\x01B\xf4\x01\n" +
 	"\x1dcom.tigrisdata.objgit.meta.v1B\tMetaProtoP\x01ZAgithub.com/tigrisdata/objgit/gen/tigrisdata/objgit/meta/v1;metav1\xa2\x02\x03TOM\xaa\x02\x19Tigrisdata.Objgit.Meta.V1\xca\x02\x19Tigrisdata\\Objgit\\Meta\\V1\xe2\x02%Tigrisdata\\Objgit\\Meta\\V1\\GPBMetadata\xea\x02\x1cTigrisdata::Objgit::Meta::V1b\x06proto3"
 
 var (
