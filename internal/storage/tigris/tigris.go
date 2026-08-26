@@ -24,12 +24,9 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
-	"github.com/go-git/go-git/v6/config"
 	"github.com/go-git/go-git/v6/plumbing"
 	formatcfg "github.com/go-git/go-git/v6/plumbing/format/config"
-	"github.com/go-git/go-git/v6/plumbing/format/index"
 	"github.com/go-git/go-git/v6/plumbing/storer"
-	"github.com/go-git/go-git/v6/storage"
 	tstorage "github.com/tigrisdata/storage-go"
 )
 
@@ -178,32 +175,3 @@ func sv(v *string) string {
 }
 
 func bv(v *bool) bool { return v != nil && *v }
-
-// --- temporary stubs -------------------------------------------------------
-// Every remaining interface method funnels through errUnimplemented so the
-// compile-time assertion holds from day one. Later tasks DELETE their stubs
-// from this block as they land real implementations; Task 9 greps for
-// leftovers. Do not reorder beyond appending.
-
-func (s *Storer) SetIndex(idx *index.Index) error {
-	_ = idx
-	return errUnimplemented
-}
-
-func (s *Storer) Index() (*index.Index, error) {
-	return nil, errUnimplemented
-}
-
-func (s *Storer) Config() (*config.Config, error) {
-	return nil, errUnimplemented
-}
-
-func (s *Storer) SetConfig(cfg *config.Config) error {
-	_ = cfg
-	return errUnimplemented
-}
-
-func (s *Storer) Module(name string) (storage.Storer, error) {
-	_ = name
-	return nil, errUnimplemented
-}
