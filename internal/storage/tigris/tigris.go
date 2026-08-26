@@ -169,7 +169,6 @@ func isNotFound(err error) bool {
 
 // Pointer shims so call sites stay free of aws-sdk-go-v2/aws imports.
 func sp(v string) *string { return &v }
-func i32(v int32) *int32  { return &v }
 
 func sv(v *string) string {
 	if v == nil {
