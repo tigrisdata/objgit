@@ -3,6 +3,7 @@ package tigris
 import (
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"time"
 
@@ -86,4 +87,55 @@ func (s *Storer) EncodedObjectSize(h plumbing.Hash) (int64, error) {
 		return 0, fmt.Errorf("tigris: size of %s: %w", h.String(), err)
 	}
 	return hs.size, nil
+}
+
+func (s *Storer) loadObject(h plumbing.Hash, hs objHead) (plumbing.EncodedObject, error) {
+	if hs.typ == plumbing.OFSDeltaObject || hs.typ == plumbing.REFDeltaObject {
+		return nil, plumbing.ErrInvalidType
+	}
+
+	start := time.Now()
+	out, err := s.client.GetObject(s.ctx, &s3.GetObjectInput{
+		Bucket: sp(s.bucket),
+		Key:    sp(keyOf(h)),
+	})
+	s.observe("GetObject", start, err)
+	switch {
+	case err == nil:
+	case isNotFound(err):
+		return nil, plumbing.ErrObjectNotFound
+	default:
+		return nil, fmt.Errorf("tigris: get %s: %w", h.String(), err)
+	}
+	defer out.Body.Close()
+
+	buf, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil, fmt.Errorf("tigris: read %s: %w", h.String(), err)
+	}
+
+	obj := plumbing.NewMemoryObject(s.oh)
+	obj.SetType(hs.typ)
+	obj.SetSize(hs.size)
+	if _, err := obj.Write(buf); err != nil {
+		return nil, fmt.Errorf("%w: %s body disagrees with declared size %d: %w",
+			errBadMetadata, h.String(), hs.size, err)
+	}
+	return obj, nil
+}
+
+func (s *Storer) EncodedObject(t plumbing.ObjectType, h plumbing.Hash) (plumbing.EncodedObject, error) {
+	hs, err := s.headInfo(h)
+	switch {
+	case err == nil:
+	case errors.Is(err, plumbing.ErrObjectNotFound):
+		return nil, plumbing.ErrObjectNotFound
+	default:
+		return nil, fmt.Errorf("tigris: describe %s: %w", h.String(), err)
+	}
+
+	if t != plumbing.AnyObject && hs.typ != t {
+		return nil, plumbing.ErrObjectNotFound
+	}
+	return s.loadObject(h, hs)
 }

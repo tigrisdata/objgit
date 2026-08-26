@@ -2,6 +2,7 @@ package tigris
 
 import (
 	"errors"
+	"io"
 	"strconv"
 	"testing"
 
@@ -138,4 +139,74 @@ func TestHeadInfoErrorMapping(t *testing.T) {
 			t.Errorf("want errBadMetadata wrapping, got %v", err)
 		}
 	})
+}
+
+func TestEncodedObjectRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	const content = "the quick brown fox jumps over the lazy dog"
+	f := newFakeS3(t)
+	of := formatcfg.DefaultObjectFormat
+	h := seed(t, f, of, plumbing.BlobObject, content)
+	other := seed(t, f, of, plumbing.CommitObject, "an unrelated commit")
+
+	s := newTestStorer(t, f)
+
+	t.Run("typed hit decodes identical bytes", func(t *testing.T) {
+		obj, err := s.EncodedObject(plumbing.BlobObject, h)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		rd, rerr := obj.Reader()
+		if rerr != nil {
+			t.Fatalf("reader: %v", rerr)
+		}
+		defer rd.Close()
+		got, rerr := io.ReadAll(rd)
+		if rerr != nil {
+			t.Fatalf("read: %v", rerr)
+		}
+		if string(got) != content {
+			t.Errorf("want %q, got %q", content, got)
+		}
+		if obj.Type() != plumbing.BlobObject || obj.Size() != int64(len(content)) {
+			t.Errorf("bad framing: type=%v size=%d", obj.Type(), obj.Size())
+		}
+	})
+
+	t.Run("wrong requested type behaves like absence", func(t *testing.T) {
+		if _, err := s.EncodedObject(plumbing.TagObject, h); !errors.Is(err, plumbing.ErrObjectNotFound) {
+			t.Errorf("want ErrObjectNotFound, got %v", err)
+		}
+	})
+
+	t.Run("AnyObject ignores the type filter", func(t *testing.T) {
+		if _, err := s.EncodedObject(plumbing.AnyObject, other); err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("absent object", func(t *testing.T) {
+		if _, err := s.EncodedObject(plumbing.AnyObject, plumbing.ZeroHash); !errors.Is(err, plumbing.ErrObjectNotFound) {
+			t.Errorf("want ErrObjectNotFound, got %v", err)
+		}
+	})
+}
+
+func TestEncodedObjectRejectsDeltaTypes(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeS3(t)
+	h := seed(t, f, formatcfg.DefaultObjectFormat, plumbing.BlobObject, "real bytes underneath")
+	f.mu.Lock()
+	ent := f.objs[keyOf(h)]
+	ent.meta[metaType] = plumbing.OFSDeltaObject.String()
+	f.objs[keyOf(h)] = ent
+	f.mu.Unlock()
+
+	s := newTestStorer(t, f)
+
+	if _, err := s.EncodedObject(plumbing.AnyObject, h); !errors.Is(err, plumbing.ErrInvalidType) {
+		t.Errorf("want ErrInvalidType, got %v", err)
+	}
 }

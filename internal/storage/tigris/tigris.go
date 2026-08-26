@@ -186,10 +186,6 @@ func bv(v *bool) bool { return v != nil && *v }
 // compile-time assertion holds from day one. Later tasks DELETE their stubs
 // from this block as they land real implementations; Task 9 greps for
 // leftovers. Do not reorder beyond appending.
-func (s *Storer) EncodedObject(t plumbing.ObjectType, h plumbing.Hash) (plumbing.EncodedObject, error) {
-	_, _ = t, h
-	return nil, errUnimplemented
-}
 
 func (s *Storer) IterEncodedObjects(t plumbing.ObjectType) (storer.EncodedObjectIter, error) {
 	_ = t
