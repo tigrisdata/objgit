@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -189,15 +188,6 @@ func bv(v *bool) bool { return v != nil && *v }
 
 func (s *Storer) IterEncodedObjects(t plumbing.ObjectType) (storer.EncodedObjectIter, error) {
 	_ = t
-	return nil, errUnimplemented
-}
-
-func (s *Storer) NewEncodedObject() plumbing.EncodedObject {
-	return &plumbing.MemoryObject{} // temporary stub body
-}
-
-func (s *Storer) RawObjectWriter(typ plumbing.ObjectType, sz int64) (io.WriteCloser, error) {
-	_, _ = typ, sz
 	return nil, errUnimplemented
 }
 

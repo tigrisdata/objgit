@@ -108,18 +108,23 @@ func (f *fakeS3) ndeletes() int {
 	return f.deletes
 }
 
+// hashForBody factors seed's hash computation out for reuse.
+func hashForBody(of formatcfg.ObjectFormat, typ plumbing.ObjectType, body string) plumbing.Hash {
+	obj := plumbing.NewMemoryObject(plumbing.FromObjectFormat(of))
+	obj.SetType(typ)
+	obj.SetSize(int64(len(body)))
+	if _, err := obj.Write([]byte(body)); err != nil {
+		panic("hashForBody buffers only ever-valid sizes: " + err.Error())
+	}
+	return obj.Hash()
+}
+
 // seed builds a well-formed loose object (correct content-hash key plus
 // git-type/git-size metadata) with the given object format and stores it,
 // returning the hash. Seeds ignore injected failures on purpose.
 func seed(t *testing.T, f *fakeS3, of formatcfg.ObjectFormat, typ plumbing.ObjectType, content string) plumbing.Hash {
 	t.Helper()
-	obj := plumbing.NewMemoryObject(plumbing.FromObjectFormat(of))
-	obj.SetType(typ)
-	obj.SetSize(int64(len(content)))
-	if _, err := obj.Write([]byte(content)); err != nil {
-		t.Fatalf("failed to buffer seed content: %v", err)
-	}
-	h := obj.Hash()
+	h := hashForBody(of, typ, content)
 	f.put(keyOf(h), content, map[string]string{
 		metaType: typ.String(),
 		metaSize: strconv.Itoa(len(content)),
