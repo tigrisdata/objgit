@@ -185,47 +185,6 @@ func bv(v *bool) bool { return v != nil && *v }
 // from this block as they land real implementations; Task 9 greps for
 // leftovers. Do not reorder beyond appending.
 
-func (s *Storer) SetReference(ref *plumbing.Reference) error {
-	_ = ref
-	return errUnimplemented
-}
-
-func (s *Storer) CheckAndSetReference(newRef, old *plumbing.Reference) error {
-	_, _ = newRef, old
-	return errUnimplemented
-}
-
-func (s *Storer) Reference(n plumbing.ReferenceName) (*plumbing.Reference, error) {
-	_ = n
-	return nil, errUnimplemented
-}
-
-func (s *Storer) IterReferences() (storer.ReferenceIter, error) {
-	return nil, errUnimplemented
-}
-
-func (s *Storer) RemoveReference(n plumbing.ReferenceName) error {
-	_ = n
-	return errUnimplemented
-}
-
-func (s *Storer) CountLooseRefs() (int, error) {
-	return 0, errUnimplemented
-}
-
-func (s *Storer) PackRefs() error {
-	return errUnimplemented
-}
-
-func (s *Storer) SetShallow(commits []plumbing.Hash) error {
-	_ = commits
-	return errUnimplemented
-}
-
-func (s *Storer) Shallow() ([]plumbing.Hash, error) {
-	return nil, errUnimplemented
-}
-
 func (s *Storer) SetIndex(idx *index.Index) error {
 	_ = idx
 	return errUnimplemented
