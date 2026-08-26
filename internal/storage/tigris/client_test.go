@@ -33,6 +33,9 @@ type fakeObject struct {
 	meta map[string]string
 }
 
+// headShape lets a test strip normally-automatic fields from one key's HEAD.
+type headShape struct{ metaOnly bool }
+
 type fakeS3 struct {
 	t    *testing.T
 	mu   sync.Mutex
@@ -47,6 +50,8 @@ type fakeS3 struct {
 	puts    int
 	deletes int
 	listMax int64 // ListObjectsV2 page size knob; 0 = unlimited
+
+	headOverride map[string]*headShape
 }
 
 func newFakeS3(t *testing.T) *fakeS3 {
@@ -170,6 +175,14 @@ func (f *fakeS3) HeadObject(_ context.Context, p *s3.HeadObjectInput, _ ...func(
 	o, ok := f.objs[sv(p.Key)]
 	if !ok {
 		return nil, notFound()
+	}
+	if hs, forced := f.headOverride[sv(p.Key)]; forced && hs.metaOnly {
+		// Copy metadata map to satisfy the "copy semantics fine as coded" note.
+		metaCopy := make(map[string]string, len(o.meta))
+		for k, v := range o.meta {
+			metaCopy[k] = v
+		}
+		return &s3.HeadObjectOutput{Metadata: metaCopy}, nil
 	}
 	return &s3.HeadObjectOutput{
 		ContentLength: ip(int64(len(o.body))),
