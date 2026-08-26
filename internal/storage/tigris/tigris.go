@@ -190,16 +190,6 @@ func (s *Storer) IterEncodedObjects(t plumbing.ObjectType) (storer.EncodedObject
 	return nil, errUnimplemented
 }
 
-func (s *Storer) SetEncodedObject(obj plumbing.EncodedObject) (plumbing.Hash, error) {
-	_ = obj
-	return plumbing.ZeroHash, errUnimplemented
-}
-
-func (s *Storer) AddAlternate(remote string) error {
-	_ = remote
-	return errUnimplemented
-}
-
 func (s *Storer) SetReference(ref *plumbing.Reference) error {
 	_ = ref
 	return errUnimplemented

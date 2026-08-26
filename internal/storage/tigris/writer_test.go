@@ -202,3 +202,93 @@ func TestNewEncodedObjectBindsFormat(t *testing.T) {
 		t.Errorf("sha256 object produced %d-length hash", len(h.String()))
 	}
 }
+
+// lyingObject wraps a real encoded object but claims someone else's hash —
+// exactly the forgery SetEncodedObject must refuse.
+type lyingObject struct {
+	plumbing.EncodedObject
+	hash plumbing.Hash
+}
+
+func (l lyingObject) Hash() plumbing.Hash { return l.hash }
+
+func TestSetEncodedObjectStoresUnderRecomputedHash(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeS3(t)
+	s := newTestStorer(t, f)
+
+	const body = "committed through set"
+	obj := plumbing.NewMemoryObject(s.oh)
+	obj.SetType(plumbing.BlobObject)
+	obj.SetSize(int64(len(body)))
+	if _, err := obj.Write([]byte(body)); err != nil {
+		t.Fatalf("buffer: %v", err)
+	}
+	want := obj.Hash()
+
+	got, err := s.SetEncodedObject(obj)
+	if err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if got != want {
+		t.Fatalf("returned hash %s differs from recomputed %s", got.String(), want.String())
+	}
+	stored := f.get(t, keyOf(want))
+	if string(stored.body) != body {
+		t.Errorf("body mismatch: %q", stored.body)
+	}
+	if f.nputs() != 1 {
+		t.Errorf("want one upload, got %d", f.nputs())
+	}
+}
+
+func TestSetEncodedObjectForgedHashRejectedWithoutUpload(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeS3(t)
+	s := newTestStorer(t, f)
+	victim := seed(t, f, formatcfg.DefaultObjectFormat, plumbing.BlobObject, "innocent bystander")
+	putsBefore := f.nputs()
+
+	obj := plumbing.NewMemoryObject(s.oh)
+	obj.SetType(plumbing.BlobObject)
+	obj.SetSize(int64(len("actually different")))
+	if _, err := obj.Write([]byte("actually different")); err != nil {
+		t.Fatalf("buffer: %v", err)
+	}
+
+	got, err := s.SetEncodedObject(lyingObject{EncodedObject: obj, hash: victim})
+	if !errors.Is(err, ErrHashMismatch) {
+		t.Fatalf("want ErrHashMismatch, got %v", err)
+	}
+	if got != plumbing.ZeroHash {
+		t.Errorf("want ZeroHash on refusal, got %s", got.String())
+	}
+	if f.nputs() != putsBefore {
+		t.Error("forged object uploaded anyway")
+	}
+}
+
+func TestSetEncodedObjectRejectsDeltas(t *testing.T) {
+	t.Parallel()
+
+	s := newTestStorer(t, newFakeS3(t))
+
+	delta := plumbing.NewMemoryObject(s.oh)
+	delta.SetType(plumbing.OFSDeltaObject)
+	if _, err := s.SetEncodedObject(delta); !errors.Is(err, plumbing.ErrInvalidType) {
+		t.Errorf("delta-set went through: %v", err)
+	}
+}
+
+func TestAddAlternateUnsupported(t *testing.T) {
+	t.Parallel()
+
+	s := newTestStorer(t, newFakeS3(t))
+
+	err := s.AddAlternate("../elsewhere")
+	if !errors.Is(err, ErrAlternatesNotSupported) {
+		t.Errorf("want ErrAlternatesNotSupported, got %v", err)
+	}
+}

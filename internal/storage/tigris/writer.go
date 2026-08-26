@@ -112,3 +112,44 @@ func (w *stageWriter) Close() error {
 	}
 	return nil
 }
+
+func (s *Storer) SetEncodedObject(obj plumbing.EncodedObject) (plumbing.Hash, error) {
+	switch obj.Type() {
+	case plumbing.OFSDeltaObject, plumbing.REFDeltaObject:
+		return plumbing.ZeroHash, plumbing.ErrInvalidType
+	}
+
+	rd, err := obj.Reader()
+	if err != nil {
+		return plumbing.ZeroHash, fmt.Errorf("tigris: open reader for %s: %w", obj.Hash().String(), err)
+	}
+	defer rd.Close()
+
+	w, err := s.RawObjectWriter(obj.Type(), obj.Size())
+	if err != nil {
+		return plumbing.ZeroHash, err
+	}
+	sw := w.(*stageWriter)
+
+	if _, err := io.Copy(sw, rd); err != nil {
+		sw.Discard()
+		return plumbing.ZeroHash, fmt.Errorf("tigris: copy data for %s: %w", obj.Hash().String(), err)
+	}
+
+	// Claimed hashes are untrusted (spec CAUTION): prove the recomputed
+	// stream agrees before storing anything under any address.
+	got := sw.hasher.Sum()
+	if want := obj.Hash(); got.String() != want.String() {
+		sw.Discard()
+		return plumbing.ZeroHash, ErrHashMismatch
+	}
+
+	if err := sw.Close(); err != nil {
+		return plumbing.ZeroHash, err
+	}
+	return got, nil
+}
+
+func (s *Storer) AddAlternate(remote string) error {
+	return fmt.Errorf("%w: remote %q", ErrAlternatesNotSupported, remote)
+}
