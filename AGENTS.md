@@ -174,6 +174,18 @@ The non-obvious piece is `tempfs.go`. go-git's streaming `PackWriter` creates a 
 
 All S3 keys go through `S3FS.key` → `cleanPath` + leading-slash strip. Any new S3 op must funnel through there or chroot/path semantics will desync.
 
+### `internal/storage/tigris` — a go-git `storage.Storer` on one Tigris bucket
+
+This package implements `storage.Storer` for Tigris. One bucket holds one repository. The package speaks `storage.Storer` directly to the bucket. It does not use the s3fs filesystem layer.
+
+Git objects live under `objects/<hex>`. Each object stores type and size in user metadata (`git-type`, `git-size`). Reads send a HEAD request first. Writes go through a local staging file. The file hashes the content and names the key. If the claimed hash disagrees with the recomputed hash, the package refuses the write.
+
+Refs store text at `refs/<name>`. Symbolic refs use the format `ref: target`. Shallow marks, the worktree index, and the repo config sit at root-level keys.
+
+Tests can use a fake S3 client. The package uses the `s3API` interface for this, shaped like s3fs's `s3Client`. The `WithObserver` option adds a metrics seam. This works like s3fs. The `main` package can wire both packages to `metrics.ObserveS3`.
+
+Packfile support is not in this package. One PUT per push is better than one PUT per object. This work is tracked at `docs/reference/tigris-backend.md`.
+
 ### `internal/slog.go`
 
 Trivial JSON-handler init. The convention across the codebase is `slog` with `"err"` (not `"error"`) as the error key.
