@@ -185,11 +185,6 @@ func bv(v *bool) bool { return v != nil && *v }
 // from this block as they land real implementations; Task 9 greps for
 // leftovers. Do not reorder beyond appending.
 
-func (s *Storer) IterEncodedObjects(t plumbing.ObjectType) (storer.EncodedObjectIter, error) {
-	_ = t
-	return nil, errUnimplemented
-}
-
 func (s *Storer) SetReference(ref *plumbing.Reference) error {
 	_ = ref
 	return errUnimplemented
