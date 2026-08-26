@@ -308,19 +308,19 @@ func TestObserverIsInvokedByOperation(t *testing.T) {
 	t.Parallel()
 
 	f := newFakeS3(t)
-	seed(t, f, formatcfg.DefaultObjectFormat, plumbing.BlobObject, "watched")
+	// Seed a blob so we can test HasEncodedObject finds it via observer.
+	h := seed(t, f, formatcfg.DefaultObjectFormat, plumbing.BlobObject, "x")
 
 	seen := map[string]int{}
 	s := newTestStorer(t, f, WithObserver(func(op string, _ time.Duration, _ error) {
 		seen[op]++
 	}))
 
-	if err := s.HasEncodedObject(seed(t, f, formatcfg.DefaultObjectFormat, plumbing.BlobObject, "x")); err != nil {
-		// HasEncodedObject is still a stub in this task: expected error path.
-		var target error = errUnimplemented
-		if !errors.Is(err, target) {
-			t.Fatalf("unexpected pre-stub behavior: %v", err)
-		}
+	// HasEncodedObject should succeed (object exists) and observer records the op.
+	if err := s.HasEncodedObject(h); err != nil {
+		t.Fatalf("HasEncodedObject failed for existing object: %v", err)
 	}
-	_ = seen // populated assertions arrive with Task 2
+	if got := seen["HeadObject"]; got != 1 {
+		t.Errorf("observer recorded HeadObject calls: got %d, want 1 (map: %v)", got, seen)
+	}
 }

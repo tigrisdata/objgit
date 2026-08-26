@@ -58,8 +58,6 @@ var (
 	errMalformedRef = errors.New("tigris: malformed loose ref")
 
 	errEmptyBucket = errors.New("tigris: bucket must be set")
-
-	errUnimplemented = errors.New("tigris: method not implemented yet") // TEMPORARY: gone by Task 9
 )
 
 // s3API is the subset of *tstorage.Client (which embeds *s3.Client) this
