@@ -1,3 +1,34 @@
+# [1.2.0](https://github.com/tigrisdata/objgit/compare/v1.1.0...v1.2.0) (2026-08-27)
+
+- refactor(objgitd)!: serve every repository from one bucket via the storer ([ebfe4e3](https://github.com/tigrisdata/objgit/commit/ebfe4e315aa387386c98ccef269d44cd98077470))
+
+### Features
+
+- **bundler:** vendor Google's item bundler, generic over item type ([d89b002](https://github.com/tigrisdata/objgit/commit/d89b002c85304c21fa84dcb9c9a9d7a9e58791cf))
+- **storage/tigris:** bin/cue pack containers, async uploads, pack cache ([f4a1419](https://github.com/tigrisdata/objgit/commit/f4a1419657cf94680e157e7c181fa856259b0ad5))
+- **storage/tigris:** body fetch and type-filtered EncodedObject ([1ccf723](https://github.com/tigrisdata/objgit/commit/1ccf7239fd6ee04812c98f2772d67cb034734758))
+- **storage/tigris:** cap pack containers at 128 MiB, overlap uploads ([b4c843d](https://github.com/tigrisdata/objgit/commit/b4c843d0bc691908aa1f9a82348a1b2aceaa9561))
+- **storage/tigris:** complete storage.Storer with index, config, module ([4e371c4](https://github.com/tigrisdata/objgit/commit/4e371c472525cab8547f2f554be7873f1bd10a88))
+- **storage/tigris:** hash-verifying staging writer for RawObjectWriter ([d3b0fd6](https://github.com/tigrisdata/objgit/commit/d3b0fd60b55edcd3632f7c1c9a71f5f3752b39da))
+- **storage/tigris:** HEAD-backed Has and Size lookups ([aac779b](https://github.com/tigrisdata/objgit/commit/aac779b625ed81c6626b36e99dd7f349cbcba00d))
+- **storage/tigris:** lazy paginated EncodedObject iteration ([cb28403](https://github.com/tigrisdata/objgit/commit/cb2840320c7db41bdd5f1d3017bcdc6a9bf429fc))
+- **storage/tigris:** loose references, CAS updates, shallow marks ([dfd5ae0](https://github.com/tigrisdata/objgit/commit/dfd5ae0c3cd988bdf4ce02a028325556767acb39))
+- **storage/tigris:** scaffold Tigris-backed go-git storer seam ([93f1832](https://github.com/tigrisdata/objgit/commit/93f1832988f43711364bb5e8e1750cff332d7e04))
+- **storage/tigris:** SetEncodedObject with forged-hash refusal ([c808cda](https://github.com/tigrisdata/objgit/commit/c808cda62cb42b9b47cf3eecaa40a1ba2231d172))
+
+### BREAKING CHANGES
+
+- -bucket now holds every repository, not just daemon
+  system state, and repositories are addressed by key prefix rather than
+  by per-keypair bucket. Existing per-keypair buckets are not read. The
+  flags -s3-cache-ttl, -s3-cache-refresh, -s3-cache-idle,
+  -s3-cache-recursive-prefixes, and -s3-cache-max-subtree-keys are
+  removed. -pack-cache-dir and -pack-cache-bytes now configure the
+  storer's container cache and no longer cache git .pack/.idx files.
+
+Assisted-by: Claude Opus 5 via Claude Code
+Signed-off-by: Xe Iaso <xe@tigrisdata.com>
+
 # [1.1.0](https://github.com/tigrisdata/objgit/compare/v1.0.2...v1.1.0) (2026-06-29)
 
 - feat(storage)!: resolve repositories to per-keypair Tigris buckets ([0ee1387](https://github.com/tigrisdata/objgit/commit/0ee13872b4a4ed4aa4f88c5bf0636157b1e578d1))
