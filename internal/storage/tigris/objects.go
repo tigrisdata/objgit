@@ -1,6 +1,7 @@
 package tigris
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -35,7 +36,7 @@ func (s *Storer) headInfo(h plumbing.Hash) (objHead, error) {
 	if e, ok, err := s.packLookup(h); err != nil {
 		return zeroObjHead, err
 	} else if ok {
-		return objHead{typ: e.typ, size: e.length}, nil
+		return objHead{typ: e.typ, size: e.raw}, nil
 	}
 
 	start := time.Now()
@@ -215,6 +216,33 @@ func (s *Storer) decodePending(t plumbing.ObjectType, h plumbing.Hash, p pending
 	defer f.Close()
 
 	return s.decodeBody(h, hs, f)
+}
+
+// decodePacked reads one packed object's *stored* bytes and hands the object's
+// real bytes to decodeBody, decompressing first when the cue says the payload
+// is zstd. Every tier of packObject funnels through here, so a compressed
+// container is invisible above this line.
+//
+// DecodeAll rather than a streaming reader on purpose: decodeBody buffers the
+// whole body into a MemoryObject regardless, and one shared decoder doing
+// DecodeAll beats allocating a zstd.Decoder's window buffers per read.
+func (s *Storer) decodePacked(h plumbing.Hash, hs objHead, codec uint8, body io.Reader) (plumbing.EncodedObject, error) {
+	if codec == codecRaw {
+		return s.decodeBody(h, hs, body)
+	}
+
+	stored, err := io.ReadAll(body)
+	if err != nil {
+		return nil, fmt.Errorf("tigris: read %s: %w", h.String(), err)
+	}
+	// The capacity hint is clamped: hs.size comes from the .cue, so a corrupt
+	// record claiming a huge size must not turn into a huge allocation here.
+	// DecodeAll grows the slice when the real payload needs it.
+	plain, err := payloadDecoder().DecodeAll(stored, make([]byte, 0, min(hs.size, decodeHintCap)))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s payload does not decompress: %w", errBadMetadata, h.String(), err)
+	}
+	return s.decodeBody(h, hs, bytes.NewReader(plain))
 }
 
 // decodeBody reads a GetObject body into a MemoryObject framed by an already

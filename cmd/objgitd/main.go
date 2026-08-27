@@ -45,6 +45,8 @@ var (
 
 	packCacheDir   = flag.String("pack-cache-dir", "", "parent directory for the local pack cache; empty uses the OS temp directory")
 	packCacheBytes = flag.Int64("pack-cache-bytes", 2<<30, "disk budget for the local pack cache, least-recently-used eviction; 0 disables caching")
+
+	packCompression = flag.Bool("pack-compression", true, "store zstd-compressed payloads in newly written pack containers; reading compressed containers is always enabled, so this is safe to turn off for one release before a rollback")
 )
 
 // tigrisBase adapts *tigris.Storer to repofs.Base: Storer.Scoped returns the
@@ -101,7 +103,11 @@ func main() {
 	// One pack cache for the whole process, shared by every repository's Storer
 	// (its keys are content hashes, so sharing is deduplication). Without it,
 	// each request that bulk-fetches a pack throws the copy away when it ends.
-	storerOpts := []tigris.Option{tigris.WithObserver(metrics.ObserveS3)}
+	storerOpts := []tigris.Option{
+		tigris.WithObserver(metrics.ObserveS3),
+		tigris.WithPayloadObserver(metrics.ObservePackPayload),
+		tigris.WithPackCompression(*packCompression),
+	}
 	var packCache *tigris.PackCache
 	if *packCacheBytes > 0 {
 		packCache, err = tigris.NewPackCache(*packCacheDir, *packCacheBytes)

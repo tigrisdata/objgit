@@ -38,8 +38,8 @@ One bucket holds everything. One S3 object holds one git object.
 
 ```
 objects/<hex>      loose object, keyed by its content hash
-packs/<id>.bin     up to 32768 objects or 128 MiB, raw bytes concatenated
-packs/<id>.cue     that pack's index: hash, type, offset, length
+packs/<id>.bin     up to 32768 objects or 128 MiB, payloads concatenated
+packs/<id>.cue     that pack's index: hash, type, codec, offset, lengths
 ```
 
 Layout decisions:
@@ -47,9 +47,9 @@ Layout decisions:
 - Flat keys, no `<2-char>` fanout. The fanout on disk exists to keep
   directories small. Object storage keys behave like one sorted hash map,
   so fanout buys nothing here.
-- Raw, uncompressed payload. Simple read path: wrap the bytes in a
-  `plumbing.MemoryObject`. A zlib variant is possible later for lower
-  egress and storage cost.
+- A loose object holds a raw, uncompressed payload. The read path wraps
+  the bytes in a `plumbing.MemoryObject`. Pack containers compress their
+  payloads. Loose objects do not.
 - User metadata carries the object type and size, under the keys
   `git-type` and `git-size`. With this, `HasEncodedObject`,
   `EncodedObjectSize`, and type-filtered iteration run on HEAD requests
@@ -69,10 +69,11 @@ is then one ranged `GetObject`, with no reconstruction step.
 
 A container is two objects:
 
-- `packs/<id>.bin` holds the raw bytes of every object, one after
-  another. The bytes carry no compression and no deltas.
+- `packs/<id>.bin` holds the payload of every object, one after another.
+  There are no deltas. Each payload is raw, or one zstd frame. See
+  [Payload compression](#payload-compression).
 - `packs/<id>.cue` holds the index. One record gives the hash, the type,
-  the offset, and the length of one object.
+  the codec, the offset, and two lengths for one object.
 
 A push writes one container, or more than one. Two limits bound one
 container, and both live in `packindex.go`:
@@ -139,27 +140,92 @@ All integers are big-endian. The header is 16 bytes:
 
 | Offset | Size | Field                                                |
 | ------ | ---- | ---------------------------------------------------- |
-| 0      | 4    | Magic `OGC\x01`. The last byte is the format version |
+| 0      | 4    | Magic `OGC\x02`. The last byte is the format version |
 | 4      | 1    | Hash width: 20 for SHA-1, 32 for SHA-256             |
-| 5      | 3    | Reserved. Must be zero                               |
-| 8      | 8    | Record count                                         |
+| 5      | 1    | Codec of the record block: 0 raw, 1 zstd             |
+| 6      | 2    | Reserved. Must be zero                               |
+| 8      | 8    | Record count (N)                                     |
 
-One record follows for each object. A record is `hash width + 17` bytes:
+The header is always plaintext. The record block follows it, and the
+header byte at offset 5 says whether that block is one zstd frame.
 
-| Offset         | Size       | Field                                        |
-| -------------- | ---------- | -------------------------------------------- |
-| 0              | hash width | Object hash, raw bytes                       |
-| hash width     | 1          | Object type: 1 commit, 2 tree, 3 blob, 4 tag |
-| hash width + 1 | 8          | Offset into the `.bin`                       |
-| hash width + 9 | 8          | Length of the object                         |
+The block holds six columns, not one struct for each record. N comes
+from the header, so every column boundary is a calculation:
 
-Records are sorted by hash. The length field is also the size of the git
-object, because the payload is raw.
+| Column | Size            | Field                                        |
+| ------ | --------------- | -------------------------------------------- |
+| hashes | N × hash width  | Object hash, raw bytes                       |
+| types  | N × 1           | Object type: 1 commit, 2 tree, 3 blob, 4 tag |
+| codecs | N × 1           | Payload codec: 0 raw, 1 zstd                 |
+| offset | N × 8           | Offset of the payload in the `.bin`          |
+| stored | N × 8           | Stored length: the byte span to fetch        |
+| raw    | N × 8           | Raw length: the size of the git object       |
 
-The parser rejects a bad magic, a hash width that disagrees with the
-repository, a non-zero reserved field, or a length that disagrees with
-the record count. A damaged index gives an error. It never looks like a
-missing object.
+One record therefore costs `hash width + 26` bytes before compression.
+
+Columns compress much better than records in sequence. Records in
+sequence put 20 to 32 bytes of hash entropy every 26 bytes or more, and
+this starves the match finder of zstd. Columns hold the entropy in one
+place. The other five columns then cost almost nothing, because types
+take about four values, codecs take two, and the three length columns
+hold big-endian integers whose high bytes are all zero.
+
+Records are sorted by hash. `stored` and `raw` are equal when the codec
+is raw.
+
+The parser rejects a bad magic, an unknown format version, a hash width
+that disagrees with the repository, a non-zero reserved field, an
+unknown codec, a record block that does not decompress, or a
+decompressed block whose size disagrees with the record count. A damaged
+index gives an error. It never looks like a missing object.
+
+### Format version 1
+
+Version 1 is the original layout: a 16-byte header, then one fixed-width
+record of `hash width + 17` bytes for each object, holding the hash, the
+type, the offset, and one length. Version 1 payloads are always raw.
+
+The parser reads both versions. A version 1 record becomes a record with
+the raw codec and with `stored` equal to `raw`, so nothing above the
+parser knows which version it read. Containers already in a bucket stay
+readable, and no migration pass exists.
+
+An older binary reads a version 2 cue as a bad magic and stops. This is
+the correct direction to fail, but it means that a rollback loses every
+container written after the upgrade. The `-pack-compression` flag exists
+for this reason: run one release with the flag off, then turn it on.
+
+### Payload compression
+
+A payload is raw bytes, or one zstd frame. One frame for each object
+keeps the read path unchanged: a ranged `GetObject` still fetches exactly
+one object, because `stored` gives its byte span.
+
+Three size bands decide the codec. `compress.go` holds the constants:
+
+- Under 2 KiB, the payload is raw. There is no probe and no buffer.
+- Up to 1 MiB, the writer compresses the object and keeps the smaller
+  form. This decision is exact.
+- Over 1 MiB, the writer compresses the first 64 KiB to decide. This
+  avoids compression of 500 MiB of video that cannot compress.
+
+The floor of 2 KiB comes from a measurement of a real source repository.
+A floor of 2 KiB recovers 58.3% of the object bytes. A floor of 64 KiB
+recovers 8.1%. A floor of 512 B recovers 60.2%, which is only 1.9 points
+more. Under 512 B, compression gains almost nothing: those objects
+average 1.07x, and fewer than half of them get smaller at all. Git trees
+are mostly hash bytes, and hash bytes do not compress.
+
+A compressed payload must be smaller by at least 64 bytes. A zstd frame
+header and checksum cost 13 to 17 bytes, so this rule stops a small gain
+from buying a codec branch on every later read.
+
+The probe judges a ratio, and not a byte count. A byte floor against a
+small window can be impossible to meet. The writer therefore checks the
+whole object again after it compresses it. If the result is not smaller
+by 64 bytes, the writer truncates the staging file and stores the object
+raw. The stored form is never larger than the object, which is what lets
+the 128 MiB container limit treat `obj.Size()` as an upper bound.
 
 ### The read path for packs
 
@@ -173,7 +239,9 @@ Each `Storer` builds its pack index one time. The build lists
 `packs/*.cue` and reads each one. These files are small. The build reads
 no `.bin` body.
 
-A read of a packed object sends one ranged `GetObject` into the `.bin`.
+A read of a packed object sends one ranged `GetObject` into the `.bin`,
+over the `stored` byte span, and then decompresses the frame if the
+record says zstd.
 After a `Storer` reads more than 32 different objects from one pack, it
 downloads the whole `.bin` one time. All later reads of that pack use
 the local copy. A clone therefore costs about one large GET for each
@@ -368,7 +436,8 @@ Items 1 to 4 and item 6 are complete.
 6. **Done.** Cache packs across requests. One process holds one
    least-recently-used cache of whole `.bin` files, under a disk budget.
    See [The pack cache](#the-pack-cache).
-7. Switch the payload format to the zlib objfile form from
-   `plumbing/format/objfile` when egress or storage cost matters.
+7. **Done.** Compress pack payloads with zstd, and compress the `.cue`
+   record block. See [Payload compression](#payload-compression). A real
+   source repository measures 2.70x on stored pack bytes.
 8. Add the optional `PromisorPackfileWriter` support when partial clones
    matter for your users.

@@ -3,15 +3,18 @@ package tigris
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,15 +45,18 @@ func TestCueRoundTrip(t *testing.T) {
 		recs    []cueRecord
 	}{
 		{name: "empty, sha1 width", hashLen: 20, recs: nil},
-		{name: "one record, sha1", hashLen: 20, recs: []cueRecord{
-			{hash: h1, typ: plumbing.BlobObject, offset: 0, length: 3},
+		{name: "one raw record, sha1", hashLen: 20, recs: []cueRecord{
+			{hash: h1, typ: plumbing.BlobObject, offset: 0, stored: 3, raw: 3},
 		}},
-		{name: "many records, sha1, sorted", hashLen: 20, recs: sortedRecs([]cueRecord{
-			{hash: h2, typ: plumbing.TreeObject, offset: 3, length: 7},
-			{hash: h1, typ: plumbing.BlobObject, offset: 0, length: 3},
+		{name: "one zstd record, sha1", hashLen: 20, recs: []cueRecord{
+			{hash: h1, typ: plumbing.BlobObject, codec: codecZstd, offset: 0, stored: 40, raw: 4096},
+		}},
+		{name: "mixed codecs, sha1, sorted", hashLen: 20, recs: sortedRecs([]cueRecord{
+			{hash: h2, typ: plumbing.TreeObject, offset: 40, stored: 7, raw: 7},
+			{hash: h1, typ: plumbing.BlobObject, codec: codecZstd, offset: 0, stored: 40, raw: 8192},
 		})},
 		{name: "sha256 width", hashLen: 32, recs: []cueRecord{
-			{hash: sh1, typ: plumbing.BlobObject, offset: 0, length: 3},
+			{hash: sh1, typ: plumbing.BlobObject, codec: codecZstd, offset: 0, stored: 3, raw: 9},
 		}},
 	}
 
@@ -67,7 +73,7 @@ func TestCueRoundTrip(t *testing.T) {
 				t.Fatalf("got %d records, want %d", len(got), len(tt.recs))
 			}
 			for i, r := range tt.recs {
-				if got[i].hash != r.hash || got[i].typ != r.typ || got[i].offset != r.offset || got[i].length != r.length {
+				if got[i] != r {
 					t.Errorf("record %d = %+v, want %+v", i, got[i], r)
 				}
 			}
@@ -75,20 +81,94 @@ func TestCueRoundTrip(t *testing.T) {
 	}
 }
 
+// TestCueEncodesVersion2 pins the on-the-wire version byte. Without it the
+// round-trip test above would pass just as well against v1's layout.
+func TestCueEncodesVersion2(t *testing.T) {
+	t.Parallel()
+
+	h1 := hashForBody(formatcfg.DefaultObjectFormat, plumbing.BlobObject, "one")
+	enc := encodeCue(20, []cueRecord{{hash: h1, typ: plumbing.BlobObject, stored: 3, raw: 3}})
+
+	if got := enc[3]; got != 2 {
+		t.Errorf("format version = %d, want 2", got)
+	}
+	if got := string(enc[0:3]); got != "OGC" {
+		t.Errorf("magic = %q, want %q", got, "OGC")
+	}
+}
+
+// TestCueParsesV1 is the back-compat guarantee: containers already in live
+// buckets carry v1 cues, and they must keep resolving forever. The bytes are
+// hand-built on purpose — encodeCue no longer emits v1, so an encoder-based
+// fixture could not prove anything.
+func TestCueParsesV1(t *testing.T) {
+	t.Parallel()
+
+	h1 := hashForBody(formatcfg.DefaultObjectFormat, plumbing.BlobObject, "one")
+	h2 := hashForBody(formatcfg.DefaultObjectFormat, plumbing.TreeObject, "two")
+
+	// v1: 16-byte header (magic "OGC"+0x01, hash width, 3 reserved, count),
+	// then one hashLen+17 record per entry: hash, type, offset, length.
+	v1 := []byte{'O', 'G', 'C', 1, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}
+	for _, r := range sortedRecs([]cueRecord{
+		{hash: h1, typ: plumbing.BlobObject, offset: 0, raw: 3},
+		{hash: h2, typ: plumbing.TreeObject, offset: 3, raw: 7},
+	}) {
+		v1 = append(v1, r.hash.Bytes()...)
+		v1 = append(v1, byte(r.typ))
+		v1 = binary.BigEndian.AppendUint64(v1, uint64(r.offset))
+		v1 = binary.BigEndian.AppendUint64(v1, uint64(r.raw))
+	}
+
+	got, err := parseCue(20, v1)
+	if err != nil {
+		t.Fatalf("parse v1: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d records, want 2", len(got))
+	}
+	// A v1 payload is raw, so stored must equal raw and the codec must be raw.
+	for i, r := range got {
+		if r.codec != codecRaw {
+			t.Errorf("record %d codec = %d, want codecRaw", i, r.codec)
+		}
+		if r.stored != r.raw {
+			t.Errorf("record %d stored = %d, raw = %d; v1 payloads are raw so they must match", i, r.stored, r.raw)
+		}
+	}
+	// Keyed by hash, not position: the records are in hash order, which is not
+	// the order they were declared in above.
+	want := map[plumbing.Hash]cueRecord{
+		h1: {hash: h1, typ: plumbing.BlobObject, codec: codecRaw, offset: 0, stored: 3, raw: 3},
+		h2: {hash: h2, typ: plumbing.TreeObject, codec: codecRaw, offset: 3, stored: 7, raw: 7},
+	}
+	for _, r := range got {
+		if r != want[r.hash] {
+			t.Errorf("record %s = %+v, want %+v", r.hash, r, want[r.hash])
+		}
+	}
+}
+
 func TestCueParseRejectsCorruption(t *testing.T) {
 	t.Parallel()
 
 	h1 := hashForBody(formatcfg.DefaultObjectFormat, plumbing.BlobObject, "one")
-	valid := encodeCue(20, []cueRecord{{hash: h1, typ: plumbing.BlobObject, offset: 0, length: 3}})
+	valid := encodeCue(20, []cueRecord{{hash: h1, typ: plumbing.BlobObject, offset: 0, stored: 3, raw: 3}})
 
 	tests := []struct {
 		name string
 		raw  []byte
 	}{
 		{"truncated header", valid[:10]},
-		{"truncated record", valid[:len(valid)-1]},
+		{"truncated record block", valid[:len(valid)-1]},
 		{"bad magic", tamper(valid, 0, 'X')},
-		{"non-zero reserved", tamper(valid, 5, 1)},
+		// Byte 5 was a reserved zero in v1; v2 spends it on the record-block
+		// codec, so the reserved-bytes check now covers 6 and 7 only.
+		{"non-zero reserved", tamper(valid, 6, 1)},
+		{"non-zero reserved, second byte", tamper(valid, 7, 1)},
+		{"unknown format version", tamper(valid, 3, 9)},
+		{"unknown record block codec", tamper(valid, 5, 9)},
+		{"record count larger than the file", tamper(valid, 15, 0xff)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -107,10 +187,365 @@ func TestCueParseRejectsCorruption(t *testing.T) {
 	})
 }
 
+// TestCueParseRejectsDecompressionBomb pins the memory bound on the record
+// block. The zstd default is 64 GiB, so without a bound a few kilobytes of
+// hostile or corrupt .cue could exhaust the daemon's memory before any length
+// check ever ran. A legitimate block is under 2 MiB: 32768 records at 58 bytes.
+func TestCueParseRejectsDecompressionBomb(t *testing.T) {
+	// Not parallel: it lowers a package-level bound.
+	restore := cueMaxDecoded
+	cueMaxDecoded = 64 << 10
+	resetCueDecoder()
+	t.Cleanup(func() {
+		cueMaxDecoded = restore
+		resetCueDecoder()
+	})
+
+	// One record's worth of header, then a block that decompresses far past
+	// the bound. Zeros compress to almost nothing, which is the whole trick.
+	bomb := encoder().EncodeAll(make([]byte, 4<<20), nil)
+	if len(bomb) >= 64<<10 {
+		t.Fatalf("bomb is %d bytes compressed, too big to prove the point", len(bomb))
+	}
+
+	cue := []byte{'O', 'G', 'C', 2, 20, codecZstd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+	cue = append(cue, bomb...)
+
+	_, err := parseCue(20, cue)
+	if !errors.Is(err, errBadCue) {
+		t.Errorf("want errBadCue for a block that exceeds the decode bound, got %v", err)
+	}
+}
+
 func tamper(b []byte, i int, v byte) []byte {
 	cp := append([]byte(nil), b...)
 	cp[i] = v
 	return cp
+}
+
+// --- payload compression -------------------------------------------------
+
+// blobSpec asks buildBlobFixture for one blob of a given size, either
+// maximally compressible (a repeated byte) or incompressible (a fixed-seed
+// PRNG, so the fixture stays deterministic across runs).
+type blobSpec struct {
+	size         int
+	compressible bool
+	// headCompressible makes the first head bytes compressible and the rest
+	// random, which is exactly the shape that fools a head probe.
+	headCompressible bool
+	// head is how much of the blob is compressible when headCompressible is
+	// set. Zero means probeWindow.
+	head int
+}
+
+// buildBlobFixture packs one commit holding one file per spec. Sizes must be
+// distinct, since the assertions below locate a blob's cue record by its size.
+func buildBlobFixture(t *testing.T, specs ...blobSpec) packFixture {
+	t.Helper()
+	dir := t.TempDir()
+	gitRun(t, dir, "init", "-b", "main")
+	gitRun(t, dir, "config", "user.email", "test@example.com")
+	gitRun(t, dir, "config", "user.name", "Test")
+
+	rng := rand.New(rand.NewSource(1))
+	for i, spec := range specs {
+		body := make([]byte, spec.size)
+		switch {
+		case spec.compressible:
+			for j := range body {
+				body[j] = byte('a' + i%26)
+			}
+		case spec.headCompressible:
+			head := spec.head
+			if head == 0 {
+				head = probeWindow
+			}
+			if head > len(body) {
+				head = len(body)
+			}
+			for j := 0; j < head; j++ {
+				body[j] = byte('a' + i%26)
+			}
+			rng.Read(body[head:])
+		default:
+			rng.Read(body)
+		}
+		name := filepath.Join(dir, fmt.Sprintf("file%03d.bin", i))
+		if err := os.WriteFile(name, body, 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	gitRun(t, dir, "add", ".")
+	gitRun(t, dir, "commit", "-m", "blobs")
+
+	return collectPackFixture(t, dir)
+}
+
+// recordForSize finds the single cue record whose raw size matches, across
+// every container the push produced.
+func recordForSize(t *testing.T, byID map[string][]cueRecord, size int) cueRecord {
+	t.Helper()
+	var found []cueRecord
+	for _, recs := range byID {
+		for _, r := range recs {
+			if r.raw == int64(size) {
+				found = append(found, r)
+			}
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("want exactly one record of raw size %d, found %d", size, len(found))
+	}
+	return found[0]
+}
+
+// TestPackPayloadCodec pins the compression policy at every band boundary.
+// The floor cases are the ones most likely to regress if someone later
+// "improves" the threshold, so each boundary is tested from both sides.
+func TestPackPayloadCodec(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		spec      blobSpec
+		wantCodec uint8
+	}{
+		{
+			name:      "compressible, just under the floor, stays raw",
+			spec:      blobSpec{size: compressionFloor - 1, compressible: true},
+			wantCodec: codecRaw,
+		},
+		{
+			name:      "compressible, at the floor, compresses",
+			spec:      blobSpec{size: compressionFloor, compressible: true},
+			wantCodec: codecZstd,
+		},
+		{
+			name:      "incompressible, well over the floor, stays raw",
+			spec:      blobSpec{size: 64 << 10, compressible: false},
+			wantCodec: codecRaw,
+		},
+		{
+			name:      "compressible, well over the floor, compresses",
+			spec:      blobSpec{size: 32 << 10, compressible: true},
+			wantCodec: codecZstd,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newFakeS3(t)
+			s := newTestStorer(t, f)
+			fx := buildBlobFixture(t, tt.spec)
+			writePack(t, s, fx)
+			if err := s.up.flush(); err != nil {
+				t.Fatalf("flush: %v", err)
+			}
+
+			byID := assertContainers(t, s, f, fx, maxPackObjects, maxPackBytes)
+			r := recordForSize(t, byID, tt.spec.size)
+
+			if r.codec != tt.wantCodec {
+				t.Errorf("codec = %d, want %d (raw=%d stored=%d)", r.codec, tt.wantCodec, r.raw, r.stored)
+			}
+			switch tt.wantCodec {
+			case codecRaw:
+				if r.stored != r.raw {
+					t.Errorf("raw payload: stored = %d, want %d", r.stored, r.raw)
+				}
+			case codecZstd:
+				if r.stored >= r.raw {
+					t.Errorf("compressed payload is not smaller: stored = %d, raw = %d", r.stored, r.raw)
+				}
+			}
+		})
+	}
+}
+
+// TestPackCompressionRatioOnRealSource is the end-to-end value check: every
+// test above proves the machinery works, and this one proves it is worth
+// having. The fixture is this package's own Go source, so the content is
+// genuinely representative of what a git server stores rather than synthetic.
+//
+// The bar is deliberately loose. The measurement behind the 2 KiB floor put
+// source blobs around 2.5x, so 1.5x on the whole push — trees, commits and
+// sub-floor files included — has plenty of headroom while still failing loudly
+// if compression silently stops happening.
+func TestPackCompressionRatioOnRealSource(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	t.Parallel()
+
+	sources, err := filepath.Glob("*.go")
+	if err != nil || len(sources) == 0 {
+		t.Skipf("no Go sources beside the test to use as a fixture: %v", err)
+	}
+
+	dir := t.TempDir()
+	gitRun(t, dir, "init", "-b", "main")
+	gitRun(t, dir, "config", "user.email", "test@example.com")
+	gitRun(t, dir, "config", "user.name", "Test")
+	for _, src := range sources {
+		body, err := os.ReadFile(src)
+		if err != nil {
+			t.Fatalf("read %s: %v", src, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, src), body, 0o644); err != nil {
+			t.Fatalf("write %s: %v", src, err)
+		}
+	}
+	gitRun(t, dir, "add", ".")
+	gitRun(t, dir, "commit", "-m", "real source")
+	fx := collectPackFixture(t, dir)
+
+	f := newFakeS3(t)
+	s := newTestStorer(t, f)
+	writePack(t, s, fx)
+	if err := s.up.flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	byID := assertContainers(t, s, f, fx, maxPackObjects, maxPackBytes)
+
+	var raw, stored int64
+	var compressed int
+	for _, recs := range byID {
+		for _, r := range recs {
+			raw += r.raw
+			stored += r.stored
+			if r.codec == codecZstd {
+				compressed++
+			}
+		}
+	}
+	if stored == 0 {
+		t.Fatal("no bytes stored")
+	}
+
+	ratio := float64(raw) / float64(stored)
+	t.Logf("%d objects (%d compressed): %d raw -> %d stored, %.2fx",
+		len(fx.hashes), compressed, raw, stored, ratio)
+	if ratio < 1.5 {
+		t.Errorf("compression ratio %.2fx on real source is below 1.5x", ratio)
+	}
+}
+
+// TestPackPayloadObserver proves the metrics seam fires once per object with
+// the codec actually used and both byte counts, since a wrong codec label here
+// would silently misreport the feature's whole value in production.
+func TestPackPayloadObserver(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	t.Parallel()
+
+	const (
+		compressible   = 16 << 10
+		incompressible = 32 << 10
+	)
+
+	type seen struct {
+		codec       string
+		raw, stored int64
+	}
+	var mu sync.Mutex
+	byRaw := map[int64]seen{}
+	var calls int
+
+	f := newFakeS3(t)
+	s := newTestStorer(t, f, WithPayloadObserver(func(codec string, raw, stored int64) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		byRaw[raw] = seen{codec: codec, raw: raw, stored: stored}
+	}))
+
+	fx := buildBlobFixture(t,
+		blobSpec{size: compressible, compressible: true},
+		blobSpec{size: incompressible},
+	)
+	writePack(t, s, fx)
+	if err := s.up.flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if calls != len(fx.hashes) {
+		t.Errorf("observer fired %d times, want once per object (%d)", calls, len(fx.hashes))
+	}
+
+	if got := byRaw[compressible]; got.codec != "zstd" || got.stored >= got.raw {
+		t.Errorf("compressible blob reported %+v, want codec zstd with stored < raw", got)
+	}
+	if got := byRaw[incompressible]; got.codec != "raw" || got.stored != got.raw {
+		t.Errorf("incompressible blob reported %+v, want codec raw with stored == raw", got)
+	}
+}
+
+// TestPackPayloadNeverInflates is the invariant the container byte cap leans
+// on: whatever the policy decides, a stored payload is never larger than the
+// object it came from. The head-compressible case is the one that can break
+// it — it passes a head probe and then inflates over the incompressible tail —
+// so it must come back raw after the writer notices and rewinds.
+func TestPackPayloadNeverInflates(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	t.Parallel()
+
+	const (
+		// mispredicts: a compressible head over an incompressible tail.
+		mispredicts = 8 << 10
+		// compresses: wins on the same probe path, as a control.
+		compresses = 6 << 10
+		probe      = 64
+	)
+
+	f := newFakeS3(t)
+	// A tiny in-memory cap forces the probe path, and a tiny probe window makes
+	// the misprediction reachable — at the production 64 KiB window a
+	// compressible head saves more than an incompressible tail can give back,
+	// so no fixture of a sane size would ever rewind. Same motivation as
+	// withMaxPackObjects.
+	s := newTestStorer(t, f, withInMemoryCap(probe*2), withProbeWindow(probe))
+	fx := buildBlobFixture(t,
+		blobSpec{size: mispredicts, headCompressible: true, head: probe},
+		blobSpec{size: compresses, compressible: true},
+	)
+	writePack(t, s, fx)
+	if err := s.up.flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	byID := assertContainers(t, s, f, fx, maxPackObjects, maxPackBytes)
+
+	for _, recs := range byID {
+		for _, r := range recs {
+			if r.stored > r.raw {
+				t.Errorf("object %s inflated: stored = %d > raw = %d", r.hash, r.stored, r.raw)
+			}
+		}
+	}
+
+	// The head-compressible blob passed the probe, then gave the saving back
+	// over its tail, so the writer must have rewound it to raw.
+	if r := recordForSize(t, byID, mispredicts); r.codec != codecRaw || r.stored != r.raw {
+		t.Errorf("head-compressible blob: codec = %d, stored = %d, raw = %d; want raw with stored == raw",
+			r.codec, r.stored, r.raw)
+	}
+	// The fully compressible one went through the same probe path and won.
+	if r := recordForSize(t, byID, compresses); r.codec != codecZstd {
+		t.Errorf("compressible blob over the in-memory cap: codec = %d, want zstd", r.codec)
+	}
 }
 
 // --- PackfileWriter / read-path integration ------------------------------
@@ -428,7 +863,7 @@ func assertContainers(t *testing.T, s *Storer, f *fakeS3, fx packFixture, maxRec
 			t.Errorf("pack %s: records are not hash-sorted", id)
 		}
 		for _, r := range recs {
-			if end := r.offset + r.length; end > int64(len(bin)) {
+			if end := r.offset + r.stored; end > int64(len(bin)) {
 				t.Errorf("pack %s: record %s runs to %d, past the %d-byte .bin", id, r.hash, end, len(bin))
 			}
 			counts[r.hash]++
@@ -532,6 +967,13 @@ func TestPackfileWriterSplitsAtObjectLimit(t *testing.T) {
 // result the same way buildPackFixture does. It exists so the byte cap can be
 // exercised with a small cap and known blob sizes, instead of a 128 MiB
 // fixture.
+//
+// The bodies are incompressible, from a fixed-seed PRNG. The byte cap counts
+// *stored* bytes, so compressible bodies would make a blob's contribution to
+// its container some unpredictable fraction of the size asked for here, and
+// every expectation in the caller's table would be guesswork. Incompressible
+// bodies keep stored == raw, which lets the caller reason in the sizes it
+// passed while still running the real codec path.
 func buildSizedPackFixture(t *testing.T, sizes ...int) packFixture {
 	t.Helper()
 	dir := t.TempDir()
@@ -539,9 +981,11 @@ func buildSizedPackFixture(t *testing.T, sizes ...int) packFixture {
 	gitRun(t, dir, "config", "user.email", "test@example.com")
 	gitRun(t, dir, "config", "user.name", "Test")
 
+	rng := rand.New(rand.NewSource(2))
 	for i, size := range sizes {
-		name := filepath.Join(dir, fmt.Sprintf("file%03d.txt", i))
-		body := bytes.Repeat([]byte{byte('a' + i%26)}, size)
+		name := filepath.Join(dir, fmt.Sprintf("file%03d.bin", i))
+		body := make([]byte, size)
+		rng.Read(body)
 		if err := os.WriteFile(name, body, 0o644); err != nil {
 			t.Fatalf("write %s: %v", name, err)
 		}
@@ -643,7 +1087,7 @@ func TestPackfileWriterSplitsAtByteLimit(t *testing.T) {
 			var found int
 			for id, recs := range byID {
 				for _, r := range recs {
-					if r.length != int64(tt.oversized) {
+					if r.raw != int64(tt.oversized) {
 						continue
 					}
 					found++

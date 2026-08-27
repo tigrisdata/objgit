@@ -13,10 +13,11 @@
 //	index               plumbing/format/index-encoded worktree index
 //	config              config.Config.Marshal output
 //	packs/<id>.bin      up to maxPackObjects objects or maxPackBytes bytes,
-//	                    concatenated raw bytes (one push writes as many
-//	                    containers as it needs)
-//	packs/<id>.cue      that pack's index (hash, type, offset, length per
-//	                    object) — see packindex.go for the binary format
+//	                    concatenated payloads, each raw or one zstd frame
+//	                    (one push writes as many containers as it needs)
+//	packs/<id>.cue      that pack's index (hash, type, codec, offset, stored
+//	                    length and raw size per object) — see packindex.go for
+//	                    the binary format and compress.go for the codec policy
 //
 // Methods hold no per-call state on the Storer, so a Storer value is safe for
 // concurrent use.
@@ -87,13 +88,25 @@ type Storer struct {
 	of       formatcfg.ObjectFormat
 	oh       *plumbing.ObjectHasher
 	observer func(operation string, dur time.Duration, err error)
-	up       *uploader  // batches loose-object PutObject calls off of Close; see upload.go
-	packs    *packIndex // pack containers this Storer knows about; see packindex.go
-	cache    *PackCache // optional process-wide local pack cache; see packcache.go
-	maxPack  int        // objects per written pack container; see maxPackObjects
+	// payloadObserver reports each pack payload's codec and sizes; see
+	// WithPayloadObserver.
+	payloadObserver func(codec string, raw, stored int64)
+	up              *uploader  // batches loose-object PutObject calls off of Close; see upload.go
+	packs           *packIndex // pack containers this Storer knows about; see packindex.go
+	cache           *PackCache // optional process-wide local pack cache; see packcache.go
+	maxPack         int        // objects per written pack container; see maxPackObjects
 	// maxPackBytes caps a written container's payload; see maxPackBytes. Both
 	// caps apply at once, and the writer seals on whichever it reaches first.
 	maxPackBytes int64
+	// inMemoryCap is the largest object whose codec is decided exactly rather
+	// than by a head probe; see inMemoryCap and compress.go.
+	inMemoryCap int64
+	// probeWindow is how much of an over-cap object gets compressed to decide
+	// the whole object's fate; see probeWindow and compress.go.
+	probeWindow int
+	// packCompression enables writing zstd payloads. Reading them is
+	// unconditional — see WithPackCompression for why the two differ.
+	packCompression bool
 }
 
 // Option configures a Storer at construction time.
@@ -125,6 +138,30 @@ func WithPackCache(c *PackCache) Option {
 	return func(s *Storer) { s.cache = c }
 }
 
+// WithPackCompression controls whether newly written pack containers store
+// zstd payloads. Reading them is never gated: a Storer resolves compressed and
+// raw containers alike no matter how this is set.
+//
+// The asymmetry is deliberate, and it is a rollback story. A cue written by
+// this code carries format version 2, which an older binary refuses outright
+// rather than misreading — the right direction to fail, but it means rolling a
+// deploy back loses access to every container written in the window. Shipping
+// the reader first and turning writes on in a later release makes that
+// window empty.
+func WithPackCompression(enabled bool) Option {
+	return func(s *Storer) { s.packCompression = enabled }
+}
+
+// WithPayloadObserver installs a callback fired once for every object written
+// into a pack container, with the codec it was stored under ("raw" or "zstd")
+// and its size before and after. Instance-level for the same reason as
+// WithObserver, and a callback rather than a direct metrics call so this
+// package stays free of any Prometheus import. Wire metrics.ObservePackPayload
+// here from main.
+func WithPayloadObserver(fn func(codec string, raw, stored int64)) Option {
+	return func(s *Storer) { s.payloadObserver = fn }
+}
+
 func withClient(c s3API) Option {
 	return func(s *Storer) { s.client = c }
 }
@@ -143,14 +180,34 @@ func withMaxPackBytes(n int64) Option {
 	return func(s *Storer) { s.maxPackBytes = n }
 }
 
+// withInMemoryCap lowers the exact-decision size from inMemoryCap. Test-only,
+// for the same reason as the two caps above: reaching the probe path — and the
+// rewind behind it — otherwise needs a multi-megabyte git fixture.
+func withInMemoryCap(n int64) Option {
+	return func(s *Storer) { s.inMemoryCap = n }
+}
+
+// withProbeWindow shrinks the head window from probeWindow. Test-only: with
+// the production 64 KiB window, an object whose head compresses but whose tail
+// does not still comes out smaller overall, because zstd stores incompressible
+// data with only ~0.015% overhead while a 64 KiB compressible head saves ~65
+// KiB. Reaching the rewind honestly would need a fixture of several hundred
+// megabytes; a small window reaches it in a few kilobytes.
+func withProbeWindow(n int) Option {
+	return func(s *Storer) { s.probeWindow = n }
+}
+
 // New returns a Storer owning one whole bucket. ctx bounds every request this
 // storer issues.
 func New(ctx context.Context, bucket string, opts ...Option) (*Storer, error) {
 	s := &Storer{
-		ctx:          ctx,
-		of:           formatcfg.DefaultObjectFormat,
-		maxPack:      maxPackObjects,
-		maxPackBytes: maxPackBytes,
+		ctx:             ctx,
+		of:              formatcfg.DefaultObjectFormat,
+		maxPack:         maxPackObjects,
+		maxPackBytes:    maxPackBytes,
+		inMemoryCap:     inMemoryCap,
+		probeWindow:     probeWindow,
+		packCompression: true,
 	}
 	for _, opt := range opts {
 		opt(s)

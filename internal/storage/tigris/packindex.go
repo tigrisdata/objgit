@@ -26,6 +26,11 @@ const (
 	// one pack via individual ranged GETs, within one Storer instance, before
 	// switching to downloading that pack's whole .bin once and serving every
 	// later read from the local copy.
+	//
+	// Tuned when payloads were uncompressed, so it is conservative now: a
+	// ranged GET moves fewer bytes than it used to, and a bulk download moves
+	// fewer too. Left alone deliberately — the crossover is a measurement, not
+	// a guess.
 	packBulkFetchThreshold = 32
 
 	// maxPackObjects caps how many objects one *written* pack container holds,
@@ -51,88 +56,251 @@ const (
 	maxPackBytes = 128 << 20 // 128 MiB
 )
 
-var cueMagic = [4]byte{'O', 'G', 'C', 1} // "OGC" + format version 1
+// cueMagicPrefix is shared by every .cue format version; the 4th header byte
+// carries the version itself.
+var cueMagicPrefix = [3]byte{'O', 'G', 'C'}
+
+const (
+	cueVersion1 = 1 // fixed-width records, raw payloads, no codecs
+	cueVersion2 = 2 // columnar records, optionally zstd, per-object codecs
+
+	cueHeaderLen = 16
+
+	// cueRecCodecOff is header byte 5: the codec of the *record block*, which
+	// is independent of any object's payload codec. v1 held a reserved zero
+	// here, so a v1 cue reads as codecRaw and stays correct.
+	cueRecCodecOff = 5
+)
 
 // errBadCue marks a malformed pack index: corruption never masquerades as
 // absence, the same posture errBadMetadata takes for loose objects.
 var errBadCue = fmt.Errorf("tigris: malformed pack cue index")
 
-// cueRecord is one object's entry in a .cue index: its hash plus where its
-// raw bytes live in the sibling .bin.
+// cueRecord is one object's entry in a .cue index: its hash, its payload
+// codec, and where its bytes live in the sibling .bin.
+//
+// stored and raw are deliberately separate. stored is the byte span to fetch —
+// the only length a ranged GetObject may ever use — while raw is the git
+// object's own size, which is what every caller outside this file means by
+// "length". They are equal exactly when codec is codecRaw.
 type cueRecord struct {
 	hash   plumbing.Hash
 	typ    plumbing.ObjectType
-	offset int64
-	length int64 // == the git object's size, since .bin payloads are raw
+	codec  uint8
+	offset int64 // byte offset of the stored bytes within the .bin
+	stored int64 // stored byte span; == raw when codec is codecRaw
+	raw    int64 // the git object's size, i.e. the decoded length
 }
 
-// encodeCue serializes recs (assumed already sorted by hash) into the .cue
-// binary format: a 16-byte header (magic, hash width, reserved, count)
-// followed by one hashLen+17-byte record per entry, all big-endian.
+// cueRecWidth is one v2 record's contribution to the record block. The block
+// is columnar rather than one struct per record, so this is a total rather
+// than a stride.
+func cueRecWidth(hashLen int) int { return hashLen + 26 }
+
+// encodeCue serializes recs (assumed already sorted by hash) into the v2 .cue
+// format: a 16-byte plaintext header, then a record block holding six columns
+// — hashes, types, codecs, offsets, stored lengths, raw sizes.
+//
+// Columnar, not one record after another, because interleaving puts 20-32
+// bytes of incompressible hash entropy every 26+ bytes and starves zstd's
+// match finder. Split into columns, the noise is quarantined in the hash
+// column while the other five compress nearly to nothing: types take about
+// four distinct values, codecs two, and the three big-endian uint64 columns
+// have all-zero high bytes.
 func encodeCue(hashLen int, recs []cueRecord) []byte {
-	recWidth := hashLen + 17
-	buf := make([]byte, 16+len(recs)*recWidth)
-	copy(buf[0:4], cueMagic[:])
-	buf[4] = byte(hashLen)
-	binary.BigEndian.PutUint64(buf[8:16], uint64(len(recs)))
+	n := len(recs)
+	block := make([]byte, 0, n*cueRecWidth(hashLen))
 
-	off := 16
 	for _, r := range recs {
-		copy(buf[off:off+hashLen], r.hash.Bytes())
-		buf[off+hashLen] = byte(r.typ)
-		binary.BigEndian.PutUint64(buf[off+hashLen+1:off+hashLen+9], uint64(r.offset))
-		binary.BigEndian.PutUint64(buf[off+hashLen+9:off+hashLen+17], uint64(r.length))
-		off += recWidth
+		block = append(block, r.hash.Bytes()...)
 	}
-	return buf
+	for _, r := range recs {
+		block = append(block, byte(r.typ))
+	}
+	for _, r := range recs {
+		block = append(block, r.codec)
+	}
+	for _, r := range recs {
+		block = binary.BigEndian.AppendUint64(block, uint64(r.offset))
+	}
+	for _, r := range recs {
+		block = binary.BigEndian.AppendUint64(block, uint64(r.stored))
+	}
+	for _, r := range recs {
+		block = binary.BigEndian.AppendUint64(block, uint64(r.raw))
+	}
+
+	body, compressed := compressBlock(block)
+
+	buf := make([]byte, cueHeaderLen, cueHeaderLen+len(body))
+	copy(buf[0:3], cueMagicPrefix[:])
+	buf[3] = cueVersion2
+	buf[4] = byte(hashLen)
+	if compressed {
+		buf[cueRecCodecOff] = codecZstd
+	}
+	binary.BigEndian.PutUint64(buf[8:16], uint64(n))
+	return append(buf, body...)
 }
 
-// parseCue is encodeCue's inverse. hashLen is the caller's expected width
+// parseCue is encodeCue's inverse, and also the reader for every v1 cue
+// already sitting in a live bucket. hashLen is the caller's expected width
 // (from this Storer's own object format) — a cue written under a different
 // format is rejected rather than silently misparsed.
+//
+// Both versions yield the same []cueRecord, so nothing downstream of here
+// knows or cares which version it came from.
 func parseCue(hashLen int, raw []byte) ([]cueRecord, error) {
-	if len(raw) < 16 {
+	if len(raw) < cueHeaderLen {
 		return nil, fmt.Errorf("%w: header truncated (%d bytes)", errBadCue, len(raw))
 	}
-	if !bytes.Equal(raw[0:4], cueMagic[:]) {
+	if !bytes.Equal(raw[0:3], cueMagicPrefix[:]) {
 		return nil, fmt.Errorf("%w: bad magic", errBadCue)
+	}
+	version := raw[3]
+	if version != cueVersion1 && version != cueVersion2 {
+		return nil, fmt.Errorf("%w: unsupported format version %d", errBadCue, version)
 	}
 	if got := int(raw[4]); got != hashLen {
 		return nil, fmt.Errorf("%w: hash width %d, want %d", errBadCue, got, hashLen)
 	}
-	if raw[5] != 0 || raw[6] != 0 || raw[7] != 0 {
+	if raw[6] != 0 || raw[7] != 0 {
 		return nil, fmt.Errorf("%w: reserved bytes not zero", errBadCue)
 	}
 
-	count := binary.BigEndian.Uint64(raw[8:16])
+	count := binary.BigEndian.Uint64(raw[8:cueHeaderLen])
+	if count > uint64(len(raw)) {
+		// Cheap guard before any allocation sized by count: even a
+		// one-byte-per-record format could not fit this many.
+		return nil, fmt.Errorf("%w: %d records cannot fit in %d bytes", errBadCue, count, len(raw))
+	}
+
+	if version == cueVersion1 {
+		if raw[cueRecCodecOff] != 0 {
+			return nil, fmt.Errorf("%w: reserved bytes not zero", errBadCue)
+		}
+		return parseCueV1(hashLen, raw, int(count))
+	}
+	return parseCueV2(hashLen, raw, int(count))
+}
+
+// parseCueV1 reads the original fixed-width layout: one hashLen+17-byte record
+// per entry, holding hash, type, offset, and length. A v1 payload is raw by
+// definition, so stored == raw and the codec is codecRaw.
+func parseCueV1(hashLen int, raw []byte, count int) ([]cueRecord, error) {
 	recWidth := hashLen + 17
-	if want := 16 + int(count)*recWidth; want != len(raw) {
+	if want := cueHeaderLen + count*recWidth; want != len(raw) {
 		return nil, fmt.Errorf("%w: length %d disagrees with %d records (want %d)", errBadCue, len(raw), count, want)
 	}
 
 	recs := make([]cueRecord, 0, count)
-	off := 16
-	for i := uint64(0); i < count; i++ {
+	off := cueHeaderLen
+	for i := 0; i < count; i++ {
 		h, ok := plumbing.FromBytes(raw[off : off+hashLen])
 		if !ok {
 			return nil, fmt.Errorf("%w: record %d has an unreadable hash", errBadCue, i)
 		}
-		typ := plumbing.ObjectType(int8(raw[off+hashLen]))
-		offset := int64(binary.BigEndian.Uint64(raw[off+hashLen+1 : off+hashLen+9]))
-		length := int64(binary.BigEndian.Uint64(raw[off+hashLen+9 : off+hashLen+17]))
-		recs = append(recs, cueRecord{hash: h, typ: typ, offset: offset, length: length})
+		size := int64(binary.BigEndian.Uint64(raw[off+hashLen+9 : off+hashLen+17]))
+		recs = append(recs, cueRecord{
+			hash:   h,
+			typ:    plumbing.ObjectType(int8(raw[off+hashLen])),
+			codec:  codecRaw,
+			offset: int64(binary.BigEndian.Uint64(raw[off+hashLen+1 : off+hashLen+9])),
+			stored: size,
+			raw:    size,
+		})
 		off += recWidth
 	}
 	return recs, nil
 }
 
+// parseCueV2 reads the columnar block, decompressing it first when the header
+// says it is zstd. The decompressed length taking the place of v1's
+// length-versus-count check is what catches a truncated or lying index.
+func parseCueV2(hashLen int, rawCue []byte, count int) ([]cueRecord, error) {
+	block := rawCue[cueHeaderLen:]
+
+	switch codec := rawCue[cueRecCodecOff]; codec {
+	case codecRaw:
+	case codecZstd:
+		out, err := cueDecoder().DecodeAll(block, nil)
+		if err != nil {
+			return nil, fmt.Errorf("%w: record block does not decompress: %w", errBadCue, err)
+		}
+		block = out
+	default:
+		return nil, fmt.Errorf("%w: unknown record block codec %d", errBadCue, codec)
+	}
+
+	if want := count * cueRecWidth(hashLen); want != len(block) {
+		return nil, fmt.Errorf("%w: record block is %d bytes, but %d records need %d", errBadCue, len(block), count, want)
+	}
+
+	// Column bases, in the order encodeCue wrote them.
+	hashes := block
+	types := hashes[count*hashLen:]
+	codecs := types[count:]
+	offsets := codecs[count:]
+	storeds := offsets[count*8:]
+	raws := storeds[count*8:]
+
+	recs := make([]cueRecord, 0, count)
+	for i := 0; i < count; i++ {
+		h, ok := plumbing.FromBytes(hashes[i*hashLen : (i+1)*hashLen])
+		if !ok {
+			return nil, fmt.Errorf("%w: record %d has an unreadable hash", errBadCue, i)
+		}
+		codec := codecs[i]
+		if codec != codecRaw && codec != codecZstd {
+			return nil, fmt.Errorf("%w: record %d has unknown payload codec %d", errBadCue, i, codec)
+		}
+		recs = append(recs, cueRecord{
+			hash:   h,
+			typ:    plumbing.ObjectType(int8(types[i])),
+			codec:  codec,
+			offset: int64(binary.BigEndian.Uint64(offsets[i*8:])),
+			stored: int64(binary.BigEndian.Uint64(storeds[i*8:])),
+			raw:    int64(binary.BigEndian.Uint64(raws[i*8:])),
+		})
+	}
+	return recs, nil
+}
+
 // packEntry is what the in-memory index keeps per object: which pack it's
-// in and where.
+// in, where, and how its bytes are encoded there.
+//
+// raw keeps the meaning the old single length field had — the git object's
+// size — so every caller outside this file is unaffected. stored is the byte
+// span to fetch, and is the only length a ranged GetObject may use.
 type packEntry struct {
 	id     string
 	typ    plumbing.ObjectType
+	codec  uint8
 	offset int64
-	length int64
+	stored int64
+	raw    int64
+}
+
+// indexRecords folds one pack's cue records into the entry map, returning the
+// .bin's total length. Shared by register (a pack this instance just staged)
+// and ensurePacksBuilt (a pack listed out of the bucket) so the two can never
+// disagree about what an entry means. Callers hold p.mu.
+func (p *packIndex) indexRecords(id string, recs []cueRecord) int64 {
+	var size int64
+	for _, r := range recs {
+		p.entries[r.hash] = packEntry{
+			id:     id,
+			typ:    r.typ,
+			codec:  r.codec,
+			offset: r.offset,
+			stored: r.stored,
+			raw:    r.raw,
+		}
+		if end := r.offset + r.stored; end > size {
+			size = end
+		}
+	}
+	return size
 }
 
 // packedEntry pairs a hash with its packEntry, for iteration (a map alone
@@ -185,14 +353,7 @@ func newPackIndex() *packIndex {
 func (p *packIndex) register(id string, recs []cueRecord, localBin string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	var size int64
-	for _, r := range recs {
-		p.entries[r.hash] = packEntry{id: id, typ: r.typ, offset: r.offset, length: r.length}
-		if end := r.offset + r.length; end > size {
-			size = end
-		}
-	}
-	p.sizes[id] = size
+	p.sizes[id] = p.indexRecords(id, recs)
 	p.local[id] = localBin
 }
 
@@ -332,14 +493,7 @@ func (s *Storer) ensurePacksBuilt() error {
 		return nil // lost a race with a concurrent cold build on this instance
 	}
 	for id, recs := range byID {
-		var size int64
-		for _, r := range recs {
-			s.packs.entries[r.hash] = packEntry{id: id, typ: r.typ, offset: r.offset, length: r.length}
-			if end := r.offset + r.length; end > size {
-				size = end
-			}
-		}
-		s.packs.sizes[id] = size
+		s.packs.sizes[id] = s.packs.indexRecords(id, recs)
 	}
 	s.packs.built = true
 	return nil
@@ -464,14 +618,15 @@ func (s *Storer) streamPack(id string) func(w io.Writer) error {
 // already-bulk-downloaded local copy, triggering a bulk download on the read
 // that crosses packBulkFetchThreshold, or — the common case below that
 // threshold — a single ranged GetObject straight into the object's byte
-// range. Every tier decodes through decodeBody (objects.go).
+// range. Every tier fetches e.stored bytes and decodes through decodePacked,
+// which is what makes a compressed payload invisible to callers.
 func (s *Storer) packObject(t plumbing.ObjectType, h plumbing.Hash, e packEntry) (plumbing.EncodedObject, error) {
 	if t != plumbing.AnyObject && e.typ != t {
 		return nil, plumbing.ErrObjectNotFound
 	}
-	hs := objHead{typ: e.typ, size: e.length}
+	hs := objHead{typ: e.typ, size: e.raw}
 
-	if e.length == 0 {
+	if e.stored == 0 {
 		obj := plumbing.NewMemoryObject(s.oh)
 		obj.SetType(e.typ)
 		obj.SetSize(0)
@@ -482,7 +637,7 @@ func (s *Storer) packObject(t plumbing.ObjectType, h plumbing.Hash, e packEntry)
 		f, err := os.Open(path)
 		if err == nil {
 			defer f.Close()
-			return s.decodeBody(h, hs, io.NewSectionReader(f, e.offset, e.length))
+			return s.decodePacked(h, hs, e.codec, io.NewSectionReader(f, e.offset, e.stored))
 		}
 		// os.ErrNotExist: evicted underneath us (the upload just finished);
 		// fall through to the tiers below — S3 now has it.
@@ -491,13 +646,13 @@ func (s *Storer) packObject(t plumbing.ObjectType, h plumbing.Hash, e packEntry)
 	}
 
 	if f, ok := s.packs.bulkCopy(e.id); ok {
-		return s.decodeBody(h, hs, io.NewSectionReader(f, e.offset, e.length))
+		return s.decodePacked(h, hs, e.codec, io.NewSectionReader(f, e.offset, e.stored))
 	}
 
 	if s.packs.recordAccess(e.id, h) {
 		f, err := s.downloadPack(e.id)
 		if err == nil {
-			return s.decodeBody(h, hs, io.NewSectionReader(f, e.offset, e.length))
+			return s.decodePacked(h, hs, e.codec, io.NewSectionReader(f, e.offset, e.stored))
 		}
 		// Sticky failure: degrade to the ranged GET below rather than fail
 		// the read outright.
@@ -508,7 +663,7 @@ func (s *Storer) packObject(t plumbing.ObjectType, h plumbing.Hash, e packEntry)
 	out, err := s.client.GetObject(s.ctx, &s3.GetObjectInput{
 		Bucket: sp(s.bucket),
 		Key:    sp(s.prefix + packPrefix + e.id + binSuffix),
-		Range:  sp(fmt.Sprintf("bytes=%d-%d", e.offset, e.offset+e.length-1)),
+		Range:  sp(fmt.Sprintf("bytes=%d-%d", e.offset, e.offset+e.stored-1)),
 	})
 	s.observe("GetObject", start, err)
 	switch {
@@ -520,5 +675,5 @@ func (s *Storer) packObject(t plumbing.ObjectType, h plumbing.Hash, e packEntry)
 	}
 	defer out.Body.Close()
 
-	return s.decodeBody(h, hs, out.Body)
+	return s.decodePacked(h, hs, e.codec, out.Body)
 }

@@ -123,15 +123,21 @@ the pack and resolves every delta for us. `IterEncodedObjects` then hands back
 full objects and never deltas, so this package holds no pack-parsing code.
 
 The walk copies each object into a flat `packs/<id>.bin`, and one record into
-`packs/<id>.cue`. A record holds the hash, the type, the offset, and the
-length. `<id>` is the hex SHA-256 of the `.bin`, so the name doubles as a
-checksum. Both files upload through the same uploader as loose objects, so the
-existing `SetReference` flush covers them.
+`packs/<id>.cue`. A record holds the hash, the type, the payload codec, the
+offset, the stored length, and the raw size. `<id>` is the hex SHA-256 of the
+`.bin`, so the name doubles as a checksum. Both files upload through the same
+uploader as loose objects, so the existing `SetReference` flush covers them.
+
+An object of 2 KiB or more is stored as one zstd frame when that frame is
+smaller by at least 64 bytes. Smaller objects are always raw. One frame for
+each object is what keeps a packed read one ranged GET. See
+[the backend reference](../reference/tigris-backend.md#payload-compression)
+for the size bands and the measurements behind them.
 
 Two caps bound one container, and the walk seals on the first one it reaches:
 
 - `maxPackObjects` (1<<15), the object count.
-- `maxPackBytes` (128 MiB), the payload size.
+- `maxPackBytes` (128 MiB), the stored payload size.
 
 The walk opens the next container lazily, on the next object. A push that
 divides exactly by a cap therefore leaves no empty trailing container. A huge
@@ -170,8 +176,9 @@ Reads check three tiers, in this order:
 The pack index is built once for each `Storer`, from the `packs/*.cue` files.
 Those files are small, and no `.bin` body is read to build it.
 
-A packed read is one ranged `GetObject`. The payload is raw, so there is
-nothing to reconstruct.
+A packed read is one ranged `GetObject` over the record's `stored` span. There
+is no delta chain to reconstruct. When the record names the zstd codec, the
+read decompresses one frame; otherwise the bytes are already the object.
 
 After one `Storer` reads more than 32 **distinct** objects from one pack
 (`packBulkFetchThreshold`), it downloads that whole `.bin` once. It then
