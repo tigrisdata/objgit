@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 // PackCache materializes whole pack .bin containers as local files under one
@@ -96,7 +98,12 @@ func (c *PackCache) Get(id string, fetch func(io.Writer) error) (*os.File, error
 	for try := 0; try < 3; try++ {
 		e, mine := c.claim(id)
 		if mine {
+			slog.Debug("pack not cached, downloading", "pack", id, "try", try)
 			c.fill(e, fetch)
+		} else {
+			// Either a settled entry or a download another caller is already
+			// running; both mean this caller downloads nothing.
+			slog.Debug("pack served from cache", "pack", id, "path", e.path)
 		}
 		<-e.ready
 		if e.err != nil {
@@ -110,6 +117,7 @@ func (c *PackCache) Get(id string, fetch func(io.Writer) error) (*os.File, error
 		case errors.Is(err, os.ErrNotExist):
 			// Evicted between the lookup and the open. Forget this entry and
 			// go round again, which re-downloads it.
+			slog.Debug("cached pack vanished before it could be opened, retrying", "pack", id, "try", try)
 			c.forget(e)
 		default:
 			return nil, fmt.Errorf("tigris: open cached pack %s: %w", id, err)
@@ -159,11 +167,14 @@ func (c *PackCache) forget(e *cacheEntry) {
 func (c *PackCache) fill(e *cacheEntry, fetch func(io.Writer) error) {
 	defer close(e.ready)
 
+	start := time.Now()
+
 	// Same directory as the final path, so the rename below cannot cross a
 	// filesystem boundary.
 	tmp, err := os.CreateTemp(c.dir, "download-*")
 	if err != nil {
 		e.err = fmt.Errorf("tigris: stage pack %s: %w", e.id, err)
+		slog.Debug("pack download failed", "pack", e.id, "err", e.err)
 		c.forget(e)
 		return
 	}
@@ -178,6 +189,7 @@ func (c *PackCache) fill(e *cacheEntry, fetch func(io.Writer) error) {
 	if err != nil {
 		os.Remove(tmp.Name())
 		e.err = err
+		slog.Debug("pack download failed", "pack", e.id, "dur", time.Since(start), "err", err)
 		c.forget(e)
 		return
 	}
@@ -185,6 +197,13 @@ func (c *PackCache) fill(e *cacheEntry, fetch func(io.Writer) error) {
 	c.mu.Lock()
 	e.size = size
 	c.cur += size
+	slog.Debug("pack cached",
+		"pack", e.id,
+		"bytes", size,
+		"dur", time.Since(start),
+		"cache_bytes", c.cur,
+		"cache_max_bytes", c.maxBytes,
+		"cache_packs", len(c.entries))
 	c.evictLocked(e.id)
 	c.mu.Unlock()
 }
@@ -211,13 +230,23 @@ func (c *PackCache) evictLocked(keep string) {
 			}
 		}
 		if victim == nil {
-			return // nothing evictable left; the survivors are all in use
+			// nothing evictable left; the survivors are all in use
+			slog.Debug("pack cache over budget with nothing evictable",
+				"cache_bytes", c.cur, "cache_max_bytes", c.maxBytes, "cache_packs", len(c.entries))
+			return
 		}
 		delete(c.entries, victim.id)
 		c.cur -= victim.size
 		// Open descriptors survive the unlink and keep serving reads; the disk
 		// space comes back when the last one closes.
 		os.Remove(victim.path)
+		slog.Debug("pack uncached",
+			"pack", victim.id,
+			"bytes", victim.size,
+			"admitted", keep,
+			"cache_bytes", c.cur,
+			"cache_max_bytes", c.maxBytes,
+			"cache_packs", len(c.entries))
 	}
 }
 

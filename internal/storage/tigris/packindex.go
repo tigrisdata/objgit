@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"runtime"
 	"sort"
@@ -363,6 +364,8 @@ func (s *Storer) packLookup(h plumbing.Hash) (packEntry, bool, error) {
 func (s *Storer) downloadPack(id string) (*os.File, error) {
 	a := s.packs.getAccess(id)
 	a.once.Do(func() {
+		slog.Debug("pack read threshold crossed, bulk-fetching pack",
+			"pack", id, "threshold", packBulkFetchThreshold, "prefix", s.prefix)
 		a.f, a.err = s.fetchWholePack(id)
 	})
 	return a.f, a.err
@@ -408,6 +411,8 @@ func (s *Storer) openWholePack(id string) (*os.File, error) {
 		return s.cache.Get(id, s.streamPack(id))
 	}
 
+	slog.Debug("no pack cache installed, downloading pack to a private temp file", "pack", id)
+
 	f, err := os.CreateTemp("", "objgit-tigris-bulk-*")
 	if err != nil {
 		return nil, fmt.Errorf("tigris: create bulk-download temp file: %w", err)
@@ -429,20 +434,27 @@ func (s *Storer) openWholePack(id string) (*os.File, error) {
 // in the shape PackCache.Get and verifiedCopy both consume.
 func (s *Storer) streamPack(id string) func(w io.Writer) error {
 	return func(w io.Writer) error {
+		key := s.prefix + packPrefix + id + binSuffix
+		slog.Debug("fetching whole pack", "pack", id, "bucket", s.bucket, "key", key)
+
 		start := time.Now()
 		out, err := s.client.GetObject(s.ctx, &s3.GetObjectInput{
 			Bucket: sp(s.bucket),
-			Key:    sp(s.prefix + packPrefix + id + binSuffix),
+			Key:    sp(key),
 		})
 		s.observe("GetObject", start, err)
 		if err != nil {
+			slog.Debug("fetching whole pack failed", "pack", id, "key", key, "dur", time.Since(start), "err", err)
 			return fmt.Errorf("tigris: download pack %s: %w", id, err)
 		}
 		defer out.Body.Close()
 
-		if _, err := io.Copy(w, out.Body); err != nil {
+		n, err := io.Copy(w, out.Body)
+		if err != nil {
+			slog.Debug("fetching whole pack failed", "pack", id, "key", key, "bytes", n, "dur", time.Since(start), "err", err)
 			return fmt.Errorf("tigris: download pack %s: %w", id, err)
 		}
+		slog.Debug("fetched whole pack", "pack", id, "key", key, "bytes", n, "dur", time.Since(start))
 		return nil
 	}
 }
@@ -467,12 +479,15 @@ func (s *Storer) packObject(t plumbing.ObjectType, h plumbing.Hash, e packEntry)
 	}
 
 	if path, ok := s.packs.localPath(e.id); ok {
-		if f, err := os.Open(path); err == nil {
+		f, err := os.Open(path)
+		if err == nil {
 			defer f.Close()
 			return s.decodeBody(h, hs, io.NewSectionReader(f, e.offset, e.length))
 		}
 		// os.ErrNotExist: evicted underneath us (the upload just finished);
 		// fall through to the tiers below — S3 now has it.
+		slog.Debug("staged pack no longer on disk, reading from the bucket",
+			"pack", e.id, "path", path, "err", err)
 	}
 
 	if f, ok := s.packs.bulkCopy(e.id); ok {
@@ -480,11 +495,13 @@ func (s *Storer) packObject(t plumbing.ObjectType, h plumbing.Hash, e packEntry)
 	}
 
 	if s.packs.recordAccess(e.id, h) {
-		if f, err := s.downloadPack(e.id); err == nil {
+		f, err := s.downloadPack(e.id)
+		if err == nil {
 			return s.decodeBody(h, hs, io.NewSectionReader(f, e.offset, e.length))
 		}
 		// Sticky failure: degrade to the ranged GET below rather than fail
 		// the read outright.
+		slog.Debug("bulk pack fetch unavailable, falling back to ranged reads", "pack", e.id, "err", err)
 	}
 
 	start := time.Now()
