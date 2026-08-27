@@ -47,31 +47,69 @@ func (s *Storer) listKeys(prefix string) ([]string, error) {
 	return keys, nil
 }
 
-// objectIter resolves keys one HEAD at a time. Laziness buys the cost profile
-// the spec asks for: type mismatches cost a HEAD, never a body download.
+// objectIter walks packed objects first — one whole pack at a time, in offset
+// order, as snapshotEntries hands them over — then resolves loose keys one HEAD
+// at a time. Laziness buys the cost profile the spec asks for: type mismatches
+// cost a HEAD, never a body download; a pack with more than
+// packBulkFetchThreshold objects self-converts to one bulk download partway
+// through (see packObject) instead of one ranged GET per object — exactly the
+// clone/fetch case that threshold exists for.
 type objectIter struct {
-	s    *Storer
-	want plumbing.ObjectType
-	keys []string
-	pos  int
+	s      *Storer
+	want   plumbing.ObjectType
+	packed []packedEntry
+	ppos   int
+	keys   []string
+	pos    int
+	seen   map[plumbing.Hash]struct{} // packed hashes already yielded, so the loose walk can skip duplicates
 }
 
 func (s *Storer) IterEncodedObjects(t plumbing.ObjectType) (storer.EncodedObjectIter, error) {
-	keys, err := s.listKeys(objectPrefix)
+	if err := s.ensurePacksBuilt(); err != nil {
+		return nil, err
+	}
+	packed := s.packs.snapshotEntries()
+
+	keys, err := s.listKeys(s.prefix + objectPrefix)
 	if err != nil {
 		return nil, err
 	}
-	return &objectIter{s: s, want: t, keys: keys}, nil
+	return &objectIter{s: s, want: t, packed: packed, keys: keys, seen: make(map[plumbing.Hash]struct{}, len(packed))}, nil
 }
 
 func (it *objectIter) Next() (plumbing.EncodedObject, error) {
+	for it.ppos < len(it.packed) {
+		pe := it.packed[it.ppos]
+		it.ppos++
+
+		if _, dup := it.seen[pe.hash]; dup {
+			continue
+		}
+		it.seen[pe.hash] = struct{}{}
+
+		if it.want != plumbing.AnyObject && pe.e.typ != it.want {
+			continue
+		}
+		obj, err := it.s.packObject(it.want, pe.hash, pe.e)
+		if errors.Is(err, plumbing.ErrObjectNotFound) {
+			continue // pack vanished between the index build and this read: tolerate, like the loose race below
+		}
+		if err != nil {
+			return nil, err
+		}
+		return obj, nil
+	}
+
 	for it.pos < len(it.keys) {
-		raw := strings.TrimPrefix(it.keys[it.pos], objectPrefix)
+		raw := strings.TrimPrefix(it.keys[it.pos], it.s.prefix+objectPrefix)
 		it.pos++
 
 		h, ok := plumbing.FromHex(raw)
 		if !ok {
 			continue // junk under objects/: skip, never poison the walk
+		}
+		if _, dup := it.seen[h]; dup {
+			continue // already yielded from a pack
 		}
 
 		hs, herr := it.s.headInfo(h)
@@ -113,5 +151,6 @@ func (it *objectIter) ForEach(cb func(plumbing.EncodedObject) error) error {
 }
 
 func (it *objectIter) Close() {
+	it.ppos = len(it.packed)
 	it.pos = len(it.keys)
 }

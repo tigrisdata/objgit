@@ -1,16 +1,21 @@
 // Package tigris implements github.com/go-git/go-git/v6/storage.Storer on top
-// of one Tigris bucket per repository. See docs/plans/tigris-gogit-storer.md
-// and docs/reference/tigris-backend.md for the design.
+// of one Tigris bucket, optionally shared by many repositories via a key
+// prefix. See docs/plans/tigris-gogit-storer.md and
+// docs/reference/tigris-backend.md for the design.
 //
-// Layout in the bucket:
+// Layout in the bucket (all keys additionally rooted under an optional
+// per-Storer prefix — see Scoped):
 //
-//	objects/<hex>   loose object keyed by content hash; user metadata carries
-//	                the git type (git-type) and size (git-size)
-//	refs/<name>     one loose ref (hash hex, or "ref: target" for symbolics)
-//	shallow         newline separated commit hashes
-//	index           plumbing/format/index-encoded worktree index
-//	config          config.Config.Marshal output
-//	packs/          reserved for packfiles (future work)
+//	objects/<hex>       loose object keyed by content hash; user metadata
+//	                    carries the git type (git-type) and size (git-size)
+//	refs/<name>         one loose ref (hash hex, or "ref: target" for symbolics)
+//	shallow             newline separated commit hashes
+//	index               plumbing/format/index-encoded worktree index
+//	config              config.Config.Marshal output
+//	packs/<id>.bin      up to maxPackObjects objects, concatenated raw bytes
+//	                    (one push writes as many containers as it needs)
+//	packs/<id>.cue      that pack's index (hash, type, offset, length per
+//	                    object) — see packindex.go for the binary format
 //
 // Methods hold no per-call state on the Storer, so a Storer value is safe for
 // concurrent use.
@@ -20,6 +25,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -75,10 +81,15 @@ type s3API interface {
 type Storer struct {
 	client   s3API
 	bucket   string
+	prefix   string          // key prefix scoping this Storer to one repository; see Scoped
 	ctx      context.Context // request-context slot inherited by every operation
 	of       formatcfg.ObjectFormat
 	oh       *plumbing.ObjectHasher
 	observer func(operation string, dur time.Duration, err error)
+	up       *uploader  // batches loose-object PutObject calls off of Close; see upload.go
+	packs    *packIndex // pack containers this Storer knows about; see packindex.go
+	cache    *PackCache // optional process-wide local pack cache; see packcache.go
+	maxPack  int        // objects per written pack container; see maxPackObjects
 }
 
 // Option configures a Storer at construction time.
@@ -100,16 +111,34 @@ func WithObserver(fn func(operation string, dur time.Duration, err error)) Optio
 	return func(s *Storer) { s.observer = fn }
 }
 
+// WithPackCache installs a local pack cache shared by this Storer and every
+// Storer that Scoped derives from it. Without one, a Storer that bulk-fetches
+// a pack drops the copy when it goes out of scope, so the next request
+// downloads it again; with one, the copy survives on disk under a byte budget
+// and every later request opens it locally. Pass a single cache built once per
+// process — see NewPackCache.
+func WithPackCache(c *PackCache) Option {
+	return func(s *Storer) { s.cache = c }
+}
+
 func withClient(c s3API) Option {
 	return func(s *Storer) { s.client = c }
+}
+
+// withMaxPackObjects lowers the per-container object cap from maxPackObjects.
+// Test-only: it exists so the write-side split can be exercised without a
+// 32768-object git fixture.
+func withMaxPackObjects(n int) Option {
+	return func(s *Storer) { s.maxPack = n }
 }
 
 // New returns a Storer owning one whole bucket. ctx bounds every request this
 // storer issues.
 func New(ctx context.Context, bucket string, opts ...Option) (*Storer, error) {
 	s := &Storer{
-		ctx: ctx,
-		of:  formatcfg.DefaultObjectFormat,
+		ctx:     ctx,
+		of:      formatcfg.DefaultObjectFormat,
+		maxPack: maxPackObjects,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -126,11 +155,41 @@ func New(ctx context.Context, bucket string, opts ...Option) (*Storer, error) {
 		}
 		s.client = c
 	}
+	s.up = newUploader(s)
+	s.packs = newPackIndex()
 	return s, nil
 }
 
 // Compile-time proof the storer covers the whole surface.
 var _ storer.Storer = (*Storer)(nil)
+var _ storer.PackfileWriter = (*Storer)(nil)
+
+// Scoped returns a Storer sharing this Storer's client, bucket, object
+// format, and observer, but addressing keys under an additional prefix —
+// letting one bucket host many repositories, each reached through its own
+// Storer value. Prefixes nest: scoping an already-scoped Storer extends its
+// existing prefix. Cheap: it copies the Storer value and dials nothing.
+//
+// The returned Storer gets its own uploader and pack index (see upload.go,
+// packindex.go), independent of s's: one repository's push, pending/failed
+// uploads, or pack read history can never block or leak into another's. The
+// pack cache is the deliberate exception — it is shared, because sharing
+// downloaded packs across requests is the whole point of it, and its keys are
+// content hashes, so a hit is always the exact bytes the caller named.
+func (s *Storer) Scoped(prefix string) *Storer {
+	cp := *s
+	prefix = strings.Trim(prefix, "/")
+	switch {
+	case prefix == "":
+	case cp.prefix == "":
+		cp.prefix = prefix + "/"
+	default:
+		cp.prefix = strings.TrimSuffix(cp.prefix, "/") + "/" + prefix + "/"
+	}
+	cp.up = newUploader(&cp)
+	cp.packs = newPackIndex()
+	return &cp
+}
 
 func (s *Storer) observe(op string, start time.Time, err error) {
 	if s.observer != nil {

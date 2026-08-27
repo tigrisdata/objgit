@@ -42,14 +42,20 @@ func decodeRefValue(name plumbing.ReferenceName, v string) (*plumbing.Reference,
 	return plumbing.NewHashReference(name, h), nil
 }
 
+// SetReference flushes every upload queued through this Storer before writing
+// the ref, so a ref can never point at an object that failed — or hasn't yet
+// finished — its asynchronous upload (see upload.go).
 func (s *Storer) SetReference(ref *plumbing.Reference) error {
 	if ref == nil {
 		return nil // tolerated identically by the in-memory storer
 	}
+	if err := s.up.flush(); err != nil {
+		return fmt.Errorf("tigris: set ref %s: %w", ref.Name().String(), err)
+	}
 	start := time.Now()
 	_, err := s.client.PutObject(s.ctx, &s3.PutObjectInput{
 		Bucket: sp(s.bucket),
-		Key:    sp(refKey(ref.Name())),
+		Key:    sp(s.prefix + refKey(ref.Name())),
 		Body:   strings.NewReader(encodeRefValue(ref)),
 	})
 	s.observe("PutObject", start, err)
@@ -75,7 +81,7 @@ func (s *Storer) CheckAndSetReference(newRef, old *plumbing.Reference) error {
 }
 
 func (s *Storer) Reference(n plumbing.ReferenceName) (*plumbing.Reference, error) {
-	body, err := s.fetchSmall(refKey(n))
+	body, err := s.fetchSmall(s.prefix + refKey(n))
 	switch {
 	case err == nil:
 	case errors.Is(err, plumbing.ErrObjectNotFound):
@@ -95,14 +101,14 @@ func (s *Storer) Reference(n plumbing.ReferenceName) (*plumbing.Reference, error
 // CountLooseRefs, so the two can never disagree. Malformed entries log-and-
 // skip; vanished-mid-list keys behave like the object iterator's race rule.
 func (s *Storer) listLooseRefs() ([]*plumbing.Reference, error) {
-	keys, err := s.listKeys(refPrefix)
+	keys, err := s.listKeys(s.prefix + refPrefix)
 	if err != nil {
 		return nil, err
 	}
 
 	var refs []*plumbing.Reference
 	for _, k := range keys {
-		name := plumbing.ReferenceName(strings.TrimPrefix(k, refPrefix))
+		name := plumbing.ReferenceName(strings.TrimPrefix(k, s.prefix+refPrefix))
 
 		ref, rerr := s.Reference(name)
 		switch {
@@ -129,7 +135,7 @@ func (s *Storer) IterReferences() (storer.ReferenceIter, error) {
 }
 
 func (s *Storer) RemoveReference(n plumbing.ReferenceName) error {
-	if err := s.removeSimple(refKey(n)); err != nil {
+	if err := s.removeSimple(s.prefix + refKey(n)); err != nil {
 		return fmt.Errorf("tigris: remove ref %s: %w", n.String(), err)
 	}
 	return nil
@@ -153,7 +159,7 @@ func (s *Storer) PackRefs() error {
 
 func (s *Storer) SetShallow(commits []plumbing.Hash) error {
 	if len(commits) == 0 {
-		return s.removeSimple(shallowKey)
+		return s.removeSimple(s.prefix + shallowKey)
 	}
 	var b strings.Builder
 	for _, c := range commits {
@@ -163,7 +169,7 @@ func (s *Storer) SetShallow(commits []plumbing.Hash) error {
 	start := time.Now()
 	_, err := s.client.PutObject(s.ctx, &s3.PutObjectInput{
 		Bucket: sp(s.bucket),
-		Key:    sp(shallowKey),
+		Key:    sp(s.prefix + shallowKey),
 		Body:   strings.NewReader(b.String()),
 	})
 	s.observe("PutObject", start, err)
@@ -174,7 +180,7 @@ func (s *Storer) SetShallow(commits []plumbing.Hash) error {
 }
 
 func (s *Storer) Shallow() ([]plumbing.Hash, error) {
-	body, err := s.fetchSmall(shallowKey)
+	body, err := s.fetchSmall(s.prefix + shallowKey)
 	switch {
 	case err == nil:
 	case errors.Is(err, plumbing.ErrObjectNotFound):

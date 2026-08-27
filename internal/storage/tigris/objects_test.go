@@ -5,6 +5,7 @@ import (
 	"io"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/aws/smithy-go"
 	"github.com/go-git/go-git/v6/plumbing"
@@ -191,6 +192,28 @@ func TestEncodedObjectRoundTrip(t *testing.T) {
 			t.Errorf("want ErrObjectNotFound, got %v", err)
 		}
 	})
+}
+
+func TestEncodedObjectSkipsHeadObject(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeS3(t)
+	h := seed(t, f, formatcfg.DefaultObjectFormat, plumbing.BlobObject, "no head needed")
+
+	seen := map[string]int{}
+	s := newTestStorer(t, f, WithObserver(func(op string, _ time.Duration, _ error) {
+		seen[op]++
+	}))
+
+	if _, err := s.EncodedObject(plumbing.AnyObject, h); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := seen["HeadObject"]; got != 0 {
+		t.Errorf("EncodedObject issued %d HeadObject calls, want 0 (map: %v)", got, seen)
+	}
+	if got := seen["GetObject"]; got != 1 {
+		t.Errorf("EncodedObject issued %d GetObject calls, want 1 (map: %v)", got, seen)
+	}
 }
 
 func TestEncodedObjectRejectsDeltaTypes(t *testing.T) {

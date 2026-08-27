@@ -10,7 +10,7 @@ import (
 )
 
 func (s *Storer) Config() (*config.Config, error) {
-	raw, err := s.fetchSmall(configKey)
+	raw, err := s.fetchSmall(s.prefix + configKey)
 	switch {
 	case err == nil:
 	case errors.Is(err, plumbing.ErrObjectNotFound):
@@ -34,7 +34,7 @@ func (s *Storer) SetConfig(cfg *config.Config) error {
 	if err != nil {
 		return fmt.Errorf("tigris: marshal config: %w", err)
 	}
-	if err := s.putBytes(configKey, raw); err != nil {
+	if err := s.putBytes(s.prefix+configKey, raw); err != nil {
 		return fmt.Errorf("tigris: store config: %w", err)
 	}
 	return nil

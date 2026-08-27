@@ -5,17 +5,17 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strconv"
-	"time"
 
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/go-git/go-git/v6/plumbing"
 )
 
 // Writer design follows docs/reference/tigris-backend.md "Write path": bytes
 // stream into a local staging file while a hashing tee runs alongside. Close
-// performs the single PUT, named by the freshly computed hash. Upload failures
-// or size disagreements leave the bucket untouched.
+// hands the finished file to the Storer's uploader (upload.go) for an
+// asynchronous PUT named by the freshly computed hash — it does not block on
+// the network. Size disagreements are still caught, and leave the bucket
+// untouched, before that handoff; a later upload failure surfaces from the
+// next SetReference/CheckAndSetReference call, which flushes first.
 type stageWriter struct {
 	s      *Storer
 	f      *os.File
@@ -84,31 +84,36 @@ func (w *stageWriter) Close() error {
 		return nil
 	}
 	w.done = true
-	defer os.Remove(w.f.Name())
-	defer w.f.Close()
 
 	if w.wrote != w.size {
+		w.f.Close()
+		os.Remove(w.f.Name())
 		return fmt.Errorf("tigris: staged %d bytes but declared %d", w.wrote, w.size)
 	}
 
 	h := w.hasher.Sum()
-	if _, err := w.f.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("tigris: rewind staging file: %w", err)
+	if err := w.f.Close(); err != nil {
+		os.Remove(w.f.Name())
+		return fmt.Errorf("tigris: close staging file: %w", err)
 	}
 
-	start := time.Now()
-	_, err := w.s.client.PutObject(w.s.ctx, &s3.PutObjectInput{
-		Bucket: sp(w.s.bucket),
-		Key:    sp(keyOf(h)),
-		Body:   w.f,
-		Metadata: map[string]string{
-			metaType: w.typ.String(),
-			metaSize: strconv.FormatInt(w.wrote, 10),
-		},
-	})
-	w.s.observe("PutObject", start, err)
-	if err != nil {
-		return fmt.Errorf("tigris: upload %s: %w", keyOf(h), err)
+	// The staged file stays right where os.CreateTemp put it — see
+	// looseJob's doc comment for why that path is deliberately not
+	// content-addressed. Reads (headInfo/EncodedObject) and the async
+	// uploader both find it via the pending map, keyed by hash.
+	path := w.f.Name()
+	typ := w.typ.String()
+	w.s.up.registerPending(h, typ, w.wrote, path)
+	job := looseJob{
+		hash: h,
+		key:  w.s.prefix + keyOf(h),
+		typ:  typ,
+		size: w.wrote,
+		path: path,
+	}
+	if err := w.s.up.enqueue(w.s.ctx, job); err != nil {
+		w.s.up.evict(h, path)
+		return err
 	}
 	return nil
 }

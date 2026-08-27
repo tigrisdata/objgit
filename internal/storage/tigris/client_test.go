@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sort"
 	"strconv"
@@ -47,11 +48,16 @@ type fakeS3 struct {
 	delErr  error
 	listErr error
 
+	putDelay time.Duration // artificial latency before PutObject lands, for async-upload tests
+
 	puts    int
 	deletes int
 	listMax int64 // ListObjectsV2 page size knob; 0 = unlimited
 
 	headOverride map[string]*headShape
+
+	rangedGets  int // GetObject calls that carried a Range header
+	fullBinGets int // full (non-ranged) GetObject calls on a pack .bin — i.e. bulk pack downloads
 }
 
 func newFakeS3(t *testing.T) *fakeS3 {
@@ -108,6 +114,21 @@ func (f *fakeS3) ndeletes() int {
 	return f.deletes
 }
 
+func (f *fakeS3) nrangedGets() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rangedGets
+}
+
+// nfullBinGets counts bulk pack downloads: full (non-ranged) GETs of a .bin.
+// Counting all full GETs would also sweep in the cold index build's .cue
+// fetches, which say nothing about the bulk-download threshold.
+func (f *fakeS3) nfullBinGets() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fullBinGets
+}
+
 // hashForBody factors seed's hash computation out for reuse.
 func hashForBody(of formatcfg.ObjectFormat, typ plumbing.ObjectType, body string) plumbing.Hash {
 	obj := plumbing.NewMemoryObject(plumbing.FromObjectFormat(of))
@@ -142,15 +163,51 @@ func (f *fakeS3) GetObject(_ context.Context, p *s3.GetObjectInput, _ ...func(*s
 	if !ok {
 		return nil, missingKeyErr()
 	}
+
+	body := o.body
+	if rng := sv(p.Range); rng != "" {
+		f.rangedGets++
+		start, end, ok := parseByteRange(rng, len(o.body))
+		if !ok {
+			return nil, fmt.Errorf("fake GetObject: bad Range %q", rng)
+		}
+		body = o.body[start : end+1]
+	} else if strings.HasSuffix(sv(p.Key), binSuffix) {
+		f.fullBinGets++
+	}
+
 	out := &s3.GetObjectOutput{
-		ContentLength: ip(int64(len(o.body))),
+		ContentLength: ip(int64(len(body))),
 		Metadata:      o.meta,
 	}
-	out.Body = io.NopCloser(bytes.NewReader(o.body))
+	out.Body = io.NopCloser(bytes.NewReader(body))
 	return out, nil
 }
 
+// parseByteRange parses a single-range "bytes=start-end" header (as
+// internal/storage/tigris always sends) into inclusive start/end offsets
+// clamped to size.
+func parseByteRange(header string, size int) (start, end int, ok bool) {
+	rest, ok := strings.CutPrefix(header, "bytes=")
+	if !ok {
+		return 0, 0, false
+	}
+	parts := strings.SplitN(rest, "-", 2)
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	start, err1 := strconv.Atoi(parts[0])
+	end, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil || start < 0 || end < start || end >= size {
+		return 0, 0, false
+	}
+	return start, end, true
+}
+
 func (f *fakeS3) PutObject(_ context.Context, p *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	if f.putDelay > 0 {
+		time.Sleep(f.putDelay)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.puts++
@@ -301,6 +358,59 @@ func TestNewDialsRealClientWhenNotInjected(t *testing.T) {
 		t.Error("storer built with nil client")
 	case err != nil:
 		t.Logf("dial failure surfaced (fine without credentials): %v", err)
+	}
+}
+
+// TestScopedIsolatesRepositoriesInOneBucket verifies two Scoped storers over
+// the same client/bucket read and write independent data, keyed by prefix.
+func TestScopedIsolatesRepositoriesInOneBucket(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeS3(t)
+	base := newTestStorer(t, f)
+
+	widgets := base.Scoped("acme/widgets")
+	gadgets := base.Scoped("acme/gadgets")
+
+	h := seed(t, f, formatcfg.DefaultObjectFormat, plumbing.BlobObject, "hello")
+	// seed wrote at the unprefixed key; write the same content through each
+	// scoped storer instead, so each lands under its own prefix.
+	wobj := plumbing.NewMemoryObject(plumbing.FromObjectFormat(formatcfg.DefaultObjectFormat))
+	wobj.SetType(plumbing.BlobObject)
+	wobj.SetSize(5)
+	if _, err := wobj.Write([]byte("hello")); err != nil {
+		t.Fatalf("buffer object: %v", err)
+	}
+	if _, err := widgets.SetEncodedObject(wobj); err != nil {
+		t.Fatalf("widgets SetEncodedObject: %v", err)
+	}
+	if err := widgets.up.flush(); err != nil {
+		t.Fatalf("widgets flush: %v", err)
+	}
+
+	if err := widgets.HasEncodedObject(h); err != nil {
+		t.Errorf("widgets should see its own object: %v", err)
+	}
+	if err := gadgets.HasEncodedObject(h); !errors.Is(err, plumbing.ErrObjectNotFound) {
+		t.Errorf("gadgets should not see widgets' object, got: %v", err)
+	}
+
+	if _, ok := f.objs["acme/widgets/"+keyOf(h)]; !ok {
+		t.Errorf("expected key %q in the fake bucket, got keys %v", "acme/widgets/"+keyOf(h), f.objs)
+	}
+}
+
+// TestScopedNestsPrefixes verifies scoping an already-scoped Storer extends
+// its prefix rather than replacing it.
+func TestScopedNestsPrefixes(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeS3(t)
+	base := newTestStorer(t, f)
+
+	nested := base.Scoped("acme").Scoped("widgets")
+	if nested.prefix != "acme/widgets/" {
+		t.Errorf("nested prefix = %q, want %q", nested.prefix, "acme/widgets/")
 	}
 }
 

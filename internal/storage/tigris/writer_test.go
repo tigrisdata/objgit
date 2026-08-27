@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/go-git/go-git/v6/plumbing"
 	formatcfg "github.com/go-git/go-git/v6/plumbing/format/config"
@@ -45,6 +46,12 @@ func TestRawObjectWriterHappyPath(t *testing.T) {
 	}
 	if err := w.Close(); err != nil { // idempotent
 		t.Fatalf("second close: %v", err)
+	}
+	if f.nputs() != 0 {
+		t.Fatalf("uploaded synchronously from Close (%d puts)", f.nputs())
+	}
+	if err := s.up.flush(); err != nil {
+		t.Fatalf("flush: %v", err)
 	}
 	if n := f.nputs(); n != 1 {
 		t.Fatalf("want exactly one upload, saw %d", n)
@@ -166,6 +173,9 @@ func TestRawObjectWriterWriteAfterDiscardPoisonsStream(t *testing.T) {
 	}
 }
 
+// TestStageWriterUploadFailureLeavesNoTrash confirms an asynchronous upload
+// failure surfaces from the next flush (Close itself only enqueues) and still
+// cleans up the staging file.
 func TestStageWriterUploadFailureLeavesNoTrash(t *testing.T) {
 	t.Parallel()
 
@@ -175,7 +185,10 @@ func TestStageWriterUploadFailureLeavesNoTrash(t *testing.T) {
 
 	w := pushThrough(t, s, plumbing.BlobObject, 1, []string{"z"})
 	name := w.f.Name()
-	if err := w.Close(); err == nil {
+	if err := w.Close(); err != nil {
+		t.Fatalf("close should only enqueue, got: %v", err)
+	}
+	if err := s.up.flush(); err == nil {
 		t.Fatal("upload failure swallowed")
 	}
 	if _, err := os.Stat(name); !os.IsNotExist(err) {
@@ -234,6 +247,9 @@ func TestSetEncodedObjectStoresUnderRecomputedHash(t *testing.T) {
 	if got != want {
 		t.Fatalf("returned hash %s differs from recomputed %s", got.String(), want.String())
 	}
+	if err := s.up.flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
 	stored := f.get(t, keyOf(want))
 	if string(stored.body) != body {
 		t.Errorf("body mismatch: %q", stored.body)
@@ -279,6 +295,80 @@ func TestSetEncodedObjectRejectsDeltas(t *testing.T) {
 	delta.SetType(plumbing.OFSDeltaObject)
 	if _, err := s.SetEncodedObject(delta); !errors.Is(err, plumbing.ErrInvalidType) {
 		t.Errorf("delta-set went through: %v", err)
+	}
+}
+
+// TestPendingOverlayServesReadsBeforeUploadLands reproduces the delta-base
+// resolution bug: packfile.UpdateObjectStorage (writePack's fallback for a
+// storer without PackfileWriter) reads back an object it just wrote, within
+// the same push, well before any SetReference flush. With a slow PutObject,
+// EncodedObject/HasEncodedObject must still see it — from the local pending
+// overlay, not S3 — or a real push resolving deltas against its own bases
+// fails with "object not found".
+func TestPendingOverlayServesReadsBeforeUploadLands(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeS3(t)
+	f.putDelay = 50 * time.Millisecond
+	s := newTestStorer(t, f)
+
+	const body = "delta base content"
+	obj := plumbing.NewMemoryObject(s.oh)
+	obj.SetType(plumbing.BlobObject)
+	obj.SetSize(int64(len(body)))
+	if _, err := obj.Write([]byte(body)); err != nil {
+		t.Fatalf("buffer: %v", err)
+	}
+	want := obj.Hash()
+
+	got, err := s.SetEncodedObject(obj)
+	if err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if got != want {
+		t.Fatalf("hash mismatch: got %s want %s", got, want)
+	}
+
+	// The upload is still in flight (putDelay hasn't elapsed): the real
+	// bucket must not have it yet, but reads must still succeed.
+	if f.nputs() != 0 {
+		t.Fatalf("fake bucket already saw the PUT — test no longer exercises the race")
+	}
+	if err := s.HasEncodedObject(want); err != nil {
+		t.Fatalf("HasEncodedObject before upload lands: %v", err)
+	}
+	read, err := s.EncodedObject(plumbing.AnyObject, want)
+	if err != nil {
+		t.Fatalf("EncodedObject before upload lands: %v", err)
+	}
+	rd, err := read.Reader()
+	if err != nil {
+		t.Fatalf("reader: %v", err)
+	}
+	defer rd.Close()
+	gotBody, err := io.ReadAll(rd)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(gotBody) != body {
+		t.Errorf("pending body mismatch: got %q want %q", gotBody, body)
+	}
+
+	pending, ok := s.up.lookupPending(want)
+	if !ok {
+		t.Fatal("expected the object to still be pending before flush")
+	}
+	stagedPath := pending.path
+
+	if err := s.up.flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	// Once flushed (and thus uploaded), the same reads must now come from S3.
+	if err := s.HasEncodedObject(want); err != nil {
+		t.Fatalf("HasEncodedObject after flush: %v", err)
+	}
+	if _, err := os.Stat(stagedPath); !os.IsNotExist(err) {
+		t.Errorf("staged file survived flush: %v", err)
 	}
 }
 

@@ -29,14 +29,14 @@ func (s *Storer) SetIndex(idx *index.Index) error {
 	if err := index.NewEncoder(&buf, s.idxChecksum()).Encode(idx); err != nil {
 		return fmt.Errorf("tigris: encode index: %w", err)
 	}
-	if err := s.putBytes(indexKey, buf.Bytes()); err != nil {
+	if err := s.putBytes(s.prefix+indexKey, buf.Bytes()); err != nil {
 		return fmt.Errorf("tigris: store index: %w", err)
 	}
 	return nil
 }
 
 func (s *Storer) Index() (*index.Index, error) {
-	raw, err := s.fetchSmall(indexKey)
+	raw, err := s.fetchSmall(s.prefix + indexKey)
 	switch {
 	case err == nil:
 	case errors.Is(err, plumbing.ErrObjectNotFound):

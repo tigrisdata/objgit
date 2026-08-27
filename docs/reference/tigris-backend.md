@@ -38,7 +38,8 @@ One bucket holds everything. One S3 object holds one git object.
 
 ```
 objects/<hex>      loose object, keyed by its content hash
-packs/             reserved for packfiles and their indexes
+packs/<id>.bin     up to 32768 objects, raw bytes concatenated
+packs/<id>.cue     that pack's index: hash, type, offset, length
 ```
 
 Layout decisions:
@@ -58,6 +59,149 @@ Writes need no locking or dedup logic. Identical bytes hash to identical
 keys, so concurrent writers of the same object write identical data to
 the same key, and any winner suffices. Conditional writes such as
 `If-None-Match: *` are safe to use but not required for correctness.
+
+## The pack container
+
+A push arrives as one git packfile. This package does not store that
+format. Git packs use delta compression, so one read must resolve a
+chain of deltas. This package stores a flat container instead. One read
+is then one ranged `GetObject`, with no reconstruction step.
+
+A container is two objects:
+
+- `packs/<id>.bin` holds the raw bytes of every object, one after
+  another. The bytes carry no compression and no deltas.
+- `packs/<id>.cue` holds the index. One record gives the hash, the type,
+  the offset, and the length of one object.
+
+A push writes one container, or more than one. One container holds a
+maximum of 32768 objects (`maxPackObjects` in `packindex.go`). A push
+above that limit writes one more container for each further 32768
+objects. The limit applies to writes only. Reads accept a repository
+with any number of containers, and a container with any number of
+objects.
+
+The `<id>` is the hex SHA-256 of the content of the `.bin`. The name is
+therefore a checksum. A reader that downloads a whole `.bin` can verify
+the bytes against the name.
+
+### The write path for packs
+
+`PackfileWriter` writes the incoming pack to a scratch
+`storage/filesystem.Storage` on a local temporary directory. That storer
+decodes the pack and resolves every delta. `IterEncodedObjects` then
+returns full objects, never deltas. This package writes no pack-parsing
+code of its own.
+
+The writer copies each object into the `.bin` and adds one record to the
+`.cue`. It then deletes the scratch directory. The two files upload
+asynchronously. `SetReference` waits for those uploads, so a ref never
+points to a pack that the bucket does not hold.
+
+The writer seals the current container when that container holds 32768
+objects. It then opens the next container for the next object. It opens a
+container only when an object needs one, so a push of an exact multiple
+of 32768 objects writes no empty container. Each sealed container is
+complete on its own: it has its own id, its own `.cue`, and its own
+upload.
+
+An error part way through a large push leaves the sealed containers in
+the bucket. Each one holds real objects and needs no repair. The error
+fails the push, so no ref points into the incomplete set.
+
+### The `.cue` binary format
+
+All integers are big-endian. The header is 16 bytes:
+
+| Offset | Size | Field                                                |
+| ------ | ---- | ---------------------------------------------------- |
+| 0      | 4    | Magic `OGC\x01`. The last byte is the format version |
+| 4      | 1    | Hash width: 20 for SHA-1, 32 for SHA-256             |
+| 5      | 3    | Reserved. Must be zero                               |
+| 8      | 8    | Record count                                         |
+
+One record follows for each object. A record is `hash width + 17` bytes:
+
+| Offset         | Size       | Field                                        |
+| -------------- | ---------- | -------------------------------------------- |
+| 0              | hash width | Object hash, raw bytes                       |
+| hash width     | 1          | Object type: 1 commit, 2 tree, 3 blob, 4 tag |
+| hash width + 1 | 8          | Offset into the `.bin`                       |
+| hash width + 9 | 8          | Length of the object                         |
+
+Records are sorted by hash. The length field is also the size of the git
+object, because the payload is raw.
+
+The parser rejects a bad magic, a hash width that disagrees with the
+repository, a non-zero reserved field, or a length that disagrees with
+the record count. A damaged index gives an error. It never looks like a
+missing object.
+
+### The read path for packs
+
+A read looks in three places, in this order:
+
+1. The local staging file of a push that has not finished its upload.
+2. The pack index, when the object is in a pack.
+3. The loose key `objects/<hex>`.
+
+Each `Storer` builds its pack index one time. The build lists
+`packs/*.cue` and reads each one. These files are small. The build reads
+no `.bin` body.
+
+A read of a packed object sends one ranged `GetObject` into the `.bin`.
+After a `Storer` reads more than 32 different objects from one pack, it
+downloads the whole `.bin` one time. All later reads of that pack use
+the local copy. A clone therefore costs about one large GET for each
+pack, and not one GET for each object.
+
+Iteration returns the packed objects one pack at a time, in offset
+order. A push above the write limit spans several packs, and this order
+keeps one whole-pack copy open at a time instead of one for each pack.
+
+The code verifies the SHA-256 of the copy against the pack name before
+it trusts the bytes.
+
+### The pack cache
+
+One process holds one pack cache. The cache is a local directory that
+keeps whole `.bin` files under a disk budget. Every `Storer` in the
+process shares it, so a second clone of the same repository downloads
+nothing.
+
+The cache keys each file by pack id. That id is the SHA-256 of the
+content, so two repositories that ask for one id ask for the same bytes.
+A shared file is therefore deduplication and not leakage. The cache also
+verifies the digest while the download streams to disk. A hit can only
+be the bytes that the caller named.
+
+The cache owns the file on disk. Each caller owns a separate file
+descriptor. To evict a file, the cache unlinks it. An open descriptor
+outlives the unlink, so a clone that reads a pack does not fail when the
+cache reclaims that pack. The disk space returns when the last reader
+closes. This is also why the code holds no reference counts: the kernel
+holds them.
+
+Eviction is least-recently-used. A read of a cached pack makes that pack
+recent again. The cache admits a pack that is larger than the whole
+budget, because the read must succeed.
+
+Two more properties are deliberate:
+
+- Many concurrent readers cause one download. The cache publishes an
+  entry before the download starts, so a second caller waits instead of
+  starting a second download.
+- The cache does not keep a failed download. The entry goes away, so a
+  later request can try again. The `once` guard in `packindex.go` stops
+  a retry storm inside one request.
+
+Without a cache, a `Storer` puts its copy in a temporary file that the
+code unlinks at once, and the copy dies with the request.
+
+The daemon builds the cache from two flags. `-pack-cache-dir` gives the
+parent directory, and defaults to the OS temporary directory.
+`-pack-cache-bytes` gives the budget, and defaults to 2 GB. A budget of
+`0` disables the cache.
 
 ## Interface map
 
@@ -181,15 +325,26 @@ for a missing key. Absence checks match typed errors such as
 
 ## Build order
 
-1. Implement the `Storer` methods against the `s3API` seam. Run unit
-   tests against a fake client.
-2. Record which error a real bucket returns for a missing key. Fix the
-   absence checks around that fact.
-3. Implement `PackfileWriter`. Without it, every push sends one PUT per
-   object. With it, a push becomes one pack upload plus one index upload.
-4. Load pack indexes into memory at startup. Serve packed objects with
-   ranged `GetObject` requests into the pack.
-5. Switch the payload format to the zlib objfile form from
+Items 1 to 4 and item 6 are complete.
+
+1. **Done.** Implement the `Storer` methods against the `s3API` seam. Run
+   unit tests against a fake client.
+2. **Done.** Record which error a real bucket returns for a missing key.
+   Fix the absence checks around that fact.
+3. **Done.** Implement `PackfileWriter`. Without it, every push sends one
+   PUT for each object. With it, a push sends two PUTs for each 32768
+   objects. See [The pack container](#the-pack-container).
+4. **Done.** Load pack indexes into memory. Serve packed objects with
+   ranged `GetObject` requests into the pack. A `Storer` downloads a
+   whole pack after 32 different objects from it.
+5. Add repacking and garbage collection. Today packs collect forever, one
+   for each 32768 objects pushed. A cold index build costs one small GET
+   for each pack. A compaction pass must also delete a `.bin` that has
+   no `.cue`, which a failed upload can leave behind.
+6. **Done.** Cache packs across requests. One process holds one
+   least-recently-used cache of whole `.bin` files, under a disk budget.
+   See [The pack cache](#the-pack-cache).
+7. Switch the payload format to the zlib objfile form from
    `plumbing/format/objfile` when egress or storage cost matters.
-6. Add the optional `PromisorPackfileWriter` support when partial clones
+8. Add the optional `PromisorPackfileWriter` support when partial clones
    matter for your users.
