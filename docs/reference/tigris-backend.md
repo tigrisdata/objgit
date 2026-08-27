@@ -38,7 +38,7 @@ One bucket holds everything. One S3 object holds one git object.
 
 ```
 objects/<hex>      loose object, keyed by its content hash
-packs/<id>.bin     up to 32768 objects, raw bytes concatenated
+packs/<id>.bin     up to 32768 objects or 128 MiB, raw bytes concatenated
 packs/<id>.cue     that pack's index: hash, type, offset, length
 ```
 
@@ -74,12 +74,19 @@ A container is two objects:
 - `packs/<id>.cue` holds the index. One record gives the hash, the type,
   the offset, and the length of one object.
 
-A push writes one container, or more than one. One container holds a
-maximum of 32768 objects (`maxPackObjects` in `packindex.go`). A push
-above that limit writes one more container for each further 32768
-objects. The limit applies to writes only. Reads accept a repository
-with any number of containers, and a container with any number of
-objects.
+A push writes one container, or more than one. Two limits bound one
+container, and both live in `packindex.go`:
+
+- `maxPackObjects`, 32768 objects.
+- `maxPackBytes`, 128 MiB of payload.
+
+The writer seals a container when it reaches the first of the two. A
+push above either limit writes more containers. An object count alone is
+a poor proxy for size: 32768 tiny objects make a few megabytes, and
+32768 large blobs make tens of gigabytes.
+
+Both limits apply to writes only. Reads accept a repository with any
+number of containers, and a container of any size.
 
 The `<id>` is the hex SHA-256 of the content of the `.bin`. The name is
 therefore a checksum. A reader that downloads a whole `.bin` can verify
@@ -98,12 +105,29 @@ The writer copies each object into the `.bin` and adds one record to the
 asynchronously. `SetReference` waits for those uploads, so a ref never
 points to a pack that the bucket does not hold.
 
-The writer seals the current container when that container holds 32768
-objects. It then opens the next container for the next object. It opens a
-container only when an object needs one, so a push of an exact multiple
-of 32768 objects writes no empty container. Each sealed container is
+The writer seals the current container when that container reaches
+either limit. It then opens the next container for the next object. It
+opens a container only when an object needs one, so a push that divides
+exactly by a limit writes no empty container. Each sealed container is
 complete on its own: it has its own id, its own `.cue`, and its own
 upload.
+
+The two limits differ in where the writer checks them. It checks the
+byte limit before it adds an object, and the object count after. A
+container at 127 MiB must not swallow a 500 MiB blob and land at 627
+MiB.
+
+An object larger than 128 MiB gets a container to itself, because it has
+to live somewhere. That container is larger than the limit. It is the
+only container that can be, and it always holds exactly one object.
+
+CAUTION: `enqueue` in `upload.go` clamps the size it gives the bundler
+to the `BufferedByteLimit` of that bundler. The bundler takes the size
+from a semaphore whose capacity *is* that limit, and
+`x/sync/semaphore` parks a size above the whole capacity until the
+context is done. Without the clamp, a container above the limit hangs
+its push. Only the lone-object container of the paragraph above can
+reach that size.
 
 An error part way through a large push leaves the sealed containers in
 the bucket. Each one holds real objects and needs no repair. The error
@@ -332,14 +356,14 @@ Items 1 to 4 and item 6 are complete.
 2. **Done.** Record which error a real bucket returns for a missing key.
    Fix the absence checks around that fact.
 3. **Done.** Implement `PackfileWriter`. Without it, every push sends one
-   PUT for each object. With it, a push sends two PUTs for each 32768
-   objects. See [The pack container](#the-pack-container).
+   PUT for each object. With it, a push sends two PUTs for each
+   container. See [The pack container](#the-pack-container).
 4. **Done.** Load pack indexes into memory. Serve packed objects with
    ranged `GetObject` requests into the pack. A `Storer` downloads a
    whole pack after 32 different objects from it.
 5. Add repacking and garbage collection. Today packs collect forever, one
-   for each 32768 objects pushed. A cold index build costs one small GET
-   for each pack. A compaction pass must also delete a `.bin` that has
+   for each container that a push fills. A cold index build costs one
+   small GET for each pack. A compaction pass must also delete a `.bin` that has
    no `.cue`, which a failed upload can leave behind.
 6. **Done.** Cache packs across requests. One process holds one
    least-recently-used cache of whole `.bin` files, under a disk budget.

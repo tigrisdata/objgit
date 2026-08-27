@@ -21,6 +21,36 @@ import (
 // returns.
 const uploadTimeout = 5 * time.Minute
 
+const (
+	// uploadHandlerLimit is how many bundles the uploader lets the bundler hand
+	// to its handler at the same time.
+	//
+	// The bundler's own default is 1, which serializes bundles: handleBundle
+	// uploads one bundle's jobs concurrently, but nothing in the next bundle
+	// starts until every upload in this one lands. Since the bundler cuts a
+	// bundle every BundleCountThreshold items (10) — and every single pack
+	// container, each far above BundleByteThreshold — a large push spends its
+	// wall clock waiting on those barriers rather than on bandwidth.
+	//
+	// 8 lets that many bundles overlap. Nothing here needs a bundle to finish
+	// before the next starts: each job owns its own staging file and its own
+	// key, and flush() still waits for all of them.
+	uploadHandlerLimit = 8
+
+	// uploadBufferedBytes budgets bytes that are staged locally but not yet
+	// uploaded. AddWait blocks the producer once the backlog reaches it, which
+	// is what stops a fast push from staging without bound while the network
+	// drains slowly.
+	//
+	// This is a *disk* budget, not a memory one: staged bytes live in temp
+	// files and run() streams them to PutObject. The bundler calls the field
+	// BufferedByteLimit and defaults it to 1 GiB, which reads as a memory
+	// figure and is too tight here — 8 concurrent 128 MiB pack containers
+	// (maxPackBytes) fill exactly that much, leaving the walk no room to run
+	// ahead of the uploads at all. 4 GiB leaves it room.
+	uploadBufferedBytes = 4 << 30
+)
+
 // uploadJob is one thing to upload asynchronously — a loose object
 // (looseJob) or a pack container (packJob, packwriter.go). Sharing one
 // bundler across both kinds means one SetReference-triggered flush() waits
@@ -113,6 +143,8 @@ func newUploader(s *Storer) *uploader {
 	u := &uploader{pending: make(map[plumbing.Hash]pendingMeta)}
 	u.b = bundler.New(u.handleBundle(s))
 	u.b.ContextDeadline = uploadTimeout
+	u.b.HandlerLimit = uploadHandlerLimit
+	u.b.BufferedByteLimit = uploadBufferedBytes
 	return u
 }
 
@@ -181,10 +213,34 @@ func (u *uploader) lookupPending(h plumbing.Hash) (pendingMeta, bool) {
 // round trip but an unbounded backlog of staged uploads can't accumulate
 // either.
 func (u *uploader) enqueue(ctx context.Context, job uploadJob) error {
-	if err := u.b.AddWait(ctx, job, int(job.bytes())); err != nil {
+	if err := u.b.AddWait(ctx, job, u.sizeHint(job)); err != nil {
 		return fmt.Errorf("tigris: queue upload: %w", err)
 	}
 	return nil
+}
+
+// sizeHint is job's weight for AddWait's BufferedByteLimit accounting, clamped
+// to that limit.
+//
+// The clamp is not a nicety. AddWait acquires the weight from a semaphore whose
+// capacity *is* BufferedByteLimit, and x/sync/semaphore parks a weight larger
+// than the whole capacity until ctx is done rather than failing it — so an
+// unclamped oversized job hangs its push for as long as the request lives. The
+// 128 MiB pack cap keeps every ordinary container far under the limit, but one
+// case survives it by design: an object larger than the cap spills into a
+// container of its own (see packwriter.go), and that container can be larger
+// than any limit we pick.
+//
+// Clamping costs nothing real. The weight is backpressure accounting for bytes
+// that sit in a staging file on disk, and run() streams that file rather than
+// buffering it, so a job that reports less than it holds overshoots the
+// backlog budget instead of breaking anything.
+func (u *uploader) sizeHint(job uploadJob) int {
+	size := job.bytes()
+	if lim := int64(u.b.BufferedByteLimit); lim > 0 && size > lim {
+		return int(lim)
+	}
+	return int(size)
 }
 
 // flush waits for every upload queued so far to finish and returns the first

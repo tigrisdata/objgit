@@ -50,6 +50,9 @@ type fakeS3 struct {
 
 	putDelay time.Duration // artificial latency before PutObject lands, for async-upload tests
 
+	livePuts    int // PutObject calls inside putDelay right now
+	maxLivePuts int // high-water mark of livePuts, for upload-concurrency tests
+
 	puts    int
 	deletes int
 	listMax int64 // ListObjectsV2 page size knob; 0 = unlimited
@@ -106,6 +109,14 @@ func (f *fakeS3) nputs() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.puts
+}
+
+// peakLivePuts is the most PutObject calls the fake ever had in flight at one
+// time. Meaningful only with putDelay set.
+func (f *fakeS3) peakLivePuts() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.maxLivePuts
 }
 
 func (f *fakeS3) ndeletes() int {
@@ -206,7 +217,20 @@ func parseByteRange(header string, size int) (start, end int, ok bool) {
 
 func (f *fakeS3) PutObject(_ context.Context, p *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
 	if f.putDelay > 0 {
+		// Held outside the lock, so overlapping uploads really do overlap and
+		// the high-water mark means something.
+		f.mu.Lock()
+		f.livePuts++
+		if f.livePuts > f.maxLivePuts {
+			f.maxLivePuts = f.livePuts
+		}
+		f.mu.Unlock()
+
 		time.Sleep(f.putDelay)
+
+		f.mu.Lock()
+		f.livePuts--
+		f.mu.Unlock()
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()

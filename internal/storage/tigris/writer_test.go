@@ -1,6 +1,7 @@
 package tigris
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/go-git/go-git/v6/plumbing"
 	formatcfg "github.com/go-git/go-git/v6/plumbing/format/config"
+	"github.com/tigrisdata/objgit/internal/bundler"
 )
 
 // pushThrough streams chunks through a fresh RawObjectWriter and hands back
@@ -369,6 +371,98 @@ func TestPendingOverlayServesReadsBeforeUploadLands(t *testing.T) {
 	}
 	if _, err := os.Stat(stagedPath); !os.IsNotExist(err) {
 		t.Errorf("staged file survived flush: %v", err)
+	}
+}
+
+// sizedJob is an uploadJob that claims a size but uploads nothing: enqueue's
+// backpressure accounting is the only thing under test here.
+type sizedJob struct{ size int64 }
+
+func (j sizedJob) bytes() int64                           { return j.size }
+func (j sizedJob) run(_ context.Context, _ *Storer) error { return nil }
+func (j sizedJob) done(_ *Storer, _ error)                {}
+
+// TestEnqueueClampsOversizedSizeHint pins the one case the 128 MiB pack cap
+// cannot rule out. AddWait's size is a semaphore weight against the bundler's
+// BufferedByteLimit, and x/sync/semaphore parks until ctx is done when a
+// weight exceeds capacity outright — so an object larger than that limit,
+// which legally spills into a container of its own (see packwriter.go), would
+// hang its whole push. enqueue must clamp instead.
+func TestEnqueueClampsOversizedSizeHint(t *testing.T) {
+	t.Parallel()
+
+	s := newTestStorer(t, newFakeS3(t))
+	const limit = 1 << 10
+	s.up.b.BufferedByteLimit = limit
+
+	// A generous deadline: a regression parks on the semaphore forever, so this
+	// fails the test rather than stalling the suite.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := s.up.enqueue(ctx, sizedJob{size: limit * 4}); err != nil {
+		t.Fatalf("enqueue of a job larger than BufferedByteLimit: %v", err)
+	}
+	if err := s.up.flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	// The clamp must not leak the weight: a following normal-sized job still
+	// has to fit, which it cannot if the oversized one held the whole budget.
+	if err := s.up.enqueue(ctx, sizedJob{size: limit / 2}); err != nil {
+		t.Fatalf("enqueue after the clamped job: %v", err)
+	}
+	if err := s.up.flush(); err != nil {
+		t.Fatalf("second flush: %v", err)
+	}
+}
+
+// TestUploadsSpanMoreThanOneBundle covers the uploader's concurrency, which
+// costs real wall clock on a large push.
+//
+// internal/bundler cuts a bundle every BundleCountThreshold items and, with
+// its default HandlerLimit of 1, runs one bundle's handler at a time. The
+// handler itself uploads a bundle's jobs concurrently, so the default gives
+// batches of ten uploads separated by a full barrier: nothing in batch two
+// starts until every upload in batch one lands. newUploader raises
+// HandlerLimit so those batches overlap.
+//
+// The bytes under the barrier sit in staging files on disk, not in memory, and
+// run() streams them — so the budget this trades against is local disk.
+func TestUploadsSpanMoreThanOneBundle(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeS3(t)
+	f.putDelay = 50 * time.Millisecond
+	s := newTestStorer(t, f)
+
+	// Four bundles' worth. Staging every object takes microseconds against a
+	// 50ms upload, so all of them are queued long before the first one lands.
+	const objects = 4 * bundler.DefaultBundleCountThreshold
+	for i := range objects {
+		obj := plumbing.NewMemoryObject(s.oh)
+		obj.SetType(plumbing.BlobObject)
+		body := fmt.Sprintf("object number %d", i)
+		obj.SetSize(int64(len(body)))
+		if _, err := obj.Write([]byte(body)); err != nil {
+			t.Fatalf("buffer %d: %v", i, err)
+		}
+		if _, err := s.SetEncodedObject(obj); err != nil {
+			t.Fatalf("set %d: %v", i, err)
+		}
+	}
+	if err := s.up.flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	if n := f.nputs(); n != objects {
+		t.Fatalf("uploaded %d objects, want %d", n, objects)
+	}
+	// One bundle's worth in flight means the barrier is still there. More means
+	// bundles overlap, which is the whole point of the raised limit.
+	if peak := f.peakLivePuts(); peak <= bundler.DefaultBundleCountThreshold {
+		t.Errorf("peak concurrent uploads was %d, want more than one bundle's %d: bundles are still serialized",
+			peak, bundler.DefaultBundleCountThreshold)
 	}
 }
 

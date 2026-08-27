@@ -74,19 +74,23 @@ func (w *packWriter) Close() error {
 	}
 	defer iter.Close()
 
-	// One push becomes as many containers as its object count needs: the walk
-	// seals a segment the moment it is full and opens the next one lazily, so
-	// a count that divides evenly by the cap never leaves an empty trailing
-	// container. Reads impose no matching limit — packIndex merges every
-	// packs/*.cue it can see (see packindex.go).
+	// One push becomes as many containers as its object count and its total
+	// size need: the walk seals a segment the moment it is full and opens the
+	// next one lazily, so a push that divides evenly by a cap never leaves an
+	// empty trailing container. Reads impose no matching limit — packIndex
+	// merges every packs/*.cue it can see (see packindex.go).
 	//
-	// New sets maxPack and Scoped copies it, so the fallback is unreachable
-	// today; it stays because an unset cap would seal after every single
-	// object, which is precisely the per-object PUT storm this writer exists
-	// to prevent.
+	// New sets both caps and Scoped copies them, so the fallbacks are
+	// unreachable today; they stay because an unset cap would seal after every
+	// single object, which is precisely the per-object PUT storm this writer
+	// exists to prevent.
 	limit := w.s.maxPack
 	if limit <= 0 {
 		limit = maxPackObjects
+	}
+	byteLimit := w.s.maxPackBytes
+	if byteLimit <= 0 {
+		byteLimit = maxPackBytes
 	}
 
 	var seg *packSegment
@@ -97,6 +101,22 @@ func (w *packWriter) Close() error {
 	}()
 
 	walkErr := iter.ForEach(func(obj plumbing.EncodedObject) error {
+		// The byte cap seals *before* the add, unlike the object cap below: a
+		// container sitting at 127 MiB must not swallow a 500 MiB blob and
+		// land at 627 MiB. The len(seg.recs) > 0 guard is what permits the one
+		// legal spill — an object larger than the whole cap gets a container to
+		// itself, since it has to live somewhere. That container then seals on
+		// the next object's check here, or at the end of the walk below.
+		//
+		// obj.Size() is trustworthy: add fails the push if the bytes it copies
+		// disagree with it.
+		if seg != nil && len(seg.recs) > 0 && seg.offset+obj.Size() > byteLimit {
+			full := seg
+			seg = nil // ownership moves to seal, which owns its staging files
+			if err := w.seal(full); err != nil {
+				return err
+			}
+		}
 		if seg == nil {
 			var err error
 			if seg, err = newPackSegment(); err != nil {
@@ -110,7 +130,7 @@ func (w *packWriter) Close() error {
 			return nil
 		}
 		full := seg
-		seg = nil // ownership moves to seal, which owns its staging files
+		seg = nil
 		return w.seal(full)
 	})
 	if walkErr != nil {

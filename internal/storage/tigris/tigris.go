@@ -12,8 +12,9 @@
 //	shallow             newline separated commit hashes
 //	index               plumbing/format/index-encoded worktree index
 //	config              config.Config.Marshal output
-//	packs/<id>.bin      up to maxPackObjects objects, concatenated raw bytes
-//	                    (one push writes as many containers as it needs)
+//	packs/<id>.bin      up to maxPackObjects objects or maxPackBytes bytes,
+//	                    concatenated raw bytes (one push writes as many
+//	                    containers as it needs)
 //	packs/<id>.cue      that pack's index (hash, type, offset, length per
 //	                    object) — see packindex.go for the binary format
 //
@@ -90,6 +91,9 @@ type Storer struct {
 	packs    *packIndex // pack containers this Storer knows about; see packindex.go
 	cache    *PackCache // optional process-wide local pack cache; see packcache.go
 	maxPack  int        // objects per written pack container; see maxPackObjects
+	// maxPackBytes caps a written container's payload; see maxPackBytes. Both
+	// caps apply at once, and the writer seals on whichever it reaches first.
+	maxPackBytes int64
 }
 
 // Option configures a Storer at construction time.
@@ -132,13 +136,21 @@ func withMaxPackObjects(n int) Option {
 	return func(s *Storer) { s.maxPack = n }
 }
 
+// withMaxPackBytes lowers the per-container byte cap from maxPackBytes.
+// Test-only, for the same reason as withMaxPackObjects: exercising the split
+// otherwise needs a 128 MiB git fixture.
+func withMaxPackBytes(n int64) Option {
+	return func(s *Storer) { s.maxPackBytes = n }
+}
+
 // New returns a Storer owning one whole bucket. ctx bounds every request this
 // storer issues.
 func New(ctx context.Context, bucket string, opts ...Option) (*Storer, error) {
 	s := &Storer{
-		ctx:     ctx,
-		of:      formatcfg.DefaultObjectFormat,
-		maxPack: maxPackObjects,
+		ctx:          ctx,
+		of:           formatcfg.DefaultObjectFormat,
+		maxPack:      maxPackObjects,
+		maxPackBytes: maxPackBytes,
 	}
 	for _, opt := range opts {
 		opt(s)

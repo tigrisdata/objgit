@@ -197,6 +197,15 @@ func buildPackFixture(t *testing.T, numFiles int, withDeltaEdit bool) packFixtur
 		gitRun(t, dir, "commit", "-m", "edit big")
 	}
 
+	return collectPackFixture(t, dir)
+}
+
+// collectPackFixture packs the whole history of the repository in dir with the
+// real git CLI and records ground truth for every resulting object via
+// `git cat-file`.
+func collectPackFixture(t *testing.T, dir string) packFixture {
+	t.Helper()
+
 	revOut := gitOutput(t, dir, nil, "rev-list", "--objects", "--all")
 	packBytes := gitOutput(t, dir, revOut, "pack-objects", "--stdout")
 
@@ -365,6 +374,106 @@ func packContents(t *testing.T, f *fakeS3) (bins, cues map[string][]byte, loose 
 	return bins, cues, loose
 }
 
+// assertContainers checks every invariant a sealed set of containers must
+// hold, whichever write-side cap produced the split: the id is the .bin's own
+// checksum, no .cue is orphaned, records are hash-sorted and inside their
+// .bin, every fixture object is indexed exactly once, and a cold Storer
+// resolves all of them.
+//
+// maxRecs and maxBytes are the caps in force; 0 skips either check. A
+// container may exceed maxBytes only when it holds exactly one object, which
+// is the deliberate spill for an object larger than the whole cap.
+//
+// It returns the parsed records keyed by pack id, so a caller can assert more
+// about how the split actually fell.
+func assertContainers(t *testing.T, s *Storer, f *fakeS3, fx packFixture, maxRecs int, maxBytes int64) map[string][]cueRecord {
+	t.Helper()
+
+	bins, cues, loose := packContents(t, f)
+	if loose != 0 {
+		t.Errorf("expected zero loose objects, got %d", loose)
+	}
+
+	byID := make(map[string][]cueRecord, len(cues))
+	counts := map[plumbing.Hash]int{}
+	for id, raw := range cues {
+		bin, ok := bins[id]
+		if !ok {
+			t.Fatalf("cue %s has no sibling .bin", id)
+		}
+		// The id is the .bin's sha256, so a shared or reused hasher across
+		// segments shows up right here.
+		if got := fmt.Sprintf("%x", sha256.Sum256(bin)); got != id {
+			t.Errorf("pack %s: .bin hashes to %s (id is not its own checksum)", id, got)
+		}
+
+		recs, err := parseCue(s.oh.Size(), raw)
+		if err != nil {
+			t.Fatalf("parse cue %s: %v", id, err)
+		}
+		byID[id] = recs
+		if len(recs) == 0 {
+			t.Errorf("pack %s holds no records", id)
+		}
+		if maxRecs > 0 && len(recs) > maxRecs {
+			t.Errorf("pack %s holds %d records, cap is %d", id, len(recs), maxRecs)
+		}
+		if maxBytes > 0 && int64(len(bin)) > maxBytes && len(recs) != 1 {
+			t.Errorf("pack %s holds %d objects in %d bytes, past the %d-byte cap; only a lone oversized object may spill",
+				id, len(recs), len(bin), maxBytes)
+		}
+		if !sort.SliceIsSorted(recs, func(i, j int) bool {
+			return bytes.Compare(recs[i].hash.Bytes(), recs[j].hash.Bytes()) < 0
+		}) {
+			t.Errorf("pack %s: records are not hash-sorted", id)
+		}
+		for _, r := range recs {
+			if end := r.offset + r.length; end > int64(len(bin)) {
+				t.Errorf("pack %s: record %s runs to %d, past the %d-byte .bin", id, r.hash, end, len(bin))
+			}
+			counts[r.hash]++
+		}
+	}
+
+	for _, h := range fx.hashes {
+		if counts[h] != 1 {
+			t.Errorf("object %s indexed %d times across %d containers, want 1", h, counts[h], len(cues))
+		}
+	}
+	if len(counts) != len(fx.hashes) {
+		t.Errorf("containers index %d distinct objects, want %d", len(counts), len(fx.hashes))
+	}
+
+	// Cold read across every container: reads impose neither cap.
+	s2 := newTestStorer(t, f)
+	for _, h := range fx.hashes {
+		want := fx.byHash[h]
+		obj, err := s2.EncodedObject(plumbing.AnyObject, h)
+		if err != nil {
+			t.Fatalf("EncodedObject(%s): %v", h, err)
+		}
+		if obj.Type() != want.typ || obj.Size() != want.size {
+			t.Errorf("%s = (%v, %d), want (%v, %d)", h, obj.Type(), obj.Size(), want.typ, want.size)
+		}
+		if want.blob == nil {
+			continue
+		}
+		rd, err := obj.Reader()
+		if err != nil {
+			t.Fatalf("reader for %s: %v", h, err)
+		}
+		got, err := io.ReadAll(rd)
+		rd.Close()
+		if err != nil {
+			t.Fatalf("read %s: %v", h, err)
+		}
+		if !bytes.Equal(got, want.blob) {
+			t.Errorf("%s: body mismatch\ngot:  %q\nwant: %q", h, got, want.blob)
+		}
+	}
+	return byID
+}
+
 // TestPackfileWriterSplitsAtObjectLimit covers the write-side cap: one push
 // above the limit lands as several self-consistent bin/cue pairs, and the read
 // side — which has no such cap — resolves every object across all of them.
@@ -402,87 +511,150 @@ func TestPackfileWriterSplitsAtObjectLimit(t *testing.T) {
 				t.Fatalf("flush: %v", err)
 			}
 
-			bins, cues, loose := packContents(t, f)
+			bins, cues, _ := packContents(t, f)
 			// Ceiling division, never a rounded-up count that would imply an
 			// empty trailing container: limits 1 and n divide n exactly.
 			want := (n + tt.limit - 1) / tt.limit
 			if len(bins) != want || len(cues) != want {
 				t.Fatalf("got %d bins and %d cues, want %d of each (%d objects, cap %d)", len(bins), len(cues), want, n, tt.limit)
 			}
-			if loose != 0 {
-				t.Errorf("expected zero loose objects, got %d", loose)
+
+			// No byte cap in play here: the fixture's files are tiny, so the
+			// object cap is the only one that can bind.
+			assertContainers(t, s, f, fx, tt.limit, 0)
+		})
+	}
+}
+
+// buildSizedPackFixture commits one file for each entry in sizes, filled to
+// exactly that many bytes with content unique to that file (identical content
+// would collapse into one blob and one container record), then packs the
+// result the same way buildPackFixture does. It exists so the byte cap can be
+// exercised with a small cap and known blob sizes, instead of a 128 MiB
+// fixture.
+func buildSizedPackFixture(t *testing.T, sizes ...int) packFixture {
+	t.Helper()
+	dir := t.TempDir()
+	gitRun(t, dir, "init", "-b", "main")
+	gitRun(t, dir, "config", "user.email", "test@example.com")
+	gitRun(t, dir, "config", "user.name", "Test")
+
+	for i, size := range sizes {
+		name := filepath.Join(dir, fmt.Sprintf("file%03d.txt", i))
+		body := bytes.Repeat([]byte{byte('a' + i%26)}, size)
+		if err := os.WriteFile(name, body, 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	gitRun(t, dir, "add", ".")
+	gitRun(t, dir, "commit", "-m", "sized files")
+
+	return collectPackFixture(t, dir)
+}
+
+// TestPackfileWriterSplitsAtByteLimit covers the write-side byte cap. Which
+// objects share a container depends on the scratch storer's iteration order,
+// so the assertions here are order-independent: no container holding more than
+// one object may exceed the cap, and an object larger than the cap all by
+// itself gets a container to itself rather than bloating whichever container
+// it happened to arrive behind.
+func TestPackfileWriterSplitsAtByteLimit(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		sizes     []int
+		byteCap   int64
+		objCap    int // 0 leaves the object cap at its production value
+		wantPacks int // 0 skips the exact-count check; -1 wants more than one
+		oversized int // a blob of this size must sit alone in its container
+	}{
+		{
+			name:      "cap above the whole push",
+			sizes:     []int{1000, 1000, 1000},
+			byteCap:   1 << 20,
+			wantPacks: 1,
+		},
+		{
+			name:      "even blobs split evenly",
+			sizes:     []int{4096, 4096, 4096, 4096},
+			byteCap:   8192,
+			wantPacks: -1,
+		},
+		{
+			name:      "uneven blobs split unevenly",
+			sizes:     []int{5000, 300, 4000, 900, 3000},
+			byteCap:   6000,
+			wantPacks: -1,
+		},
+		{
+			name:      "cap below every object",
+			sizes:     []int{500, 600, 700},
+			byteCap:   1,
+			wantPacks: 5, // three blobs plus the tree and the commit
+		},
+		{
+			name:      "one object larger than the cap spills alone",
+			sizes:     []int{800, 800, 800, 50000},
+			byteCap:   4096,
+			oversized: 50000,
+		},
+		{
+			name:      "both caps bind within one push",
+			sizes:     []int{100, 100, 100, 9000, 100, 100},
+			byteCap:   8192,
+			objCap:    2,
+			wantPacks: -1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fx := buildSizedPackFixture(t, tt.sizes...)
+
+			f := newFakeS3(t)
+			opts := []Option{withMaxPackBytes(tt.byteCap)}
+			if tt.objCap > 0 {
+				opts = append(opts, withMaxPackObjects(tt.objCap))
+			}
+			s := newTestStorer(t, f, opts...)
+			writePack(t, s, fx)
+			if err := s.up.flush(); err != nil {
+				t.Fatalf("flush: %v", err)
 			}
 
-			counts := map[plumbing.Hash]int{}
-			for id, raw := range cues {
-				bin, ok := bins[id]
-				if !ok {
-					t.Fatalf("cue %s has no sibling .bin", id)
-				}
-				// The id is the .bin's sha256, so a shared or reused hasher
-				// across segments shows up right here.
-				if got := fmt.Sprintf("%x", sha256.Sum256(bin)); got != id {
-					t.Errorf("pack %s: .bin hashes to %s (id is not its own checksum)", id, got)
-				}
+			byID := assertContainers(t, s, f, fx, tt.objCap, tt.byteCap)
 
-				recs, err := parseCue(s.oh.Size(), raw)
-				if err != nil {
-					t.Fatalf("parse cue %s: %v", id, err)
-				}
-				if len(recs) == 0 {
-					t.Errorf("pack %s holds no records", id)
-				}
-				if len(recs) > tt.limit {
-					t.Errorf("pack %s holds %d records, cap is %d", id, len(recs), tt.limit)
-				}
-				if !sort.SliceIsSorted(recs, func(i, j int) bool {
-					return bytes.Compare(recs[i].hash.Bytes(), recs[j].hash.Bytes()) < 0
-				}) {
-					t.Errorf("pack %s: records are not hash-sorted", id)
-				}
+			switch {
+			case tt.wantPacks > 0 && len(byID) != tt.wantPacks:
+				t.Errorf("got %d containers, want %d (cap %d bytes)", len(byID), tt.wantPacks, tt.byteCap)
+			case tt.wantPacks == -1 && len(byID) < 2:
+				t.Errorf("got %d containers, want the push to split (cap %d bytes)", len(byID), tt.byteCap)
+			}
+
+			if tt.oversized == 0 {
+				return
+			}
+			var found int
+			for id, recs := range byID {
 				for _, r := range recs {
-					if end := r.offset + r.length; end > int64(len(bin)) {
-						t.Errorf("pack %s: record %s runs to %d, past the %d-byte .bin", id, r.hash, end, len(bin))
+					if r.length != int64(tt.oversized) {
+						continue
 					}
-					counts[r.hash]++
+					found++
+					if len(recs) != 1 {
+						t.Errorf("container %s holds the %d-byte object alongside %d others; an object past the cap gets a container to itself",
+							id, tt.oversized, len(recs)-1)
+					}
 				}
 			}
-
-			for _, h := range fx.hashes {
-				if counts[h] != 1 {
-					t.Errorf("object %s indexed %d times across %d containers, want 1", h, counts[h], len(cues))
-				}
-			}
-			if len(counts) != n {
-				t.Errorf("containers index %d distinct objects, want %d", len(counts), n)
-			}
-
-			// Cold read across every container: reads have no cap.
-			s2 := newTestStorer(t, f)
-			for _, h := range fx.hashes {
-				want := fx.byHash[h]
-				obj, err := s2.EncodedObject(plumbing.AnyObject, h)
-				if err != nil {
-					t.Fatalf("EncodedObject(%s): %v", h, err)
-				}
-				if obj.Type() != want.typ || obj.Size() != want.size {
-					t.Errorf("%s = (%v, %d), want (%v, %d)", h, obj.Type(), obj.Size(), want.typ, want.size)
-				}
-				if want.blob == nil {
-					continue
-				}
-				rd, err := obj.Reader()
-				if err != nil {
-					t.Fatalf("reader for %s: %v", h, err)
-				}
-				got, err := io.ReadAll(rd)
-				rd.Close()
-				if err != nil {
-					t.Fatalf("read %s: %v", h, err)
-				}
-				if !bytes.Equal(got, want.blob) {
-					t.Errorf("%s: body mismatch\ngot:  %q\nwant: %q", h, got, want.blob)
-				}
+			if found != 1 {
+				t.Fatalf("found %d objects of %d bytes across the containers, want 1", found, tt.oversized)
 			}
 		})
 	}

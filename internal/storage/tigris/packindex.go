@@ -33,6 +33,21 @@ const (
 	// packs/*.cue it lists, so any number of containers, holding any number of
 	// objects, resolves exactly the same way.
 	maxPackObjects = 1 << 15
+
+	// maxPackBytes caps a written container's payload. An object count alone is
+	// a poor proxy for size — 32768 tiny objects is a few megabytes, 32768
+	// large blobs is tens of gigabytes — and container size is what sets the
+	// size of one PutObject, of one bulk .bin download on the read side
+	// (packBulkFetchThreshold), and of one PackCache eviction.
+	//
+	// packwriter.go checks this cap *before* adding an object, so a container
+	// sitting just under it never grows past it by swallowing a large object
+	// that arrives late. The one container allowed past the cap holds a single
+	// object larger than the cap all by itself; giving it a container of its
+	// own beats bloating whichever container it happened to arrive behind.
+	//
+	// Like maxPackObjects, this is a write-side cap only.
+	maxPackBytes = 128 << 20 // 128 MiB
 )
 
 var cueMagic = [4]byte{'O', 'G', 'C', 1} // "OGC" + format version 1
@@ -217,8 +232,8 @@ func (p *packIndex) binSize(id string) int64 {
 }
 
 // snapshotEntries lists every indexed object, ordered by pack and then by
-// offset within that pack. The order matters because a push above
-// maxPackObjects lands as several containers (see packwriter.go): map order
+// offset within that pack. The order matters because a push above either
+// write-side cap lands as several containers (see packwriter.go): map order
 // would interleave them, so a full iteration would hold every container's bulk
 // download open at once. Draining one pack at a time keeps that to one.
 func (p *packIndex) snapshotEntries() []packedEntry {

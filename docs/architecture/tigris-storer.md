@@ -65,6 +65,34 @@ waits for every queued upload and surfaces the first error. A reference
 therefore never goes live while it points at an object whose upload failed or
 is still in flight.
 
+`newUploader` sets two bundler limits above their defaults.
+
+`HandlerLimit` is 8, and the default is 1. The bundler cuts a bundle every 10
+items, and at every pack container. With the default, one bundle runs at a
+time: `handleBundle` uploads a bundle's jobs together, but the next bundle
+waits for all of them. A large push then spends its time on those barriers and
+not on bandwidth. 8 bundles overlap instead. Each job owns its own staging file
+and its own key, so no job needs another to finish first.
+
+`BufferedByteLimit` is 4 GiB, and the default is 1 GiB. This budget is what
+`AddWait` blocks on, so it bounds the bytes that one push stages ahead of its
+uploads.
+
+NOTE: This budget is local disk, and not memory. Staged bytes live in temp
+files, and `run()` streams each file to `PutObject`. The 1 GiB default reads as
+a memory figure and is too tight here: 8 concurrent 128 MiB containers fill all
+of it, which leaves the pack walk no room to run ahead.
+
+`enqueue` gives the bundler a size for each job. The bundler holds that size
+against `BufferedByteLimit`. `sizeHint` clamps the size to that limit.
+
+CAUTION: The clamp is not a nicety. The bundler takes the size from a semaphore
+whose capacity *is* `BufferedByteLimit`, and `x/sync/semaphore` parks a size
+larger than the whole capacity until the context is done. An unclamped
+oversized job therefore hangs its push. The byte cap keeps every ordinary
+container far under the limit, but a lone object above the cap can still make a
+container that no limit holds.
+
 CAUTION: A staged object that is not yet uploaded must stay readable through
 the same `Storer`. The delta-base resolution of go-git reads back objects that
 the same push wrote moments earlier, long before any flush. Without the
@@ -83,8 +111,8 @@ names for this reason.
 ## Packs (`packwriter.go`, `packindex.go`)
 
 The package implements `storer.PackfileWriter`. A push therefore costs two
-PUTs for each 32768 objects (`maxPackObjects`), and not one PUT for each
-object.
+PUTs for each container it fills, and not one PUT for each object. The two
+caps below set how much one container holds.
 
 It does not store the git pack format. Git packs use delta compression, so one
 read would have to resolve a chain of deltas.
@@ -100,15 +128,32 @@ length. `<id>` is the hex SHA-256 of the `.bin`, so the name doubles as a
 checksum. Both files upload through the same uploader as loose objects, so the
 existing `SetReference` flush covers them.
 
-The walk seals the current container at `maxPackObjects` (1<<15) objects. It
-opens the next container lazily, on the next object. A push of an exact
-multiple therefore leaves no empty trailing container. A huge first push
-becomes a series of bounded containers, instead of one enormous PUT.
+Two caps bound one container, and the walk seals on the first one it reaches:
 
-**The cap is write-side only.** The read path is pack-agnostic: `packIndex`
+- `maxPackObjects` (1<<15), the object count.
+- `maxPackBytes` (128 MiB), the payload size.
+
+The walk opens the next container lazily, on the next object. A push that
+divides exactly by a cap therefore leaves no empty trailing container. A huge
+first push becomes a series of bounded containers, instead of one enormous PUT.
+
+An object count alone is a poor proxy for container size. 32768 tiny objects
+make a few megabytes. 32768 large blobs make tens of gigabytes. Container size
+is what sets the size of one PUT, of one bulk `.bin` download, and of one pack
+cache eviction, so the byte cap bounds all three.
+
+The two caps differ in where they run. The walk checks the byte cap *before* it
+adds an object, and the object cap after. A container at 127 MiB must not
+swallow a 500 MiB blob and land at 627 MiB.
+
+CAUTION: One container can exceed the byte cap. An object larger than the whole
+cap gets a container to itself, because it has to live somewhere. This is the
+only container that can pass the cap, and it always holds exactly one object.
+
+**Both caps are write-side only.** The read path is pack-agnostic: `packIndex`
 merges every `packs/*.cue` that it lists, and every `packEntry` names its own
 pack. Any number of containers, of any size, therefore resolves the same way.
-`withMaxPackObjects` lowers the cap in tests.
+`withMaxPackObjects` and `withMaxPackBytes` lower the caps in tests.
 
 One consequence is worth keeping. `snapshotEntries` sorts by pack and then by
 offset, so a full iteration drains one container at a time. It does not hold
@@ -179,4 +224,4 @@ does. The `main` package can therefore wire both packages to
 
 The build order in the reference document tracks this. There is no repacking
 and no GC, so packs accumulate. Each push leaves at least one pack, and a push
-above `maxPackObjects` leaves more.
+above either cap leaves more.
