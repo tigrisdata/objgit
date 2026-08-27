@@ -16,10 +16,10 @@ import (
 	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/utils/ioutil"
-	gossh "golang.org/x/crypto/ssh"
 	"github.com/tigrisdata/objgit/internal/auth"
 	"github.com/tigrisdata/objgit/internal/metrics"
 	"github.com/tigrisdata/objgit/internal/repofs"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 const hostKeyPath = ".objgit/ssh_host_ed25519_key"

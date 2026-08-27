@@ -12,20 +12,21 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/facebookgo/flagenv"
 	"github.com/gliderlabs/ssh"
+	"github.com/go-git/go-git/v6/storage"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/tigrisdata/objgit"
 	"github.com/tigrisdata/objgit/internal"
 	"github.com/tigrisdata/objgit/internal/auth"
 	"github.com/tigrisdata/objgit/internal/metrics"
+	"github.com/tigrisdata/objgit/internal/repofs"
 	"github.com/tigrisdata/objgit/internal/s3fs"
-	"github.com/tigrisdata/objgit/internal/tigrisfs"
-	"github.com/tigrisdata/storage-go"
+	"github.com/tigrisdata/objgit/internal/storage/tigris"
+	tstorage "github.com/tigrisdata/storage-go"
 	"golang.org/x/sync/errgroup"
 
 	_ "github.com/joho/godotenv/autoload"
@@ -35,23 +36,23 @@ var (
 	httpBind    = flag.String("http-bind", ":8080", "TCP address to listen on for the git smart-HTTP protocol; empty disables it")
 	sshBind     = flag.String("ssh-bind", "", "TCP address to listen on for the git-over-SSH protocol; empty disables it")
 	metricsBind = flag.String("metrics-bind", ":9090", "TCP address to serve the Prometheus /metrics endpoint; empty disables it")
-	bucket      = flag.String("bucket", "", "Tigris bucket for daemon system state (the SSH host key); repositories live in per-keypair buckets, not here")
+	bucket      = flag.String("bucket", "", "Tigris bucket holding daemon system state and every repository (one bucket, key-prefixed per repo)")
 	allowPush   = flag.Bool("allow-push", false, "allow unauthenticated git-receive-pack (push) requests")
 	slogLevel   = flag.String("slog-level", "INFO", "log level (DEBUG, INFO, WARN, ERROR)")
 
 	allowHooks  = flag.Bool("allow-hooks", false, "run .objgit/hooks/receive-pack in a sandbox after a successful push")
 	hookTimeout = flag.Duration("hook-timeout", 60*time.Second, "wall-clock limit for a single hook run")
 
-	s3CacheTTL     = flag.Duration("s3-cache-ttl", 60*time.Second, "how long a cached S3 directory listing answers Stat/Open before a re-list; 0 disables the listing cache")
-	s3CacheRefresh = flag.Duration("s3-cache-refresh", 30*time.Second, "interval at which the listing-cache warmer re-fills hot prefixes; 0 disables the warmer")
-	s3CacheIdle    = flag.Duration("s3-cache-idle", 10*time.Minute, "drop a prefix from the listing-cache warmer after this long without access")
-
-	s3CacheRecursive  = flag.String("s3-cache-recursive-prefixes", "refs/", "comma-separated key prefixes served from one recursive subtree scan instead of a listing per folder; empty disables subtree caching")
-	s3CacheMaxSubtree = flag.Int("s3-cache-max-subtree-keys", 50000, "abandon a recursive subtree scan past this many keys and fall back to per-folder listing")
-
-	packCacheBytes = flag.Int64("pack-cache-bytes", 2<<30, "local disk budget for cached pack files (.pack/.idx/.rev), downloaded once and served from a temp file so a clone doesn't re-fetch pack objects per access; 0 disables the cache")
-	packCacheDir   = flag.String("pack-cache-dir", "", "parent directory for the pack-file cache; empty uses the OS temp dir")
+	packCacheDir   = flag.String("pack-cache-dir", "", "parent directory for the local pack cache; empty uses the OS temp directory")
+	packCacheBytes = flag.Int64("pack-cache-bytes", 2<<30, "disk budget for the local pack cache, least-recently-used eviction; 0 disables caching")
 )
+
+// tigrisBase adapts *tigris.Storer to repofs.Base: Storer.Scoped returns the
+// concrete *tigris.Storer (useful for chaining/tests), but the Base interface
+// needs the abstract storage.Storer go-git works with.
+type tigrisBase struct{ s *tigris.Storer }
+
+func (b tigrisBase) Scoped(prefix string) storage.Storer { return b.s.Scoped(prefix) }
 
 func main() {
 	flagenv.Parse()
@@ -80,69 +81,48 @@ func main() {
 	// Route s3fs S3 round-trips into Prometheus before any filesystem use.
 	s3fs.SetMetricsObserver(metrics.ObserveS3)
 
-	rawClient, err := storage.New(ctx)
+	rawClient, err := tstorage.New(ctx)
 	if err != nil {
 		slog.Error("can't create Tigris storage client", "err", err)
 		os.Exit(1)
 	}
 	// Harden the client's HTTP path so stale keep-alive connections to Tigris
 	// fail fast and retry on a fresh connection instead of hanging the request
-	// forever (see internal/s3fs/resilient.go).
+	// forever (see internal/s3fs/resilient.go). Only sysFS (the SSH host key)
+	// uses this client; internal/storage/tigris dials its own.
 	client := s3fs.Harden(rawClient)
 
-	var cache *s3fs.ListingCache
-	var fsOpts []s3fs.Option
-	if *s3CacheTTL > 0 {
-		// Non-nil (even empty) so an empty flag explicitly disables subtree
-		// caching rather than falling back to the {"refs/"} default.
-		recursive := []string{}
-		if *s3CacheRecursive != "" {
-			recursive = strings.Split(*s3CacheRecursive, ",")
-		}
-		cache = s3fs.NewListingCache(s3fs.CacheConfig{
-			TTL:               *s3CacheTTL,
-			RefreshInterval:   *s3CacheRefresh,
-			IdleTTL:           *s3CacheIdle,
-			RecursivePrefixes: recursive,
-			MaxSubtreeKeys:    *s3CacheMaxSubtree,
-		}, client, *bucket, "/")
-		fsOpts = append(fsOpts, s3fs.WithListingCache(cache))
-		metrics.RegisterListingCache(func() metrics.ListingCacheStats {
-			s := cache.Stats()
-			return metrics.ListingCacheStats{
-				Hits: s.Hits, Misses: s.Misses,
-				ListingItems: s.ListingItems, SubtreeItems: s.SubtreeItems, HeadItems: s.HeadItems,
-			}
-		})
-	}
-
-	if *packCacheBytes != 0 {
-		packCache, err := s3fs.NewPackCache(*packCacheDir, *packCacheBytes)
-		if err != nil {
-			slog.Error("can't create pack cache", "err", err)
-			os.Exit(1)
-		}
-		defer packCache.Cleanup()
-		fsOpts = append(fsOpts, s3fs.WithPackCache(packCache))
-	}
-
-	fsys, err := s3fs.NewS3FS(client, *bucket, fsOpts...)
+	fsys, err := s3fs.NewS3FS(client, *bucket)
 	if err != nil {
 		slog.Error("can't create s3fs", "bucket", *bucket, "err", err)
 		os.Exit(1)
 	}
 
-	// Repositories live in per-keypair Tigris buckets resolved at request time
-	// (one bucket per repo, created on first push). The -bucket fsys above backs
-	// only daemon system state (the SSH host key). The per-keypair model can't
-	// share the single-bucket listing/pack caches, so repo-side caching is off.
-	if cache != nil || *packCacheBytes != 0 {
-		slog.Info("per-keypair resolver active: repo-side S3 caching is disabled (caches apply to the system bucket only)")
+	// One pack cache for the whole process, shared by every repository's Storer
+	// (its keys are content hashes, so sharing is deduplication). Without it,
+	// each request that bulk-fetches a pack throws the copy away when it ends.
+	storerOpts := []tigris.Option{tigris.WithObserver(metrics.ObserveS3)}
+	var packCache *tigris.PackCache
+	if *packCacheBytes > 0 {
+		packCache, err = tigris.NewPackCache(*packCacheDir, *packCacheBytes)
+		if err != nil {
+			slog.Error("can't create pack cache", "pack_cache_dir", *packCacheDir, "err", err)
+			os.Exit(1)
+		}
+		storerOpts = append(storerOpts, tigris.WithPackCache(packCache))
+	}
+
+	// Every repository lives in the same bucket as daemon system state, keyed
+	// by an "orgID/name" prefix (repofs.BucketResolver via tigrisBase.Scoped).
+	base, err := tigris.New(ctx, *bucket, storerOpts...)
+	if err != nil {
+		slog.Error("can't create tigris storer", "bucket", *bucket, "err", err)
+		os.Exit(1)
 	}
 
 	d := &daemon{
 		sysFS:       fsys,
-		resolver:    tigrisfs.New(),
+		resolver:    repofs.BucketResolver{Base: tigrisBase{s: base}},
 		authz:       auth.AllowAnonymous{AllowWrite: *allowPush},
 		allowHooks:  *allowHooks,
 		hookTimeout: *hookTimeout,
@@ -156,19 +136,10 @@ func main() {
 		"bucket", *bucket,
 		"allow_push", *allowPush,
 		"allow_hooks", *allowHooks,
-		"s3_cache_ttl", *s3CacheTTL,
-		"s3_cache_refresh", *s3CacheRefresh,
-		"s3_cache_recursive_prefixes", *s3CacheRecursive,
+		"pack_cache_bytes", *packCacheBytes,
 	)
 
 	g, gCtx := errgroup.WithContext(ctx)
-
-	if cache != nil {
-		g.Go(func() error {
-			cache.RunWarmer(gCtx)
-			return nil
-		})
-	}
 
 	if *metricsBind != "" {
 		ln, err := net.Listen("tcp", *metricsBind)
@@ -241,6 +212,12 @@ func main() {
 	}
 
 	err = g.Wait()
+
+	// Explicit, not deferred: the exit below skips defers. Descriptors already
+	// handed out keep working, so this is safe even mid-request.
+	if cerr := packCache.Cleanup(); cerr != nil {
+		slog.Warn("can't remove the pack cache directory", "err", cerr)
+	}
 
 	if err != nil {
 		slog.Error("server stopped", "err", err)

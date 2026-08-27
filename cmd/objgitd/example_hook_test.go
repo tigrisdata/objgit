@@ -35,10 +35,9 @@ func TestExampleHookRuns(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(prev)
 
-	fs := memfs.New()
 	d := &daemon{
-		sysFS:       fs,
-		resolver:    repofs.BucketResolver{Base: fs},
+		sysFS:       memfs.New(),
+		resolver:    repofs.BucketResolver{Base: newMemBase()},
 		authz:       auth.AllowAnonymous{AllowWrite: true},
 		allowHooks:  true,
 		hookTimeout: 30 * time.Second,

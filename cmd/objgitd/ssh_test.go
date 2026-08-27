@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/memfs"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/tigrisdata/objgit/internal/auth"
@@ -124,13 +123,14 @@ func checkSSHBinaries(t *testing.T) {
 }
 
 // startSSHServer creates an in-memory daemon and starts the SSH server on an
-// ephemeral port. It returns the listening address and the backing filesystem.
-func startSSHServer(t *testing.T, allowPush, allowHooks bool) (string, billy.Filesystem) {
+// ephemeral port. It returns the listening address and the backing resolver
+// store.
+func startSSHServer(t *testing.T, allowPush, allowHooks bool) (string, *memBase) {
 	t.Helper()
-	fs := memfs.New()
+	mb := newMemBase()
 	d := &daemon{
-		sysFS:       fs,
-		resolver:    repofs.BucketResolver{Base: fs},
+		sysFS:       memfs.New(),
+		resolver:    repofs.BucketResolver{Base: mb},
 		authz:       auth.AllowAnonymous{AllowWrite: allowPush},
 		allowHooks:  allowHooks,
 		hookTimeout: 30 * time.Second,
@@ -145,7 +145,7 @@ func startSSHServer(t *testing.T, allowPush, allowHooks bool) (string, billy.Fil
 	}
 	go srv.Serve(ln) //nolint:errcheck // returns when ln closes
 	t.Cleanup(func() { srv.Close(); ln.Close() })
-	return ln.Addr().String(), fs
+	return ln.Addr().String(), mb
 }
 
 // gitSSHEnv generates a throw-away ed25519 client key and returns an env slice
@@ -210,13 +210,12 @@ func TestSSH(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			addr, fs := startSSHServer(t, tt.allowPush, false)
+			addr, mb := startSSHServer(t, tt.allowPush, false)
 			env := gitSSHEnv(t)
 			remote := "ssh://git@" + addr + "/acme/test.git"
 
 			// Confirm no repo exists before any push.
-			_, preStatErr := fs.Stat("/acme/test/config")
-			if preStatErr == nil {
+			if mb.exists("acme/test") {
 				t.Fatal("test.git must not exist before any push")
 			}
 
@@ -236,18 +235,11 @@ func TestSSH(t *testing.T) {
 			}
 
 			// The bare repo must exist iff a push was expected to land.
-			_, statErr := fs.Stat("/acme/test/config")
 			pushLanded := tt.doPush && !tt.wantPushErr
-			if pushLanded && statErr != nil {
-				t.Fatalf("expected repo to be created on push, but config missing: %v", statErr)
-			}
-			if !pushLanded && statErr == nil {
+			if exists := mb.exists("acme/test"); pushLanded && !exists {
+				t.Fatal("expected repo to be created on push, but it does not exist")
+			} else if !pushLanded && exists {
 				t.Fatal("repository must not exist when push did not land")
-			}
-			if pushLanded {
-				// SSH shares the Scanner-bounded PackfileWriter path: the push
-				// must land as a packfile, not loose objects.
-				assertPackedRepo(t, fs, "/acme/test")
 			}
 
 			dst := t.TempDir()

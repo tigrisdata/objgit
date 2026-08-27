@@ -2,10 +2,13 @@ package repofs
 
 import (
 	"context"
+	_ "crypto/sha1" // registers SHA-1 for plumbing.FromObjectFormat, used by storage/memory
 	"errors"
+	"sync"
 	"testing"
 
-	"github.com/go-git/go-billy/v6/memfs"
+	"github.com/go-git/go-git/v6/storage"
+	"github.com/go-git/go-git/v6/storage/memory"
 )
 
 func TestParse(t *testing.T) {
@@ -85,21 +88,50 @@ func TestRepoRefPath(t *testing.T) {
 	}
 }
 
-// TestBucketResolverChroots verifies the default resolver roots the returned
-// filesystem at ref.Path(): a file written through it lands under "orgID/name".
-func TestBucketResolverChroots(t *testing.T) {
-	base := memfs.New()
+// fakeBase is a Base that records the prefix each Scoped call received and
+// hands back an independent in-memory storer per prefix.
+type fakeBase struct {
+	mu     sync.Mutex
+	calls  []string
+	scoped map[string]storage.Storer
+}
+
+func (f *fakeBase) Scoped(prefix string) storage.Storer {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, prefix)
+	if f.scoped == nil {
+		f.scoped = map[string]storage.Storer{}
+	}
+	st, ok := f.scoped[prefix]
+	if !ok {
+		st = memory.NewStorage()
+		f.scoped[prefix] = st
+	}
+	return st
+}
+
+// TestBucketResolverScopesToRefPath verifies the default resolver scopes the
+// base to ref.Path(), ignoring the credential and the create flag.
+func TestBucketResolverScopesToRefPath(t *testing.T) {
+	base := &fakeBase{}
 	r := BucketResolver{Base: base}
 
-	fs, err := r.Resolve(context.Background(), RepoRef{OrgID: "acme", Name: "widgets"}, Credential{}, false)
+	st, err := r.Resolve(context.Background(), RepoRef{OrgID: "acme", Name: "widgets"}, Credential{}, false)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-
-	if _, err := fs.Create("HEAD"); err != nil {
-		t.Fatalf("Create through resolved fs: %v", err)
+	if len(base.calls) != 1 || base.calls[0] != "acme/widgets" {
+		t.Fatalf("Scoped calls = %v, want [%q]", base.calls, "acme/widgets")
 	}
-	if _, err := base.Stat("acme/widgets/HEAD"); err != nil {
-		t.Errorf("expected file at acme/widgets/HEAD on base fs: %v", err)
+
+	// Resolving the same ref again must return the same underlying storer
+	// (data persists the way a real bucket's key-prefix scoping does).
+	again, err := r.Resolve(context.Background(), RepoRef{OrgID: "acme", Name: "widgets"}, Credential{}, true)
+	if err != nil {
+		t.Fatalf("Resolve (create): %v", err)
+	}
+	if st != again {
+		t.Error("expected the same storer instance for the same ref across calls")
 	}
 }

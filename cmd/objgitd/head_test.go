@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/memfs"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/cache"
@@ -147,10 +146,10 @@ func TestSmartHTTPHealsDanglingHEAD(t *testing.T) {
 		t.Skip("git not installed")
 	}
 
-	fs := memfs.New()
+	mb := newMemBase()
 	ts := httptest.NewServer((&daemon{
-		sysFS:    fs,
-		resolver: repofs.BucketResolver{Base: fs},
+		sysFS:    memfs.New(),
+		resolver: repofs.BucketResolver{Base: mb},
 		authz:    auth.AllowAnonymous{AllowWrite: true},
 	}).httpHandler())
 	t.Cleanup(ts.Close)
@@ -172,7 +171,7 @@ func TestSmartHTTPHealsDanglingHEAD(t *testing.T) {
 	// would otherwise have already fixed it): point HEAD back at the dangling
 	// refs/heads/main directly in the backing store. The very next load (this
 	// clone) must heal it on the way to serving the advertisement.
-	breakHEAD(t, fs, "/acme/go")
+	breakHEAD(t, mb, "acme/go")
 
 	dst := t.TempDir()
 	out, err := tryGit(dst, "clone", ts.URL+"/acme/go.git", "cloned")
@@ -202,13 +201,9 @@ func TestSmartHTTPHealsDanglingHEAD(t *testing.T) {
 
 // breakHEAD points the bare repo at repoPath's HEAD back at the dangling
 // refs/heads/main, simulating a repository created before the heal existed.
-func breakHEAD(t *testing.T, fs billy.Filesystem, repoPath string) {
+func breakHEAD(t *testing.T, mb *memBase, repoPath string) {
 	t.Helper()
-	sub, err := fs.Chroot(repoPath)
-	if err != nil {
-		t.Fatalf("chroot %q: %v", repoPath, err)
-	}
-	st := filesystem.NewStorage(sub, cache.NewObjectLRUDefault())
+	st := mb.Scoped(repoPath) // repoPath must already exist (pushed earlier)
 	if err := st.SetReference(plumbing.NewSymbolicReference(plumbing.HEAD, plumbing.Main)); err != nil {
 		t.Fatalf("break HEAD: %v", err)
 	}

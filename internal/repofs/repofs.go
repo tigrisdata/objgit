@@ -1,9 +1,10 @@
-// Package repofs maps a transport repository path to the billy.Filesystem that
-// holds it. It is the seam a real backend implements to route an org to its own
-// bucket/credentials; the default implementation chroots one bucket filesystem.
+// Package repofs maps a transport repository path to the go-git
+// storage.Storer that holds it. It is the seam a real backend implements to
+// route an org to its own storage/credentials; the default implementation
+// scopes one shared Storer by ref.Path().
 //
 // Like internal/auth, this package is transport-neutral: it imports only the
-// standard library and go-billy, never a concrete transport.
+// standard library and go-git's storage types, never a concrete transport.
 package repofs
 
 import (
@@ -12,7 +13,7 @@ import (
 	"path"
 	"strings"
 
-	"github.com/go-git/go-billy/v6"
+	"github.com/go-git/go-git/v6/storage"
 )
 
 // ErrInvalidPath is returned by Parse when a repository path is not of the form
@@ -59,26 +60,36 @@ type Credential struct {
 }
 
 // Resolver maps a RepoRef — plus the caller's credential — to the
-// billy.Filesystem rooted at that repository. The returned filesystem is the
-// repository root: go-git's storage layer is built directly on top of it.
+// storage.Storer holding that repository's git data.
 //
 // create distinguishes the write path from the read path: it is true on a push
-// (loadOrInit), allowing a backend to provision storage (e.g. create a bucket)
-// on demand, and false on a read (load), where a missing repository must surface
-// as transport.ErrRepositoryNotFound rather than being created.
+// (loadOrInit), allowing a backend to provision storage on demand, and false on
+// a read (load). Whether a missing repository surfaces as
+// transport.ErrRepositoryNotFound is decided by the caller (see
+// cmd/objgitd's storerFor), not by Resolve itself — Resolve only has to hand
+// back the storer a repository would live at.
 type Resolver interface {
-	Resolve(ctx context.Context, ref RepoRef, cred Credential, create bool) (billy.Filesystem, error)
+	Resolve(ctx context.Context, ref RepoRef, cred Credential, create bool) (storage.Storer, error)
 }
 
-// BucketResolver is the default Resolver: it chroots a single base filesystem
-// (the whole bucket) to ref.Path(), ignoring the credential. This preserves the
-// original single-bucket behavior.
+// Base is a storage.Storer that can carve out an isolated sub-storer for one
+// repository, addressed by a key prefix. *internal/storage/tigris.Storer
+// implements this by prefixing its S3 keys; tests substitute other
+// implementations without touching the Resolver seam.
+type Base interface {
+	Scoped(prefix string) storage.Storer
+}
+
+// BucketResolver is the default Resolver: every repository lives under its own
+// key prefix inside one shared Base, ignoring the credential. This is the
+// single-bucket model; per-org/per-keypair routing is a possible future
+// Resolver implementation, not this one.
 type BucketResolver struct {
-	Base billy.Filesystem
+	Base Base
 }
 
-// Resolve chroots the base filesystem to the repository's "orgID/name" path.
-// Chroot is creation-free, so create is ignored.
-func (b BucketResolver) Resolve(_ context.Context, ref RepoRef, _ Credential, _ bool) (billy.Filesystem, error) {
-	return b.Base.Chroot(ref.Path())
+// Resolve scopes the base to the repository's "orgID/name" path. Scoping is
+// creation-free, so create is ignored.
+func (b BucketResolver) Resolve(_ context.Context, ref RepoRef, _ Credential, _ bool) (storage.Storer, error) {
+	return b.Base.Scoped(ref.Path()), nil
 }

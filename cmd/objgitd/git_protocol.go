@@ -5,16 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"time"
 
 	"github.com/go-git/go-billy/v6"
 	git "github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/cache"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/storage"
-	"github.com/go-git/go-git/v6/storage/filesystem"
 	"github.com/tigrisdata/objgit/internal/auth"
 	"github.com/tigrisdata/objgit/internal/metrics"
 	"github.com/tigrisdata/objgit/internal/repofs"
@@ -44,7 +41,8 @@ func (d *daemon) authorize(ctx context.Context, req auth.Request) auth.Decision 
 	return dec
 }
 
-// daemon serves the git protocols out of billy filesystems resolved per repo.
+// daemon serves the git protocols out of storage.Storer values resolved per
+// repo.
 type daemon struct {
 	// sysFS holds daemon-level state that is not scoped to a repository (the SSH
 	// host key); repository storage is resolved per request via resolver.
@@ -57,12 +55,20 @@ type daemon struct {
 	hookTimeout time.Duration
 }
 
-// storerFor returns the bare-repository storer rooted at fs, or
-// transport.ErrRepositoryNotFound when no repository exists there. It reuses
-// go-git's own bare-repo detection (a "config" file at the root) by loading the
-// repository at the filesystem root.
-func storerFor(fs billy.Filesystem) (storage.Storer, error) {
-	return transport.NewFilesystemLoader(fs, false).Load(&url.URL{Path: "/"})
+// storerFor reports whether a repository already exists at st, returning st
+// itself on success or transport.ErrRepositoryNotFound when it does not. Repo
+// existence is detected generically across storage.Storer implementations by
+// probing HEAD: git.Init always sets it, so its absence means the repository
+// was never initialized (the same signal dotgit's own "config file present"
+// check offered when repository storage was a billy.Filesystem).
+func storerFor(st storage.Storer) (storage.Storer, error) {
+	if _, err := st.Reference(plumbing.HEAD); err != nil {
+		if errors.Is(err, plumbing.ErrReferenceNotFound) {
+			return nil, transport.ErrRepositoryNotFound
+		}
+		return nil, err
+	}
+	return st, nil
 }
 
 // load resolves the storer for ref and heals a dangling HEAD before returning it
@@ -70,11 +76,11 @@ func storerFor(fs billy.Filesystem) (storage.Storer, error) {
 // transport.ErrRepositoryNotFound, which callers map to a 404 — and treats a
 // heal failure as non-fatal so a clone is never broken by a transient HEAD write.
 func (d *daemon) load(ctx context.Context, ref repofs.RepoRef, cred repofs.Credential) (storage.Storer, error) {
-	fs, err := d.resolver.Resolve(ctx, ref, cred, false)
+	raw, err := d.resolver.Resolve(ctx, ref, cred, false)
 	if err != nil {
 		return nil, err
 	}
-	st, err := storerFor(fs)
+	st, err := storerFor(raw)
 	if err != nil {
 		return nil, err
 	}
@@ -159,12 +165,12 @@ func pickDefaultBranch(st storage.Storer) (plumbing.ReferenceName, error) {
 // demand. Git's daemon never auto-creates; objgitd does, so a first push to a
 // new path just works.
 func (d *daemon) loadOrInit(ctx context.Context, ref repofs.RepoRef, cred repofs.Credential) (storage.Storer, error) {
-	fs, err := d.resolver.Resolve(ctx, ref, cred, true)
+	raw, err := d.resolver.Resolve(ctx, ref, cred, true)
 	if err != nil {
 		return nil, err
 	}
 
-	st, err := storerFor(fs)
+	st, err := storerFor(raw)
 	if err == nil {
 		if err := ensureHEAD(st); err != nil {
 			slog.Warn("could not repoint dangling HEAD", "repo", ref.Path(), "err", err)
@@ -175,12 +181,11 @@ func (d *daemon) loadOrInit(ctx context.Context, ref repofs.RepoRef, cred repofs
 		return nil, err
 	}
 
-	st = filesystem.NewStorage(fs, cache.NewObjectLRUDefault())
-	if _, err := git.Init(st, git.WithDefaultBranch(plumbing.NewBranchReferenceName("main"))); err != nil {
+	if _, err := git.Init(raw, git.WithDefaultBranch(plumbing.NewBranchReferenceName("main"))); err != nil {
 		return nil, fmt.Errorf("init bare repo: %w", err)
 	}
 
 	metrics.ReposCreated()
 	slog.Info("created repository", "repo", ref.Path())
-	return st, nil
+	return raw, nil
 }

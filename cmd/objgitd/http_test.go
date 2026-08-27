@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/memfs"
+	"github.com/go-git/go-git/v6/storage"
 	"github.com/tigrisdata/objgit/internal/auth"
 	"github.com/tigrisdata/objgit/internal/repofs"
 )
@@ -53,7 +53,7 @@ func TestSmartHTTP(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			ts, fs := newHTTPServer(t, tt.allowPush)
+			ts, mb := newHTTPServer(t, tt.allowPush)
 			remote := ts.URL + "/acme/test.git"
 
 			var srcHead string
@@ -71,13 +71,11 @@ func TestSmartHTTP(t *testing.T) {
 				}
 			}
 
-			// The bare repo must exist on disk iff a push was expected to land.
-			_, statErr := fs.Stat("/acme/test/config")
+			// The bare repo must exist iff a push was expected to land.
 			pushLanded := tt.doPush && !tt.wantPushErr
-			if pushLanded && statErr != nil {
-				t.Fatalf("expected repo to be created on push, but config missing: %v", statErr)
-			}
-			if !pushLanded && statErr == nil {
+			if exists := mb.exists("acme/test"); pushLanded && !exists {
+				t.Fatal("expected repo to be created on push, but it does not exist")
+			} else if !pushLanded && exists {
 				t.Fatal("repository must not exist when push did not land")
 			}
 
@@ -103,19 +101,19 @@ func TestSmartHTTP(t *testing.T) {
 	}
 }
 
-// newHTTPServer starts an httptest server backed by a fresh in-memory filesystem
-// and returns it alongside that filesystem for state assertions.
-func newHTTPServer(t *testing.T, allowPush bool) (*httptest.Server, billy.Filesystem) {
+// newHTTPServer starts an httptest server backed by a fresh in-memory resolver
+// and returns it alongside that resolver's backing store for state assertions.
+func newHTTPServer(t *testing.T, allowPush bool) (*httptest.Server, *memBase) {
 	t.Helper()
-	fs := memfs.New()
+	mb := newMemBase()
 	d := &daemon{
-		sysFS:    fs,
-		resolver: repofs.BucketResolver{Base: fs},
+		sysFS:    memfs.New(),
+		resolver: repofs.BucketResolver{Base: mb},
 		authz:    auth.AllowAnonymous{AllowWrite: allowPush},
 	}
 	ts := httptest.NewServer(d.httpHandler())
 	t.Cleanup(ts.Close)
-	return ts, fs
+	return ts, mb
 }
 
 // TestSmartHTTPAnonymousReadWhilePushDisabled verifies that with push disabled,
@@ -126,11 +124,11 @@ func TestSmartHTTPAnonymousReadWhilePushDisabled(t *testing.T) {
 		t.Skip("git not installed")
 	}
 
-	// Seed a repo via a push-enabled server over a shared filesystem.
-	fs := memfs.New()
+	// Seed a repo via a push-enabled server over a shared backing store.
+	mb := newMemBase()
 	seed := httptest.NewServer((&daemon{
-		sysFS:    fs,
-		resolver: repofs.BucketResolver{Base: fs},
+		sysFS:    memfs.New(),
+		resolver: repofs.BucketResolver{Base: mb},
 		authz:    auth.AllowAnonymous{AllowWrite: true},
 	}).httpHandler())
 	t.Cleanup(seed.Close)
@@ -141,10 +139,10 @@ func TestSmartHTTPAnonymousReadWhilePushDisabled(t *testing.T) {
 		t.Fatalf("seed push failed: %v\n%s", err, out)
 	}
 
-	// Serve the same filesystem with push disabled and clone from it.
+	// Serve the same backing store with push disabled and clone from it.
 	ro := httptest.NewServer((&daemon{
-		sysFS:    fs,
-		resolver: repofs.BucketResolver{Base: fs},
+		sysFS:    memfs.New(),
+		resolver: repofs.BucketResolver{Base: mb},
 		authz:    auth.AllowAnonymous{AllowWrite: false},
 	}).httpHandler())
 	t.Cleanup(ro.Close)
@@ -174,10 +172,9 @@ func TestSmartHTTPHookStreams(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	defer slog.SetDefault(prev)
 
-	fs := memfs.New()
 	ts := httptest.NewServer((&daemon{
-		sysFS:       fs,
-		resolver:    repofs.BucketResolver{Base: fs},
+		sysFS:       memfs.New(),
+		resolver:    repofs.BucketResolver{Base: newMemBase()},
 		authz:       auth.AllowAnonymous{AllowWrite: true},
 		allowHooks:  true,
 		hookTimeout: 30 * time.Second,
@@ -236,7 +233,7 @@ type recordingResolver struct {
 	lastCred repofs.Credential
 }
 
-func (r *recordingResolver) Resolve(ctx context.Context, ref repofs.RepoRef, cred repofs.Credential, create bool) (billy.Filesystem, error) {
+func (r *recordingResolver) Resolve(ctx context.Context, ref repofs.RepoRef, cred repofs.Credential, create bool) (storage.Storer, error) {
 	r.mu.Lock()
 	r.lastCred = cred
 	r.mu.Unlock()
@@ -252,10 +249,9 @@ func (r *recordingResolver) credential() repofs.Credential {
 // TestHTTPRejectsNonOrgRepoPath verifies the {orgID}/{repoName} shape is enforced
 // by the router: a single-segment path matches no pattern and is a 404.
 func TestHTTPRejectsNonOrgRepoPath(t *testing.T) {
-	fs := memfs.New()
 	d := &daemon{
-		sysFS:    fs,
-		resolver: repofs.BucketResolver{Base: fs},
+		sysFS:    memfs.New(),
+		resolver: repofs.BucketResolver{Base: newMemBase()},
 		authz:    auth.AllowAnonymous{AllowWrite: true},
 	}
 	ts := httptest.NewServer(d.httpHandler())
@@ -274,10 +270,9 @@ func TestHTTPRejectsNonOrgRepoPath(t *testing.T) {
 // TestHTTPCredentialReachesResolver verifies the HTTP Basic-auth username and
 // password are threaded into the filesystem resolver.
 func TestHTTPCredentialReachesResolver(t *testing.T) {
-	fs := memfs.New()
-	rec := &recordingResolver{inner: repofs.BucketResolver{Base: fs}}
+	rec := &recordingResolver{inner: repofs.BucketResolver{Base: newMemBase()}}
 	d := &daemon{
-		sysFS:    fs,
+		sysFS:    memfs.New(),
 		resolver: rec,
 		authz:    auth.AllowAnonymous{AllowWrite: true},
 	}

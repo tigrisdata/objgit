@@ -10,18 +10,56 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/memfs"
+	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/format/pktline"
 	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v6/plumbing/transport"
+	"github.com/go-git/go-git/v6/storage"
+	"github.com/go-git/go-git/v6/storage/memory"
 	"github.com/tigrisdata/objgit/internal/auth"
 	"github.com/tigrisdata/objgit/internal/metrics"
 	"github.com/tigrisdata/objgit/internal/repofs"
 )
+
+// memBase is a repofs.Base backed by go-git's in-memory storer, letting tests
+// exercise the daemon without a real Tigris bucket. Each ref path gets its own
+// persistent *memory.Storage, cached across calls the way a real bucket's
+// key-prefix scoping persists data across requests.
+type memBase struct {
+	mu    sync.Mutex
+	repos map[string]*memory.Storage
+}
+
+func newMemBase() *memBase { return &memBase{repos: map[string]*memory.Storage{}} }
+
+func (m *memBase) Scoped(prefix string) storage.Storer {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st, ok := m.repos[prefix]
+	if !ok {
+		st = memory.NewStorage()
+		m.repos[prefix] = st
+	}
+	return st
+}
+
+// exists reports whether a repository has been initialized at path, mirroring
+// storerFor's own HEAD-based existence check.
+func (m *memBase) exists(path string) bool {
+	m.mu.Lock()
+	st, ok := m.repos[path]
+	m.mu.Unlock()
+	if !ok {
+		return false
+	}
+	_, err := st.Reference(plumbing.HEAD)
+	return err == nil
+}
 
 // ServeGitProtocol accepts connections on l until ctx is cancelled or Accept fails.
 func (d *daemon) ServeGitProtocol(ctx context.Context, l net.Listener) error {
@@ -155,10 +193,10 @@ func TestDaemonPushCreatesRepo(t *testing.T) {
 		t.Skip("git not installed")
 	}
 
-	fs := memfs.New()
+	mb := newMemBase()
 	d := &daemon{
-		sysFS:    fs,
-		resolver: repofs.BucketResolver{Base: fs},
+		sysFS:    memfs.New(),
+		resolver: repofs.BucketResolver{Base: mb},
 		authz:    auth.AllowAnonymous{AllowWrite: true},
 	}
 
@@ -184,8 +222,8 @@ func TestDaemonPushCreatesRepo(t *testing.T) {
 	// The repository does not exist yet; the push must create it.
 	runGit(t, work, "push", remote, "main")
 
-	if _, err := fs.Stat("/acme/test/config"); err != nil {
-		t.Fatalf("expected bare repo to be created on push, but %q is missing: %v", "/acme/test/config", err)
+	if !mb.exists("acme/test") {
+		t.Fatal("expected bare repo to be created on push, but it does not exist")
 	}
 
 	// Round-trip: a clone must recover the pushed commit.
@@ -212,10 +250,10 @@ func TestDaemonPushDisabled(t *testing.T) {
 		t.Skip("git not installed")
 	}
 
-	fs := memfs.New()
+	mb := newMemBase()
 	d := &daemon{
-		sysFS:    fs,
-		resolver: repofs.BucketResolver{Base: fs},
+		sysFS:    memfs.New(),
+		resolver: repofs.BucketResolver{Base: mb},
 		authz:    auth.AllowAnonymous{AllowWrite: false},
 	}
 
@@ -240,94 +278,9 @@ func TestDaemonPushDisabled(t *testing.T) {
 		t.Fatalf("expected push to be rejected when allowPush is false, got success:\n%s", out)
 	}
 
-	if _, err := fs.Stat("/acme/test/config"); err == nil {
+	if mb.exists("acme/test") {
 		t.Fatal("repository must not be created when push is disabled")
 	}
-}
-
-// TestDaemonPushKeepsPack verifies the receive-pack path stores the incoming
-// pack whole (objects/pack/pack-*.pack + .idx) rather than exploding it into
-// loose objects (objects/<2-hex>/...). git:// used to hide the PackfileWriter
-// capability and fall back to loose objects (one S3 PUT + one Lstat per object);
-// writePack now delimits the pack with a Scanner and feeds the PackfileWriter on
-// every transport.
-func TestDaemonPushKeepsPack(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not installed")
-	}
-
-	fs := memfs.New()
-	d := &daemon{
-		sysFS:    fs,
-		resolver: repofs.BucketResolver{Base: fs},
-		authz:    auth.AllowAnonymous{AllowWrite: true},
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	go func() { _ = d.ServeGitProtocol(ctx, ln) }()
-
-	remote := "git://" + ln.Addr().String() + "/acme/test.git"
-
-	work := t.TempDir()
-	runGit(t, work, "init", "-b", "main")
-	runGit(t, work, "config", "user.email", "test@example.com")
-	runGit(t, work, "config", "user.name", "Test")
-	writeFile(t, filepath.Join(work, "README.md"), "hello\n")
-	runGit(t, work, "add", ".")
-	runGit(t, work, "commit", "-m", "initial") // blob + tree + commit
-	runGit(t, work, "push", remote, "main")
-
-	assertPackedRepo(t, fs, "/acme/test")
-}
-
-// assertPackedRepo fails unless repoPath holds at least one packfile and no loose
-// object directories (a 2-hex-char dir under objects/ such as "ab/").
-func assertPackedRepo(t *testing.T, fs billy.Filesystem, repoPath string) {
-	t.Helper()
-
-	packs, err := fs.ReadDir(repoPath + "/objects/pack")
-	if err != nil {
-		t.Fatalf("ReadDir objects/pack: %v", err)
-	}
-	var packCount int
-	for _, e := range packs {
-		if strings.HasSuffix(e.Name(), ".pack") {
-			packCount++
-		}
-	}
-	if packCount == 0 {
-		t.Errorf("expected a packfile under %s/objects/pack, found none", repoPath)
-	}
-
-	entries, err := fs.ReadDir(repoPath + "/objects")
-	if err != nil {
-		t.Fatalf("ReadDir objects: %v", err)
-	}
-	for _, e := range entries {
-		if e.IsDir() && isLooseObjectDir(e.Name()) {
-			t.Errorf("found loose-object dir objects/%s; pack should have been kept whole", e.Name())
-		}
-	}
-}
-
-// isLooseObjectDir reports whether name is a git loose-object fan-out directory
-// (two lowercase hex characters), distinguishing it from "pack" and "info".
-func isLooseObjectDir(name string) bool {
-	if len(name) != 2 {
-		return false
-	}
-	for _, c := range name {
-		if !strings.ContainsRune("0123456789abcdef", c) {
-			return false
-		}
-	}
-	return true
 }
 
 func runGit(t *testing.T, dir string, args ...string) string {
