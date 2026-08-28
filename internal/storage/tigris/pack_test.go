@@ -58,6 +58,18 @@ func TestCueRoundTrip(t *testing.T) {
 		{name: "sha256 width", hashLen: 32, recs: []cueRecord{
 			{hash: sh1, typ: plumbing.BlobObject, codec: codecZstd, offset: 0, stored: 3, raw: 9},
 		}},
+		// A delta record carries its base hash; raw stays the reconstructed
+		// object size, while stored spans only the delta instruction stream.
+		{name: "one delta record, sha1", hashLen: 20, recs: []cueRecord{
+			{hash: h1, typ: plumbing.BlobObject, offset: 0, stored: 12, raw: 4096, base: h2},
+		}},
+		{name: "delta and its base, sha1, sorted", hashLen: 20, recs: sortedRecs([]cueRecord{
+			{hash: h2, typ: plumbing.BlobObject, offset: 0, stored: 4096, raw: 4096},
+			{hash: h1, typ: plumbing.BlobObject, codec: codecZstd, offset: 4096, stored: 9, raw: 4100, base: h2},
+		})},
+		{name: "delta, sha256 width", hashLen: 32, recs: []cueRecord{
+			{hash: sh1, typ: plumbing.TreeObject, offset: 0, stored: 11, raw: 512, base: sh1},
+		}},
 	}
 
 	for _, tt := range tests {
@@ -81,19 +93,77 @@ func TestCueRoundTrip(t *testing.T) {
 	}
 }
 
-// TestCueEncodesVersion2 pins the on-the-wire version byte. Without it the
-// round-trip test above would pass just as well against v1's layout.
-func TestCueEncodesVersion2(t *testing.T) {
+// TestCueEncodesVersion3 pins the on-the-wire version byte. Without it the
+// round-trip test above would pass just as well against v1's or v2's layout.
+func TestCueEncodesVersion3(t *testing.T) {
 	t.Parallel()
 
 	h1 := hashForBody(formatcfg.DefaultObjectFormat, plumbing.BlobObject, "one")
 	enc := encodeCue(20, []cueRecord{{hash: h1, typ: plumbing.BlobObject, stored: 3, raw: 3}})
 
-	if got := enc[3]; got != 2 {
-		t.Errorf("format version = %d, want 2", got)
+	if got := enc[3]; got != 3 {
+		t.Errorf("format version = %d, want 3", got)
 	}
 	if got := string(enc[0:3]); got != "OGC" {
 		t.Errorf("magic = %q, want %q", got, "OGC")
+	}
+}
+
+// TestCueParsesV2 is the same back-compat guarantee TestCueParsesV1 makes, one
+// version up: v2 containers predate the base-hash column, so every record in
+// one must read back as a non-delta. Hand-built, because encodeCue emits v3.
+func TestCueParsesV2(t *testing.T) {
+	t.Parallel()
+
+	h1 := hashForBody(formatcfg.DefaultObjectFormat, plumbing.BlobObject, "one")
+	h2 := hashForBody(formatcfg.DefaultObjectFormat, plumbing.TreeObject, "two")
+	recs := sortedRecs([]cueRecord{
+		{hash: h1, typ: plumbing.BlobObject, codec: codecRaw, offset: 0, stored: 3, raw: 3},
+		{hash: h2, typ: plumbing.TreeObject, codec: codecZstd, offset: 3, stored: 7, raw: 90},
+	})
+
+	// v2: the same 16-byte header, then six columns — no base column.
+	var block []byte
+	for _, r := range recs {
+		block = append(block, r.hash.Bytes()...)
+	}
+	for _, r := range recs {
+		block = append(block, byte(r.typ))
+	}
+	for _, r := range recs {
+		block = append(block, r.codec)
+	}
+	for _, r := range recs {
+		block = binary.BigEndian.AppendUint64(block, uint64(r.offset))
+	}
+	for _, r := range recs {
+		block = binary.BigEndian.AppendUint64(block, uint64(r.stored))
+	}
+	for _, r := range recs {
+		block = binary.BigEndian.AppendUint64(block, uint64(r.raw))
+	}
+
+	v2 := []byte{'O', 'G', 'C', 2, 20, codecRaw, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}
+	v2 = append(v2, block...)
+
+	got, err := parseCue(20, v2)
+	if err != nil {
+		t.Fatalf("parse v2: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d records, want 2", len(got))
+	}
+	want := map[plumbing.Hash]cueRecord{h1: recs[0], h2: recs[1]}
+	for i := range recs {
+		want[recs[i].hash] = recs[i]
+	}
+	for _, r := range got {
+		if r.base != plumbing.ZeroHash {
+			t.Errorf("record %s base = %s, want the zero hash: v2 has no delta column", r.hash, r.base)
+		}
+		if r != want[r.hash] {
+			t.Errorf("record %s = %+v, want %+v", r.hash, r, want[r.hash])
+		}
 	}
 }
 
@@ -190,7 +260,8 @@ func TestCueParseRejectsCorruption(t *testing.T) {
 // TestCueParseRejectsDecompressionBomb pins the memory bound on the record
 // block. The zstd default is 64 GiB, so without a bound a few kilobytes of
 // hostile or corrupt .cue could exhaust the daemon's memory before any length
-// check ever ran. A legitimate block is under 2 MiB: 32768 records at 58 bytes.
+// check ever ran. The bound tracks maxPackBytes rather than any object count;
+// see cueMaxDecoded.
 func TestCueParseRejectsDecompressionBomb(t *testing.T) {
 	// Not parallel: it lowers a package-level bound.
 	restore := cueMaxDecoded
@@ -348,7 +419,7 @@ func TestPackPayloadCodec(t *testing.T) {
 				t.Fatalf("flush: %v", err)
 			}
 
-			byID := assertContainers(t, s, f, fx, maxPackObjects, maxPackBytes)
+			byID := assertContainers(t, s, f, fx, maxPackBytes)
 			r := recordForSize(t, byID, tt.spec.size)
 
 			if r.codec != tt.wantCodec {
@@ -412,7 +483,7 @@ func TestPackCompressionRatioOnRealSource(t *testing.T) {
 		t.Fatalf("flush: %v", err)
 	}
 
-	byID := assertContainers(t, s, f, fx, maxPackObjects, maxPackBytes)
+	byID := assertContainers(t, s, f, fx, maxPackBytes)
 
 	var raw, stored int64
 	var compressed int
@@ -515,7 +586,7 @@ func TestPackPayloadNeverInflates(t *testing.T) {
 	// the misprediction reachable — at the production 64 KiB window a
 	// compressible head saves more than an incompressible tail can give back,
 	// so no fixture of a sane size would ever rewind. Same motivation as
-	// withMaxPackObjects.
+	// withMaxPackBytes.
 	s := newTestStorer(t, f, withInMemoryCap(probe*2), withProbeWindow(probe))
 	fx := buildBlobFixture(t,
 		blobSpec{size: mispredicts, headCompressible: true, head: probe},
@@ -526,7 +597,7 @@ func TestPackPayloadNeverInflates(t *testing.T) {
 		t.Fatalf("flush: %v", err)
 	}
 
-	byID := assertContainers(t, s, f, fx, maxPackObjects, maxPackBytes)
+	byID := assertContainers(t, s, f, fx, maxPackBytes)
 
 	for _, recs := range byID {
 		for _, r := range recs {
@@ -745,9 +816,9 @@ func TestPackfileWriterRoundTrip(t *testing.T) {
 	}
 
 	// Cold read: a fresh Storer over the same fake bucket must resolve every
-	// object — this is the delta-resolution proof, since the scratch storer
-	// that produced the .bin already flattened every delta before we ever
-	// touched S3.
+	// object. The fixture's edited big.txt means some of those records hold a
+	// delta rather than the object, so this also proves the read path rebuilds
+	// a chain it never saw written.
 	obs, snapshot := countingObserver()
 	s2 := newTestStorer(t, f, obs)
 
@@ -821,7 +892,7 @@ func packContents(t *testing.T, f *fakeS3) (bins, cues map[string][]byte, loose 
 //
 // It returns the parsed records keyed by pack id, so a caller can assert more
 // about how the split actually fell.
-func assertContainers(t *testing.T, s *Storer, f *fakeS3, fx packFixture, maxRecs int, maxBytes int64) map[string][]cueRecord {
+func assertContainers(t *testing.T, s *Storer, f *fakeS3, fx packFixture, maxBytes int64) map[string][]cueRecord {
 	t.Helper()
 
 	bins, cues, loose := packContents(t, f)
@@ -849,9 +920,6 @@ func assertContainers(t *testing.T, s *Storer, f *fakeS3, fx packFixture, maxRec
 		byID[id] = recs
 		if len(recs) == 0 {
 			t.Errorf("pack %s holds no records", id)
-		}
-		if maxRecs > 0 && len(recs) > maxRecs {
-			t.Errorf("pack %s holds %d records, cap is %d", id, len(recs), maxRecs)
 		}
 		if maxBytes > 0 && int64(len(bin)) > maxBytes && len(recs) != 1 {
 			t.Errorf("pack %s holds %d objects in %d bytes, past the %d-byte cap; only a lone oversized object may spill",
@@ -909,58 +977,6 @@ func assertContainers(t *testing.T, s *Storer, f *fakeS3, fx packFixture, maxRec
 	return byID
 }
 
-// TestPackfileWriterSplitsAtObjectLimit covers the write-side cap: one push
-// above the limit lands as several self-consistent bin/cue pairs, and the read
-// side — which has no such cap — resolves every object across all of them.
-func TestPackfileWriterSplitsAtObjectLimit(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not installed")
-	}
-	t.Parallel()
-
-	fx := buildPackFixture(t, 40, false)
-	n := len(fx.hashes)
-	if n < 8 {
-		t.Fatalf("fixture too small to split: %d objects", n)
-	}
-
-	tests := []struct {
-		name  string
-		limit int
-	}{
-		{name: "one object per container", limit: 1},
-		{name: "uneven split", limit: 5},
-		{name: "half the object count", limit: n / 2},
-		{name: "cap equals object count", limit: n},
-		{name: "cap above object count", limit: n + 10},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			f := newFakeS3(t)
-			s := newTestStorer(t, f, withMaxPackObjects(tt.limit))
-			writePack(t, s, fx)
-			if err := s.up.flush(); err != nil {
-				t.Fatalf("flush: %v", err)
-			}
-
-			bins, cues, _ := packContents(t, f)
-			// Ceiling division, never a rounded-up count that would imply an
-			// empty trailing container: limits 1 and n divide n exactly.
-			want := (n + tt.limit - 1) / tt.limit
-			if len(bins) != want || len(cues) != want {
-				t.Fatalf("got %d bins and %d cues, want %d of each (%d objects, cap %d)", len(bins), len(cues), want, n, tt.limit)
-			}
-
-			// No byte cap in play here: the fixture's files are tiny, so the
-			// object cap is the only one that can bind.
-			assertContainers(t, s, f, fx, tt.limit, 0)
-		})
-	}
-}
-
 // buildSizedPackFixture commits one file for each entry in sizes, filled to
 // exactly that many bytes with content unique to that file (identical content
 // would collapse into one blob and one container record), then packs the
@@ -1012,7 +1028,6 @@ func TestPackfileWriterSplitsAtByteLimit(t *testing.T) {
 		name      string
 		sizes     []int
 		byteCap   int64
-		objCap    int // 0 leaves the object cap at its production value
 		wantPacks int // 0 skips the exact-count check; -1 wants more than one
 		oversized int // a blob of this size must sit alone in its container
 	}{
@@ -1047,10 +1062,9 @@ func TestPackfileWriterSplitsAtByteLimit(t *testing.T) {
 			oversized: 50000,
 		},
 		{
-			name:      "both caps bind within one push",
+			name:      "tiny objects ride together until the cap binds",
 			sizes:     []int{100, 100, 100, 9000, 100, 100},
 			byteCap:   8192,
-			objCap:    2,
 			wantPacks: -1,
 		},
 	}
@@ -1062,17 +1076,13 @@ func TestPackfileWriterSplitsAtByteLimit(t *testing.T) {
 			fx := buildSizedPackFixture(t, tt.sizes...)
 
 			f := newFakeS3(t)
-			opts := []Option{withMaxPackBytes(tt.byteCap)}
-			if tt.objCap > 0 {
-				opts = append(opts, withMaxPackObjects(tt.objCap))
-			}
-			s := newTestStorer(t, f, opts...)
+			s := newTestStorer(t, f, withMaxPackBytes(tt.byteCap))
 			writePack(t, s, fx)
 			if err := s.up.flush(); err != nil {
 				t.Fatalf("flush: %v", err)
 			}
 
-			byID := assertContainers(t, s, f, fx, tt.objCap, tt.byteCap)
+			byID := assertContainers(t, s, f, fx, tt.byteCap)
 
 			switch {
 			case tt.wantPacks > 0 && len(byID) != tt.wantPacks:
@@ -1117,7 +1127,9 @@ func TestIterDrainsOnePackAtATime(t *testing.T) {
 	fx := buildPackFixture(t, 40, false)
 
 	f := newFakeS3(t)
-	s := newTestStorer(t, f, withMaxPackObjects(5))
+	// The fixture's objects are tiny, so a one-byte cap is what splits this
+	// push across containers at all.
+	s := newTestStorer(t, f, withMaxPackBytes(1))
 	writePack(t, s, fx)
 	if err := s.up.flush(); err != nil {
 		t.Fatalf("flush: %v", err)
@@ -1647,7 +1659,7 @@ func TestPackPrefetchConcurrencyCap(t *testing.T) {
 	t.Parallel()
 
 	fx := buildPackFixture(t, 40, false)
-	f, reader := seededReader(t, fx, withMaxPackObjects(2))
+	f, reader := seededReader(t, fx, withMaxPackBytes(1))
 	byID := packRecords(t, reader, f)
 	if len(byID) <= maxLivePackFetches {
 		t.Fatalf("fixture produced %d containers, need more than %d", len(byID), maxLivePackFetches)

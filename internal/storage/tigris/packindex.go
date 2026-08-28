@@ -3,6 +3,7 @@ package tigris
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/format/packfile"
 )
 
 const (
@@ -38,18 +40,13 @@ const (
 	// and Scopes every repository off it.
 	maxLivePackFetches = 4
 
-	// maxPackObjects caps how many objects one *written* pack container holds,
-	// so a large initial push lands as several bin/cue pairs instead of one
-	// enormous one. Reads have no matching limit: packIndex merges every
-	// packs/*.cue it lists, so any number of containers, holding any number of
-	// objects, resolves exactly the same way.
-	maxPackObjects = 1 << 15
-
-	// maxPackBytes caps a written container's payload. An object count alone is
-	// a poor proxy for size — 32768 tiny objects is a few megabytes, 32768
-	// large blobs is tens of gigabytes — and container size is what sets the
-	// size of one PutObject, of one prefetched .bin download on the read side
-	// (startPackFetch), and of one PackCache eviction.
+	// maxPackBytes caps a written container's payload, so a large initial push
+	// lands as several bin/cue pairs instead of one enormous one. Size is the
+	// only cap, and nothing bounds a container's object count: a count is a
+	// poor proxy for size — a thousand tiny objects is a few kilobytes, a
+	// thousand large blobs is tens of gigabytes — while container size is what
+	// sets the size of one PutObject, of one prefetched .bin download on the
+	// read side (startPackFetch), and of one PackCache eviction.
 	//
 	// packwriter.go checks this cap *before* adding an object, so a container
 	// sitting just under it never grows past it by swallowing a large object
@@ -57,7 +54,9 @@ const (
 	// object larger than the cap all by itself; giving it a container of its
 	// own beats bloating whichever container it happened to arrive behind.
 	//
-	// Like maxPackObjects, this is a write-side cap only.
+	// This is a write-side cap only. Reads have no matching limit: packIndex
+	// merges every packs/*.cue it lists, so any number of containers, holding
+	// any number of objects, resolves exactly the same way.
 	maxPackBytes = 128 << 20 // 128 MiB
 )
 
@@ -68,6 +67,7 @@ var cueMagicPrefix = [3]byte{'O', 'G', 'C'}
 const (
 	cueVersion1 = 1 // fixed-width records, raw payloads, no codecs
 	cueVersion2 = 2 // columnar records, optionally zstd, per-object codecs
+	cueVersion3 = 3 // v2 plus a base-hash column, so a payload may be a delta
 
 	cueHeaderLen = 16
 
@@ -95,23 +95,69 @@ type cueRecord struct {
 	offset int64 // byte offset of the stored bytes within the .bin
 	stored int64 // stored byte span; == raw when codec is codecRaw
 	raw    int64 // the git object's size, i.e. the decoded length
+	// base is the hash of the object this one is a delta against, or the zero
+	// hash when the payload is the object itself. A set base is the only thing
+	// that marks a record as a delta — there is no separate flag — and the
+	// column costs nothing once zstd sees a run of zeros.
+	//
+	// typ stays the *real* object type even here, never REFDeltaObject, so
+	// every type filter downstream keeps working untouched. raw likewise stays
+	// the reconstructed object's size, which is what preserves stored <= raw
+	// for a delta: the instruction stream is far smaller than what it rebuilds.
+	base plumbing.Hash
 }
 
-// cueRecWidth is one v2 record's contribution to the record block. The block
+// cueRecWidth is one v3 record's contribution to the record block. The block
 // is columnar rather than one struct per record, so this is a total rather
-// than a stride.
-func cueRecWidth(hashLen int) int { return hashLen + 26 }
+// than a stride. Two hashes wide: the object's own, and its delta base.
+func cueRecWidth(hashLen int) int { return hashLen*2 + 26 }
 
-// encodeCue serializes recs (assumed already sorted by hash) into the v2 .cue
-// format: a 16-byte plaintext header, then a record block holding six columns
-// — hashes, types, codecs, offsets, stored lengths, raw sizes.
+// cueRecWidthV2 is the same total for a v2 record, which has no base column.
+// Kept so v2 containers already in a bucket keep parsing.
+func cueRecWidthV2(hashLen int) int { return hashLen + 26 }
+
+// appendHashCol appends exactly hashLen bytes for h.
+//
+// plumbing.Hash carries its own object format, and a zero-value one reports
+// the SHA-1 width no matter what the container uses (ObjectFormat.Size falls
+// back to the default). So h.Bytes() returns 20 bytes for the zero hash even
+// in a SHA-256 container, and appending it directly would shift every column
+// after it. Copying into a zeroed slice of the container's width is correct
+// for a real hash and for the zero hash alike.
+func appendHashCol(dst []byte, h plumbing.Hash, hashLen int) []byte {
+	col := make([]byte, hashLen)
+	copy(col, h.Bytes())
+	return append(dst, col...)
+}
+
+// hashFromCol is appendHashCol's inverse. An all-zero column is the zero hash,
+// which marks a record as "not a delta"; returning plumbing.FromBytes's result
+// there instead would stamp a format onto it and stop it comparing equal to
+// plumbing.ZeroHash in a SHA-256 container.
+func hashFromCol(b []byte) (plumbing.Hash, bool) {
+	for _, c := range b {
+		if c != 0 {
+			return plumbing.FromBytes(b)
+		}
+	}
+	return plumbing.Hash{}, true
+}
+
+// encodeCue serializes recs (assumed already sorted by hash) into the v3 .cue
+// format: a 16-byte plaintext header, then a record block holding seven columns
+// — hashes, types, codecs, offsets, stored lengths, raw sizes, base hashes.
 //
 // Columnar, not one record after another, because interleaving puts 20-32
 // bytes of incompressible hash entropy every 26+ bytes and starves zstd's
 // match finder. Split into columns, the noise is quarantined in the hash
-// column while the other five compress nearly to nothing: types take about
+// columns while the others compress nearly to nothing: types take about
 // four distinct values, codecs two, and the three big-endian uint64 columns
 // have all-zero high bytes.
+//
+// The base column is the v3 addition. It pays for itself twice over: in a
+// repository where nothing is a delta it is a run of zeros that zstd erases,
+// and where objects *are* deltas it saves the reader from rebuilding a delta
+// chain go-git already computed at push time.
 func encodeCue(hashLen int, recs []cueRecord) []byte {
 	n := len(recs)
 	block := make([]byte, 0, n*cueRecWidth(hashLen))
@@ -134,12 +180,15 @@ func encodeCue(hashLen int, recs []cueRecord) []byte {
 	for _, r := range recs {
 		block = binary.BigEndian.AppendUint64(block, uint64(r.raw))
 	}
+	for _, r := range recs {
+		block = appendHashCol(block, r.base, hashLen)
+	}
 
 	body, compressed := compressBlock(block)
 
 	buf := make([]byte, cueHeaderLen, cueHeaderLen+len(body))
 	copy(buf[0:3], cueMagicPrefix[:])
-	buf[3] = cueVersion2
+	buf[3] = cueVersion3
 	buf[4] = byte(hashLen)
 	if compressed {
 		buf[cueRecCodecOff] = codecZstd
@@ -163,7 +212,7 @@ func parseCue(hashLen int, raw []byte) ([]cueRecord, error) {
 		return nil, fmt.Errorf("%w: bad magic", errBadCue)
 	}
 	version := raw[3]
-	if version != cueVersion1 && version != cueVersion2 {
+	if version != cueVersion1 && version != cueVersion2 && version != cueVersion3 {
 		return nil, fmt.Errorf("%w: unsupported format version %d", errBadCue, version)
 	}
 	if got := int(raw[4]); got != hashLen {
@@ -186,7 +235,7 @@ func parseCue(hashLen int, raw []byte) ([]cueRecord, error) {
 		}
 		return parseCueV1(hashLen, raw, int(count))
 	}
-	return parseCueV2(hashLen, raw, int(count))
+	return parseCueColumnar(hashLen, raw, int(count), version == cueVersion3)
 }
 
 // parseCueV1 reads the original fixed-width layout: one hashLen+17-byte record
@@ -219,10 +268,14 @@ func parseCueV1(hashLen int, raw []byte, count int) ([]cueRecord, error) {
 	return recs, nil
 }
 
-// parseCueV2 reads the columnar block, decompressing it first when the header
-// says it is zstd. The decompressed length taking the place of v1's
+// parseCueColumnar reads a v2 or v3 record block, decompressing it first when
+// the header says it is zstd. The decompressed length taking the place of v1's
 // length-versus-count check is what catches a truncated or lying index.
-func parseCueV2(hashLen int, rawCue []byte, count int) ([]cueRecord, error) {
+//
+// withBase selects the version: v3 carries a seventh column of base hashes,
+// v2 does not and every record it yields is a non-delta. Both produce the same
+// []cueRecord, so nothing downstream of here knows which version it came from.
+func parseCueColumnar(hashLen int, rawCue []byte, count int, withBase bool) ([]cueRecord, error) {
 	block := rawCue[cueHeaderLen:]
 
 	switch codec := rawCue[cueRecCodecOff]; codec {
@@ -237,7 +290,11 @@ func parseCueV2(hashLen int, rawCue []byte, count int) ([]cueRecord, error) {
 		return nil, fmt.Errorf("%w: unknown record block codec %d", errBadCue, codec)
 	}
 
-	if want := count * cueRecWidth(hashLen); want != len(block) {
+	width := cueRecWidthV2(hashLen)
+	if withBase {
+		width = cueRecWidth(hashLen)
+	}
+	if want := count * width; want != len(block) {
 		return nil, fmt.Errorf("%w: record block is %d bytes, but %d records need %d", errBadCue, len(block), count, want)
 	}
 
@@ -248,6 +305,10 @@ func parseCueV2(hashLen int, rawCue []byte, count int) ([]cueRecord, error) {
 	offsets := codecs[count:]
 	storeds := offsets[count*8:]
 	raws := storeds[count*8:]
+	var bases []byte
+	if withBase {
+		bases = raws[count*8:]
+	}
 
 	recs := make([]cueRecord, 0, count)
 	for i := 0; i < count; i++ {
@@ -259,6 +320,13 @@ func parseCueV2(hashLen int, rawCue []byte, count int) ([]cueRecord, error) {
 		if codec != codecRaw && codec != codecZstd {
 			return nil, fmt.Errorf("%w: record %d has unknown payload codec %d", errBadCue, i, codec)
 		}
+		var base plumbing.Hash
+		if withBase {
+			base, ok = hashFromCol(bases[i*hashLen : (i+1)*hashLen])
+			if !ok {
+				return nil, fmt.Errorf("%w: record %d has an unreadable base hash", errBadCue, i)
+			}
+		}
 		recs = append(recs, cueRecord{
 			hash:   h,
 			typ:    plumbing.ObjectType(int8(types[i])),
@@ -266,6 +334,7 @@ func parseCueV2(hashLen int, rawCue []byte, count int) ([]cueRecord, error) {
 			offset: int64(binary.BigEndian.Uint64(offsets[i*8:])),
 			stored: int64(binary.BigEndian.Uint64(storeds[i*8:])),
 			raw:    int64(binary.BigEndian.Uint64(raws[i*8:])),
+			base:   base,
 		})
 	}
 	return recs, nil
@@ -284,6 +353,11 @@ type packEntry struct {
 	offset int64
 	stored int64
 	raw    int64
+	// base mirrors cueRecord.base: the object this payload is a delta against,
+	// or the zero hash when the payload is the object itself. Reads resolve it
+	// by hash through this same index, so a base in a sibling container works —
+	// though the writer keeps base and delta together (see packwriter.go).
+	base plumbing.Hash
 }
 
 // indexRecords folds one pack's cue records into the entry map, returning the
@@ -300,6 +374,7 @@ func (p *packIndex) indexRecords(id string, recs []cueRecord) int64 {
 			offset: r.offset,
 			stored: r.stored,
 			raw:    r.raw,
+			base:   r.base,
 		}
 		if end := r.offset + r.stored; end > size {
 			size = end
@@ -715,20 +790,27 @@ func (s *Storer) packObject(t plumbing.ObjectType, h plumbing.Hash, e packEntry)
 	if t != plumbing.AnyObject && e.typ != t {
 		return nil, plumbing.ErrObjectNotFound
 	}
-	hs := objHead{typ: e.typ, size: e.raw}
+	payload, err := s.packPayload(h, e)
+	if err != nil {
+		return nil, err
+	}
+	return s.framePacked(h, e, payload, 0)
+}
 
+// packPayload runs the tier ladder and returns one record's decoded payload —
+// the object's own bytes, or a delta instruction stream when e.base is set.
+// Framing is deliberately not its job, because a delta payload's length has
+// nothing to do with e.raw and would fail the size check in decodeBody.
+func (s *Storer) packPayload(h plumbing.Hash, e packEntry) ([]byte, error) {
 	if e.stored == 0 {
-		obj := plumbing.NewMemoryObject(s.oh)
-		obj.SetType(e.typ)
-		obj.SetSize(0)
-		return obj, nil
+		return nil, nil
 	}
 
 	if path, ok := s.packs.localPath(e.id); ok {
 		f, err := os.Open(path)
 		if err == nil {
 			defer f.Close()
-			return s.decodePacked(h, hs, e.codec, io.NewSectionReader(f, e.offset, e.stored))
+			return s.decodePackedPayload(h, e, io.NewSectionReader(f, e.offset, e.stored))
 		}
 		// os.ErrNotExist: evicted underneath us (the upload just finished);
 		// fall through to the tiers below — S3 now has it.
@@ -737,13 +819,13 @@ func (s *Storer) packObject(t plumbing.ObjectType, h plumbing.Hash, e packEntry)
 	}
 
 	if f, ok := s.packs.bulkCopy(e.id); ok {
-		return s.decodePacked(h, hs, e.codec, io.NewSectionReader(f, e.offset, e.stored))
+		return s.decodePackedPayload(h, e, io.NewSectionReader(f, e.offset, e.stored))
 	}
 
 	s.startPackFetch(e.id)
 
 	if r, ok := s.partialPack(e.id).readerFor(e.offset, e.stored); ok {
-		return s.decodePacked(h, hs, e.codec, r)
+		return s.decodePackedPayload(h, e, r)
 	}
 
 	start := time.Now()
@@ -762,5 +844,105 @@ func (s *Storer) packObject(t plumbing.ObjectType, h plumbing.Hash, e packEntry)
 	}
 	defer out.Body.Close()
 
-	return s.decodePacked(h, hs, e.codec, out.Body)
+	return s.decodePackedPayload(h, e, out.Body)
 }
+
+// maxDeltaDepth bounds how far a read will walk a delta chain before giving up.
+// It matches go-git's own limit (packfile.maxDepth), which is what bounds the
+// chains a push can hand us in the first place. A .cue is just bytes in a
+// bucket, so this is also the guard that keeps a corrupt or hostile index from
+// recursing without end; the visited set beside it catches short cycles that
+// would otherwise spin until the depth ran out.
+const maxDeltaDepth = 50
+
+// framePacked turns a decoded payload into the finished object. For a whole
+// record that is just framing; for a delta it resolves the base and patches.
+//
+// depth counts links already walked. The base is fetched through EncodedObject
+// rather than packObject so a base that was written loose still resolves.
+func (s *Storer) framePacked(h plumbing.Hash, e packEntry, payload []byte, depth int) (plumbing.EncodedObject, error) {
+	if e.base == plumbing.ZeroHash {
+		obj := plumbing.NewMemoryObject(s.oh)
+		obj.SetType(e.typ)
+		obj.SetSize(e.raw)
+		if _, err := obj.Write(payload); err != nil {
+			return nil, fmt.Errorf("%w: %s body disagrees with declared size %d: %w",
+				errBadMetadata, h.String(), e.raw, err)
+		}
+		return obj, nil
+	}
+
+	if depth >= maxDeltaDepth {
+		return nil, fmt.Errorf("%w: delta chain at %s is deeper than %d links", errBadCue, h.String(), maxDeltaDepth)
+	}
+	if e.base == h {
+		return nil, fmt.Errorf("%w: %s is its own delta base", errBadCue, h.String())
+	}
+
+	base, err := s.deltaBase(e.base, depth+1)
+	if err != nil {
+		return nil, err
+	}
+	baseBytes, err := io.ReadAll(mustReader(base))
+	if err != nil {
+		return nil, fmt.Errorf("tigris: read delta base %s: %w", e.base.String(), err)
+	}
+
+	plain, err := packfile.PatchDelta(baseBytes, payload)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s does not patch onto %s: %w", errBadCue, h.String(), e.base.String(), err)
+	}
+
+	obj := plumbing.NewMemoryObject(s.oh)
+	obj.SetType(e.typ)
+	obj.SetSize(e.raw)
+	if _, err := obj.Write(plain); err != nil {
+		return nil, fmt.Errorf("%w: %s rebuilds to %d bytes, not the declared %d: %w",
+			errBadCue, h.String(), len(plain), e.raw, err)
+	}
+	return obj, nil
+}
+
+// deltaBase resolves one link of a chain. A base that is missing is corruption,
+// never absence: the object naming it is present, so the container promised
+// something it did not keep. Reporting ErrObjectNotFound here would let a
+// damaged index read as "this object was never pushed".
+func (s *Storer) deltaBase(base plumbing.Hash, depth int) (plumbing.EncodedObject, error) {
+	if depth >= maxDeltaDepth {
+		return nil, fmt.Errorf("%w: delta chain through %s is deeper than %d links", errBadCue, base.String(), maxDeltaDepth)
+	}
+
+	if e, ok, err := s.packLookup(base); err != nil {
+		return nil, err
+	} else if ok {
+		payload, perr := s.packPayload(base, e)
+		if perr != nil {
+			if errors.Is(perr, plumbing.ErrObjectNotFound) {
+				return nil, fmt.Errorf("%w: delta base %s is indexed but its bytes are gone", errBadCue, base.String())
+			}
+			return nil, perr
+		}
+		return s.framePacked(base, e, payload, depth)
+	}
+
+	obj, err := s.EncodedObject(plumbing.AnyObject, base)
+	if errors.Is(err, plumbing.ErrObjectNotFound) {
+		return nil, fmt.Errorf("%w: delta base %s is not in this repository", errBadCue, base.String())
+	}
+	return obj, err
+}
+
+// mustReader adapts an EncodedObject to an io.Reader. MemoryObject.Reader never
+// fails, and every object reaching here is one; a reader that does fail surfaces
+// as a read error from the caller's io.ReadAll instead of a second error path.
+func mustReader(o plumbing.EncodedObject) io.Reader {
+	r, err := o.Reader()
+	if err != nil {
+		return errReader{err}
+	}
+	return r
+}
+
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }

@@ -1,7 +1,6 @@
 package tigris
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -218,7 +217,7 @@ func (s *Storer) decodePending(t plumbing.ObjectType, h plumbing.Hash, p pending
 	return s.decodeBody(h, hs, f)
 }
 
-// decodePacked reads one packed object's *stored* bytes and hands the object's
+// decodePackedPayload reads one record's *stored* bytes and hands back the
 // real bytes to decodeBody, decompressing first when the cue says the payload
 // is zstd. Every tier of packObject funnels through here, so a compressed
 // container is invisible above this line.
@@ -226,23 +225,25 @@ func (s *Storer) decodePending(t plumbing.ObjectType, h plumbing.Hash, p pending
 // DecodeAll rather than a streaming reader on purpose: decodeBody buffers the
 // whole body into a MemoryObject regardless, and one shared decoder doing
 // DecodeAll beats allocating a zstd.Decoder's window buffers per read.
-func (s *Storer) decodePacked(h plumbing.Hash, hs objHead, codec uint8, body io.Reader) (plumbing.EncodedObject, error) {
-	if codec == codecRaw {
-		return s.decodeBody(h, hs, body)
-	}
-
+func (s *Storer) decodePackedPayload(h plumbing.Hash, e packEntry, body io.Reader) ([]byte, error) {
 	stored, err := io.ReadAll(body)
 	if err != nil {
 		return nil, fmt.Errorf("tigris: read %s: %w", h.String(), err)
 	}
-	// The capacity hint is clamped: hs.size comes from the .cue, so a corrupt
+	if e.codec == codecRaw {
+		return stored, nil
+	}
+
+	// The capacity hint is clamped: e.raw comes from the .cue, so a corrupt
 	// record claiming a huge size must not turn into a huge allocation here.
-	// DecodeAll grows the slice when the real payload needs it.
-	plain, err := payloadDecoder().DecodeAll(stored, make([]byte, 0, min(hs.size, decodeHintCap)))
+	// DecodeAll grows the slice when the real payload needs it. For a delta
+	// record e.raw overshoots — the instruction stream is smaller than what it
+	// rebuilds — which costs a little slack and never correctness.
+	plain, err := payloadDecoder().DecodeAll(stored, make([]byte, 0, min(e.raw, decodeHintCap)))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s payload does not decompress: %w", errBadMetadata, h.String(), err)
 	}
-	return s.decodeBody(h, hs, bytes.NewReader(plain))
+	return plain, nil
 }
 
 // decodeBody reads a GetObject body into a MemoryObject framed by an already

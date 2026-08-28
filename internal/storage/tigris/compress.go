@@ -66,9 +66,13 @@ const (
 // Variables rather than constants so a test can lower them; treat them as
 // constants everywhere else.
 var (
-	// cueMaxDecoded bounds a .cue record block. A full container holds 32768
-	// records of at most 58 bytes, so a legitimate block is under 2 MiB.
-	cueMaxDecoded uint64 = 64 << 20 // 64 MiB
+	// cueMaxDecoded bounds a .cue record block. Only maxPackBytes (128 MiB of
+	// payload) bounds a container, and nothing bounds its object count, so the
+	// block scales with how small the objects in it are: at 90 bytes per record
+	// this admits a container whose objects average 45 bytes apiece. No real
+	// repository is anywhere near that, and every honest container is orders of
+	// magnitude under the bound.
+	cueMaxDecoded uint64 = 256 << 20 // 256 MiB
 
 	// payloadMaxDecoded bounds one object's payload. Generous, because a git
 	// object legitimately can be large, and decodeBody already buffers the

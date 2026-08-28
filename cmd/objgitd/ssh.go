@@ -196,6 +196,8 @@ func (d *daemon) serveSSH(s ssh.Session, service string, ref repofs.RepoRef) err
 	// forwarded yet; v0/v1 is sufficient. See plan.
 	switch service {
 	case transport.UploadPackService:
+		fmt.Fprintln(s.Stderr(), "objgit: loading packfiles from object storage, this may take a moment...")
+
 		st, err := d.load(ctx, ref, cred)
 		if err != nil {
 			fmt.Fprintf(s.Stderr(), "objgitd: repository %q not found\n", ref.Path())
@@ -220,6 +222,8 @@ func (d *daemon) serveSSH(s ssh.Session, service string, ref repofs.RepoRef) err
 		}
 
 	case transport.ReceivePackService:
+		fmt.Fprintln(s.Stderr(), "objgit: loading packfiles from object storage, this may take a moment...")
+
 		st, err := d.loadOrInit(ctx, ref, cred)
 		if err != nil {
 			fmt.Fprintf(s.Stderr(), "objgitd: cannot open repository %q\n", ref.Path())

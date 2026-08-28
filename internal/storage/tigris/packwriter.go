@@ -70,26 +70,21 @@ func (w *packWriter) Close() error {
 		return fmt.Errorf("tigris: decode incoming pack: %w", err)
 	}
 
-	iter, err := w.scratch.IterEncodedObjects(plumbing.AnyObject)
+	plan, err := w.planObjects()
 	if err != nil {
-		return fmt.Errorf("tigris: walk scratch objects: %w", err)
+		return err
 	}
-	defer iter.Close()
 
-	// One push becomes as many containers as its object count and its total
-	// size need: the walk seals a segment the moment it is full and opens the
-	// next one lazily, so a push that divides evenly by a cap never leaves an
-	// empty trailing container. Reads impose no matching limit — packIndex
-	// merges every packs/*.cue it can see (see packindex.go).
+	// One push becomes as many containers as its total size needs: the walk
+	// seals a segment the moment it is full and opens the next one lazily, so a
+	// push that divides evenly by the cap never leaves an empty trailing
+	// container. Reads impose no matching limit — packIndex merges every
+	// packs/*.cue it can see (see packindex.go).
 	//
-	// New sets both caps and Scoped copies them, so the fallbacks are
-	// unreachable today; they stay because an unset cap would seal after every
-	// single object, which is precisely the per-object PUT storm this writer
-	// exists to prevent.
-	limit := w.s.maxPack
-	if limit <= 0 {
-		limit = maxPackObjects
-	}
+	// New sets the cap and Scoped copies it, so the fallback is unreachable
+	// today; it stays because an unset cap would seal after every single
+	// object, which is precisely the per-object PUT storm this writer exists to
+	// prevent.
 	byteLimit := w.s.maxPackBytes
 	if byteLimit <= 0 {
 		byteLimit = maxPackBytes
@@ -102,45 +97,67 @@ func (w *packWriter) Close() error {
 		}
 	}()
 
-	walkErr := iter.ForEach(func(obj plumbing.EncodedObject) error {
-		// The byte cap seals *before* the add, unlike the object cap below: a
-		// container sitting at 127 MiB must not swallow a 500 MiB blob and
-		// land at 627 MiB. The len(seg.recs) > 0 guard is what permits the one
-		// legal spill — an object larger than the whole cap gets a container to
-		// itself, since it has to live somewhere. That container then seals on
-		// the next object's check here, or at the end of the walk below.
-		//
-		// obj.Size() is trustworthy: add fails the push if the bytes it copies
-		// disagree with it.
-		//
-		// seg.offset counts *stored* bytes while obj.Size() is the raw size, so
-		// the comparison mixes the two. It stays correct because the codec
-		// policy guarantees stored <= raw (compress.go, and the rewind in
-		// writeProbed), which makes obj.Size() a valid upper bound on what this
-		// object can add. The only cost is sealing a little early.
-		if seg != nil && len(seg.recs) > 0 && seg.offset+obj.Size() > byteLimit {
-			full := seg
-			seg = nil // ownership moves to seal, which owns its staging files
-			if err := w.seal(full); err != nil {
+	// inSeg is the containment rule made concrete: a delta may only be stored
+	// as a delta when its base is in the container being built. It resets on
+	// every seal, so a delta stranded on the far side of a split is demoted to
+	// its whole form rather than pointing at a sibling container.
+	//
+	// No size hint: only the byte cap bounds a container now, so nothing here
+	// knows how many objects one holds. clear keeps the buckets, so the map
+	// grows once to the largest container's object count and stays there.
+	inSeg := map[plumbing.Hash]struct{}{}
+
+	walkErr := func() error {
+		for _, p := range plan {
+			so, err := w.payloadFor(p, inSeg)
+			if err != nil {
 				return err
 			}
-		}
-		if seg == nil {
-			var err error
-			if seg, err = newPackSegment(w.s); err != nil {
+
+			// The cap seals *before* the add: a container sitting at 127 MiB
+			// must not swallow a 500 MiB blob and land at 627 MiB. The
+			// len(seg.recs) > 0 guard is what permits the one legal spill — an
+			// object larger than the whole cap gets a container to itself,
+			// since it has to live somewhere. That container then seals on the
+			// next object's check here, or at the end of the walk below.
+			//
+			// p.size is trustworthy: add fails the push if the bytes it copies
+			// disagree with the payload's own declared size.
+			//
+			// seg.offset counts *stored* bytes while p.size is the raw size, so
+			// the comparison mixes the two. It stays correct because the codec
+			// policy guarantees stored <= raw (compress.go, and the rewind in
+			// writeProbed), which makes p.size a valid upper bound on what this
+			// object can add — more so for a delta, whose payload is smaller
+			// still. The only cost is sealing a little early.
+			if seg != nil && len(seg.recs) > 0 && seg.offset+p.size > byteLimit {
+				full := seg
+				seg = nil // ownership moves to seal, which owns its staging files
+				if err := w.seal(full); err != nil {
+					return err
+				}
+				clear(inSeg)
+
+				// The seal moved the goalposts: this object's base is no longer
+				// in the container being built, so its delta form is no longer
+				// legal. Ask again, now that inSeg is empty.
+				if so, err = w.payloadFor(p, inSeg); err != nil {
+					return err
+				}
+			}
+			if seg == nil {
+				var err error
+				if seg, err = newPackSegment(w.s); err != nil {
+					return err
+				}
+			}
+			if err := seg.add(so); err != nil {
 				return err
 			}
+			inSeg[p.hash] = struct{}{}
 		}
-		if err := seg.add(obj); err != nil {
-			return err
-		}
-		if len(seg.recs) < limit {
-			return nil
-		}
-		full := seg
-		seg = nil
-		return w.seal(full)
-	})
+		return nil
+	}()
 	if walkErr != nil {
 		// Any segment this push already sealed is enqueued and cannot be
 		// recalled. Each one is a complete, self-consistent container holding
@@ -154,6 +171,128 @@ func (w *packWriter) Close() error {
 	last := seg
 	seg = nil
 	return w.seal(last)
+}
+
+// plannedObject is one object's metadata, gathered before any bytes are
+// written. Type and size come from the *resolved* object, never from the delta
+// header: git records a delta entry's size as the length of its instruction
+// stream, not of the object it rebuilds, and every record's raw field means the
+// latter.
+type plannedObject struct {
+	hash plumbing.Hash
+	typ  plumbing.ObjectType
+	size int64         // the reconstructed object's size
+	base plumbing.Hash // zero when the client did not send this as a delta
+}
+
+// storedObject is one object as a segment will record it: the payload bytes to
+// write, and the identity they rebuild. The two come apart for a delta, where
+// the payload's hash, type, and size all describe the instruction stream rather
+// than the object — which is exactly the mistake this type exists to prevent.
+type storedObject struct {
+	payload plumbing.EncodedObject
+	hash    plumbing.Hash
+	typ     plumbing.ObjectType
+	raw     int64
+	base    plumbing.Hash // zero when payload is the whole object
+}
+
+// planObjects walks the scratch storage once and returns every object in an
+// order where a delta always follows its base.
+//
+// The ordering is the reason this pass exists. IterEncodedObjects yields in
+// index order, which is hash order, so a delta can arrive long before the
+// object it is built from — and the containment rule cannot be checked against
+// a container that has not been filled yet.
+func (w *packWriter) planObjects() ([]plannedObject, error) {
+	iter, err := w.scratch.IterEncodedObjects(plumbing.AnyObject)
+	if err != nil {
+		return nil, fmt.Errorf("tigris: walk scratch objects: %w", err)
+	}
+	defer iter.Close()
+
+	var flat []plannedObject
+	byHash := map[plumbing.Hash]int{}
+	if err := iter.ForEach(func(obj plumbing.EncodedObject) error {
+		p := plannedObject{hash: obj.Hash(), typ: obj.Type(), size: obj.Size()}
+		if do, ok := w.deltaForm(p.hash); ok {
+			p.base = do.BaseHash()
+		}
+		byHash[p.hash] = len(flat)
+		flat = append(flat, p)
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("tigris: plan pack container: %w", err)
+	}
+
+	// Emit bases first. Marking before recursing is what makes a cycle
+	// terminate: a chain that loops back on itself simply places the object it
+	// looped to, and the delta behind it is demoted when its base turns out not
+	// to be in the container yet.
+	order := make([]plannedObject, 0, len(flat))
+	placed := make(map[plumbing.Hash]bool, len(flat))
+	var emit func(p plannedObject)
+	emit = func(p plannedObject) {
+		if placed[p.hash] {
+			return
+		}
+		placed[p.hash] = true
+		if p.base != plumbing.ZeroHash {
+			if i, ok := byHash[p.base]; ok {
+				emit(flat[i])
+			}
+		}
+		order = append(order, p)
+	}
+	for _, p := range flat {
+		emit(p)
+	}
+	return order, nil
+}
+
+// deltaForm asks the scratch storage for h's delta, if the client sent one.
+// The scratch storage is a real go-git filesystem.Storage over the pushed
+// packfile, so this is the client's own delta chain, not one we computed.
+func (w *packWriter) deltaForm(h plumbing.Hash) (plumbing.DeltaObject, bool) {
+	obj, err := w.scratch.DeltaObject(plumbing.AnyObject, h)
+	if err != nil {
+		// Not fatal: a base we cannot read as a delta is simply stored whole.
+		return nil, false
+	}
+	do, ok := obj.(plumbing.DeltaObject)
+	if !ok || do.BaseHash() == plumbing.ZeroHash {
+		return nil, false
+	}
+	return do, true
+}
+
+// payloadFor fetches the bytes to store for p: the client's delta when its base
+// is already in the container being built, and the whole object otherwise.
+func (w *packWriter) payloadFor(p plannedObject, inSeg map[plumbing.Hash]struct{}) (storedObject, error) {
+	whole := func() (storedObject, error) {
+		obj, err := w.scratch.EncodedObject(plumbing.AnyObject, p.hash)
+		if err != nil {
+			return storedObject{}, fmt.Errorf("tigris: read %s from scratch: %w", p.hash, err)
+		}
+		return storedObject{payload: obj, hash: p.hash, typ: p.typ, raw: p.size}, nil
+	}
+
+	if p.base == plumbing.ZeroHash {
+		return whole()
+	}
+	if _, ok := inSeg[p.base]; !ok {
+		return whole()
+	}
+	do, ok := w.deltaForm(p.hash)
+	if !ok || do.BaseHash() != p.base {
+		return whole()
+	}
+	// A delta that does not actually save anything is worse than the object:
+	// it costs a base read on every future fetch for no bytes back.
+	if do.Size() >= p.size {
+		return whole()
+	}
+	return storedObject{payload: do, hash: p.hash, typ: p.typ, raw: p.size, base: p.base}, nil
 }
 
 // packSegment is one container under construction: the staging .bin and the
@@ -187,27 +326,32 @@ func newPackSegment(s *Storer) (*packSegment, error) {
 
 // add appends one object to the segment's .bin — compressed or not, per
 // writePayload — and records where it landed and how it is encoded.
-func (g *packSegment) add(obj plumbing.EncodedObject) error {
-	codec, rawN, storedN, err := g.writePayload(obj)
+func (g *packSegment) add(so storedObject) error {
+	codec, rawN, storedN, err := g.writePayload(so.payload)
 	if err != nil {
 		return err
 	}
 
-	// The integrity check stays on the *raw* count, never the stored one.
-	// obj.Size() being trustworthy is what lets the container byte cap treat
-	// it as an upper bound, and comparing a compressed length against a
-	// declared object size would quietly destroy that.
-	if rawN != obj.Size() {
-		return fmt.Errorf("%s: copied %d bytes, object reports size %d", obj.Hash(), rawN, obj.Size())
+	// The integrity check stays on the *raw* count, never the stored one, and
+	// on the payload's own size rather than so.raw. For a whole object those
+	// are the same number; for a delta they are not, and checking against the
+	// rebuilt size would reject every delta ever written.
+	if rawN != so.payload.Size() {
+		return fmt.Errorf("%s: copied %d bytes, payload reports size %d", so.hash, rawN, so.payload.Size())
 	}
 
+	// hash and typ come from so, never from so.payload. A delta payload hashes
+	// as a REF delta over its instruction stream and reports a delta type, so
+	// deriving either from it would index the container under a hash no client
+	// will ever ask for.
 	g.recs = append(g.recs, cueRecord{
-		hash:   obj.Hash(),
-		typ:    obj.Type(),
+		hash:   so.hash,
+		typ:    so.typ,
 		codec:  codec,
 		offset: g.offset,
 		stored: storedN,
-		raw:    rawN,
+		raw:    so.raw,
+		base:   so.base,
 	})
 	g.offset += storedN
 

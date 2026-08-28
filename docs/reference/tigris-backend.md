@@ -38,7 +38,7 @@ One bucket holds everything. One S3 object holds one git object.
 
 ```
 objects/<hex>      loose object, keyed by its content hash
-packs/<id>.bin     up to 32768 objects or 128 MiB, payloads concatenated
+packs/<id>.bin     up to 128 MiB of payloads, concatenated
 packs/<id>.cue     that pack's index: hash, type, codec, offset, lengths
 ```
 
@@ -70,23 +70,23 @@ is then one ranged `GetObject`, with no reconstruction step.
 A container is two objects:
 
 - `packs/<id>.bin` holds the payload of every object, one after another.
-  There are no deltas. Each payload is raw, or one zstd frame. See
+  A payload is the object itself, or a delta that rebuilds the object
+  from another object. Each payload is raw, or one zstd frame. See
   [Payload compression](#payload-compression).
 - `packs/<id>.cue` holds the index. One record gives the hash, the type,
-  the codec, the offset, and two lengths for one object.
+  the codec, the offset, two lengths, and the base hash for one object.
 
-A push writes one container, or more than one. Two limits bound one
-container, and both live in `packindex.go`:
+A push writes one container, or more than one. One limit bounds a
+container, and it lives in `packindex.go`:
 
-- `maxPackObjects`, 32768 objects.
 - `maxPackBytes`, 128 MiB of payload.
 
-The writer seals a container when it reaches the first of the two. A
-push above either limit writes more containers. An object count alone is
-a poor proxy for size: 32768 tiny objects make a few megabytes, and
-32768 large blobs make tens of gigabytes.
+The writer seals a container when it reaches the limit. A push above the
+limit writes more containers. Nothing limits the object count: a count
+is a poor proxy for size, because a thousand tiny objects make a few
+kilobytes, and a thousand large blobs make tens of gigabytes.
 
-Both limits apply to writes only. Reads accept a repository with any
+The limit applies to writes only. Reads accept a repository with any
 number of containers, and a container of any size.
 
 The `<id>` is the hex SHA-256 of the content of the `.bin`. The name is
@@ -97,12 +97,21 @@ the bytes against the name.
 
 `PackfileWriter` writes the incoming pack to a scratch
 `storage/filesystem.Storage` on a local temporary directory. That storer
-decodes the pack and resolves every delta. `IterEncodedObjects` then
-returns full objects, never deltas. This package writes no pack-parsing
-code of its own.
+decodes the pack. This package writes no pack-parsing code of its own.
 
-The writer copies each object into the `.bin` and adds one record to the
-`.cue`. It then deletes the scratch directory. The two files upload
+The writer makes two passes over the scratch objects. The first pass
+reads the hash, the type, the size, and the delta base of each object.
+It then puts the objects in an order where a base always comes before
+the delta that needs it. This order is necessary because
+`IterEncodedObjects` returns objects in hash order.
+
+The second pass copies each payload into the `.bin` and adds one record
+to the `.cue`. The writer keeps the delta of the client when the base of
+that delta is already in the container under construction. If the base
+is not in that container, the writer stores the whole object instead.
+This rule keeps every container complete on its own.
+
+The writer then deletes the scratch directory. The two files upload
 asynchronously. `SetReference` waits for those uploads, so a ref never
 points to a pack that the bucket does not hold.
 
@@ -140,7 +149,7 @@ All integers are big-endian. The header is 16 bytes:
 
 | Offset | Size | Field                                                |
 | ------ | ---- | ---------------------------------------------------- |
-| 0      | 4    | Magic `OGC\x02`. The last byte is the format version |
+| 0      | 4    | Magic `OGC\x03`. The last byte is the format version |
 | 4      | 1    | Hash width: 20 for SHA-1, 32 for SHA-256             |
 | 5      | 1    | Codec of the record block: 0 raw, 1 zstd             |
 | 6      | 2    | Reserved. Must be zero                               |
@@ -149,7 +158,7 @@ All integers are big-endian. The header is 16 bytes:
 The header is always plaintext. The record block follows it, and the
 header byte at offset 5 says whether that block is one zstd frame.
 
-The block holds six columns, not one struct for each record. N comes
+The block holds seven columns, not one struct for each record. N comes
 from the header, so every column boundary is a calculation:
 
 | Column | Size            | Field                                        |
@@ -160,8 +169,10 @@ from the header, so every column boundary is a calculation:
 | offset | N × 8           | Offset of the payload in the `.bin`          |
 | stored | N × 8           | Stored length: the byte span to fetch        |
 | raw    | N × 8           | Raw length: the size of the git object       |
+| bases  | N × hash width  | Delta base hash, or all zero bytes           |
 
-One record therefore costs `hash width + 26` bytes before compression.
+One record therefore costs `(2 × hash width) + 26` bytes before
+compression.
 
 Columns compress much better than records in sequence. Records in
 sequence put 20 to 32 bytes of hash entropy every 26 bytes or more, and
@@ -170,8 +181,17 @@ place. The other five columns then cost almost nothing, because types
 take about four values, codecs take two, and the three length columns
 hold big-endian integers whose high bytes are all zero.
 
+The base column costs nothing in a repository with no deltas, because a
+run of zero bytes compresses to almost nothing.
+
 Records are sorted by hash. `stored` and `raw` are equal when the codec
-is raw.
+is raw and the record holds no delta.
+
+A record holds a delta when its base is not all zero bytes. There is no
+separate flag. The `types` column always gives the real type of the
+object, never a git delta type. The `raw` column always gives the size
+of the object after the delta is applied, never the length of the delta.
+These two rules let every reader that ignores deltas stay correct.
 
 The parser rejects a bad magic, an unknown format version, a hash width
 that disagrees with the repository, a non-zero reserved field, an
@@ -179,21 +199,44 @@ unknown codec, a record block that does not decompress, or a
 decompressed block whose size disagrees with the record count. A damaged
 index gives an error. It never looks like a missing object.
 
-### Format version 1
+### How a read rebuilds a delta
+
+`EncodedObject` hides deltas from its caller. When a record holds a
+delta, the reader fetches the delta, reads the base object, and applies
+one to the other. The caller gets the finished object.
+
+The reader walks a chain of at most 50 links. This limit is the same one
+that go-git uses, so it accepts every chain that a push can produce. The
+reader also keeps the hashes it has seen, which stops a short cycle.
+
+A `.cue` file is only bytes in a bucket. A base that is missing, a chain
+that is too long, and a cycle are all faults of the index. Each one
+gives an error. None of them looks like a missing object.
+
+`DeltaObject` is the opposite of `EncodedObject`: it gives the delta
+itself, with the base hash beside it. go-git calls this method when it
+builds a pack for a clone. The delta then goes into that pack without a
+rebuild, which is why the server does not compute deltas again.
+
+### Earlier format versions
 
 Version 1 is the original layout: a 16-byte header, then one fixed-width
 record of `hash width + 17` bytes for each object, holding the hash, the
 type, the offset, and one length. Version 1 payloads are always raw.
 
-The parser reads both versions. A version 1 record becomes a record with
-the raw codec and with `stored` equal to `raw`, so nothing above the
-parser knows which version it read. Containers already in a bucket stay
-readable, and no migration pass exists.
+Version 2 is the columnar layout with six columns. It has no base
+column, so no version 2 record can hold a delta. One record costs
+`hash width + 26` bytes.
 
-An older binary reads a version 2 cue as a bad magic and stops. This is
-the correct direction to fail, but it means that a rollback loses every
-container written after the upgrade. The `-pack-compression` flag exists
-for this reason: run one release with the flag off, then turn it on.
+The parser reads all three versions. A version 1 record becomes a record
+with the raw codec and with `stored` equal to `raw`. A version 1 or
+version 2 record becomes a record with a base of all zero bytes. Nothing
+above the parser knows which version it read. Containers already in a
+bucket stay readable, and no migration pass exists.
+
+An older binary reads a later cue as a bad magic and stops. This is the
+correct direction to fail, but it means that a rollback loses every
+container written after the upgrade.
 
 ### Payload compression
 

@@ -12,7 +12,7 @@
 //	shallow             newline separated commit hashes
 //	index               plumbing/format/index-encoded worktree index
 //	config              config.Config.Marshal output
-//	packs/<id>.bin      up to maxPackObjects objects or maxPackBytes bytes,
+//	packs/<id>.bin      up to maxPackBytes bytes of
 //	                    concatenated payloads, each raw or one zstd frame
 //	                    (one push writes as many containers as it needs)
 //	packs/<id>.cue      that pack's index (hash, type, codec, offset, stored
@@ -98,9 +98,8 @@ type Storer struct {
 	// Scoped shares it rather than replacing it, so one root Storer's
 	// descendants — every repository, in production — share one budget.
 	fetchSem chan struct{}
-	maxPack  int // objects per written pack container; see maxPackObjects
-	// maxPackBytes caps a written container's payload; see maxPackBytes. Both
-	// caps apply at once, and the writer seals on whichever it reaches first.
+	// maxPackBytes caps a written container's payload; see maxPackBytes. It is
+	// the only bound on a container: nothing caps the object count.
 	maxPackBytes int64
 	// inMemoryCap is the largest object whose codec is decided exactly rather
 	// than by a head probe; see inMemoryCap and compress.go.
@@ -175,16 +174,9 @@ func withClient(c s3API) Option {
 	return func(s *Storer) { s.client = c }
 }
 
-// withMaxPackObjects lowers the per-container object cap from maxPackObjects.
-// Test-only: it exists so the write-side split can be exercised without a
-// 32768-object git fixture.
-func withMaxPackObjects(n int) Option {
-	return func(s *Storer) { s.maxPack = n }
-}
-
 // withMaxPackBytes lowers the per-container byte cap from maxPackBytes.
-// Test-only, for the same reason as withMaxPackObjects: exercising the split
-// otherwise needs a 128 MiB git fixture.
+// Test-only: it exists so the write-side split can be exercised without a
+// 128 MiB git fixture.
 func withMaxPackBytes(n int64) Option {
 	return func(s *Storer) { s.maxPackBytes = n }
 }
@@ -212,7 +204,6 @@ func New(ctx context.Context, bucket string, opts ...Option) (*Storer, error) {
 	s := &Storer{
 		ctx:             ctx,
 		of:              formatcfg.DefaultObjectFormat,
-		maxPack:         maxPackObjects,
 		maxPackBytes:    maxPackBytes,
 		inMemoryCap:     inMemoryCap,
 		probeWindow:     probeWindow,

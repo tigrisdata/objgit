@@ -119,14 +119,29 @@ read would have to resolve a chain of deltas.
 
 `PackfileWriter` instead writes the incoming pack to a scratch
 `storage/filesystem.Storage` on a local temp directory. That storage decodes
-the pack and resolves every delta for us. `IterEncodedObjects` then hands back
-full objects and never deltas, so this package holds no pack-parsing code.
+the pack for us, so this package holds no pack-parsing code.
 
-The walk copies each object into a flat `packs/<id>.bin`, and one record into
-`packs/<id>.cue`. A record holds the hash, the type, the payload codec, the
-offset, the stored length, and the raw size. `<id>` is the hex SHA-256 of the
-`.bin`, so the name doubles as a checksum. Both files upload through the same
-uploader as loose objects, so the existing `SetReference` flush covers them.
+The writer makes two passes. The first reads the hash, type, size, and delta
+base of every object, then orders them so a base always precedes the delta
+that needs it — `IterEncodedObjects` returns hash order, which gives no such
+guarantee. The second pass copies each payload into a flat `packs/<id>.bin`
+and adds one record to `packs/<id>.cue`. A record holds the hash, the type,
+the payload codec, the offset, the stored length, the raw size, and the base
+hash. `<id>` is the hex SHA-256 of the `.bin`, so the name doubles as a
+checksum. Both files upload through the same uploader as loose objects, so the
+existing `SetReference` flush covers them.
+
+A payload is the object, or the delta the pushing client already computed for
+it. Keeping that delta is what stops every later clone from deriving one
+again: `Storer` implements `storer.DeltaObjectStorer`, so go-git's packer
+reuses the stored delta instead of running its rolling-hash search. See
+[the backend reference](../reference/tigris-backend.md#how-a-read-rebuilds-a-delta).
+
+A delta is only kept when its base lands in the same container. When a
+container seals between the two, the writer stores the whole object instead.
+That costs a few deltas at each boundary and buys back the rule that every
+container resolves on its own, so an interrupted push can never leave a delta
+whose base never uploaded.
 
 An object of 2 KiB or more is stored as one zstd frame when that frame is
 smaller by at least 64 bytes. Smaller objects are always raw. One frame for
@@ -134,32 +149,35 @@ each object is what keeps a packed read one ranged GET. See
 [the backend reference](../reference/tigris-backend.md#payload-compression)
 for the size bands and the measurements behind them.
 
-Two caps bound one container, and the walk seals on the first one it reaches:
-
-- `maxPackObjects` (1<<15), the object count.
-- `maxPackBytes` (128 MiB), the stored payload size.
+One cap bounds a container: `maxPackBytes` (128 MiB), the stored payload size.
+Nothing bounds the object count.
 
 The walk opens the next container lazily, on the next object. A push that
-divides exactly by a cap therefore leaves no empty trailing container. A huge
+divides exactly by the cap therefore leaves no empty trailing container. A huge
 first push becomes a series of bounded containers, instead of one enormous PUT.
 
-An object count alone is a poor proxy for container size. 32768 tiny objects
-make a few megabytes. 32768 large blobs make tens of gigabytes. Container size
-is what sets the size of one PUT, of one prefetched `.bin` download, and of one
-pack cache eviction, so the byte cap bounds all three.
+An object count is a poor proxy for container size. A thousand tiny objects
+make a few kilobytes. A thousand large blobs make tens of gigabytes. Container
+size is what sets the size of one PUT, of one prefetched `.bin` download, and of
+one pack cache eviction, so the byte cap bounds all three.
 
-The two caps differ in where they run. The walk checks the byte cap *before* it
-adds an object, and the object cap after. A container at 127 MiB must not
-swallow a 500 MiB blob and land at 627 MiB.
+The walk checks the cap *before* it adds an object. A container at 127 MiB must
+not swallow a 500 MiB blob and land at 627 MiB.
 
-CAUTION: One container can exceed the byte cap. An object larger than the whole
-cap gets a container to itself, because it has to live somewhere. This is the
-only container that can pass the cap, and it always holds exactly one object.
+CAUTION: One container can exceed the cap. An object larger than the whole cap
+gets a container to itself, because it has to live somewhere. This is the only
+container that can pass the cap, and it always holds exactly one object.
 
-**Both caps are write-side only.** The read path is pack-agnostic: `packIndex`
+**The cap is write-side only.** The read path is pack-agnostic: `packIndex`
 merges every `packs/*.cue` that it lists, and every `packEntry` names its own
 pack. Any number of containers, of any size, therefore resolves the same way.
-`withMaxPackObjects` and `withMaxPackBytes` lower the caps in tests.
+`withMaxPackBytes` lowers the cap in tests.
+
+One knock-on effect is worth knowing. A `.cue` record block grows with the
+number of records, and no cap holds that number down, so the decode bound
+`cueMaxDecoded` (256 MiB, see `compress.go`) is what keeps a hostile `.cue`
+from exhausting memory. It admits a container whose objects average 45 bytes
+apiece, which no real repository approaches.
 
 One consequence is worth keeping. `snapshotEntries` sorts by pack and then by
 offset, so a full iteration drains one container at a time. It does not hold
