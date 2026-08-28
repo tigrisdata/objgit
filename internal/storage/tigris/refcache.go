@@ -1,11 +1,15 @@
 package tigris
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/storage"
 )
 
 // refCache is one Storer's memoized view of every ref in its repository. It
@@ -116,4 +120,135 @@ func (s *Storer) invalidateRefs() {
 	s.refs.etag = ""
 	s.refs.packed = nil
 	s.refs.loose = nil
+}
+
+// maxRefCASRetries bounds the compare-and-swap loop. Eight is far above what
+// honest traffic reaches: a loser re-reads one object and re-uploads one
+// object, so a round trip is milliseconds, and losing eight in a row means
+// something is wrong that another attempt will not fix.
+const maxRefCASRetries = 8
+
+// refExpectation is one CheckAndSetReference precondition: the caller believes
+// that name currently holds old. A nil old means "the ref must not exist".
+type refExpectation struct {
+	name plumbing.ReferenceName
+	old  *plumbing.Reference
+}
+
+// commitRefs applies a whole batch of ref mutations in one conditional
+// PutObject. That single call is the commit point: either every mutation in
+// the batch lands or none of them do.
+//
+// The flush at the top runs once for the batch, and not once per ref. It holds
+// the invariant refs.go protects — a ref must never name an object whose
+// upload has not finished — and one flush per batch instead of one per ref is
+// most of why this path is faster than the loose one.
+func (s *Storer) commitRefs(sets []*plumbing.Reference, removes []plumbing.ReferenceName, expect []refExpectation) error {
+	if len(sets) == 0 && len(removes) == 0 {
+		return nil
+	}
+	if err := s.up.flush(); err != nil {
+		return fmt.Errorf("tigris: commit refs: %w", err)
+	}
+
+	for attempt := 0; attempt < maxRefCASRetries; attempt++ {
+		if attempt > 0 {
+			s.invalidateRefs()
+			if s.refCASObserver != nil {
+				s.refCASObserver()
+			}
+		}
+		if err := s.ensureRefsBuilt(); err != nil {
+			return err
+		}
+
+		s.refs.mu.Lock()
+		etag := s.refs.etag
+		next := make(map[plumbing.ReferenceName]*plumbing.Reference, len(s.refs.packed)+len(s.refs.loose)+len(sets))
+		for n, r := range s.refs.packed {
+			next[n] = r
+		}
+		// Fold the legacy loose layer in. After this commit lands, these names
+		// live in packed-refs, and dropFoldedLooseRefs deletes the keys.
+		folded := make([]plumbing.ReferenceName, 0, len(s.refs.loose))
+		for n, r := range s.refs.loose {
+			next[n] = r
+			folded = append(folded, n)
+		}
+		s.refs.mu.Unlock()
+
+		// Expectations are checked against the merged pre-write view, which is
+		// exactly what next holds before the mutations below are applied.
+		if err := checkRefExpectations(next, expect); err != nil {
+			return err
+		}
+
+		for _, r := range sets {
+			next[r.Name()] = r
+		}
+		for _, n := range removes {
+			delete(next, n)
+		}
+
+		in := &s3.PutObjectInput{
+			Bucket: sp(s.bucket),
+			Key:    sp(s.prefix + packedRefsKey),
+			Body:   bytes.NewReader(encodePackedRefs(next)),
+		}
+		if etag == "" {
+			in.IfNoneMatch = sp("*")
+		} else {
+			in.IfMatch = sp(etag)
+		}
+
+		start := time.Now()
+		out, err := s.client.PutObject(s.ctx, in)
+		s.observe("PutObject", start, err)
+		switch {
+		case err == nil:
+		case isPreconditionFailed(err):
+			continue // somebody else landed first; re-read and re-apply
+		default:
+			return fmt.Errorf("tigris: commit refs: %w", err)
+		}
+
+		// The commit landed. Adopt it in place rather than re-reading, and hand
+		// the folded names to the loose-key cleanup.
+		s.refs.mu.Lock()
+		s.refs.etag = sv(out.ETag)
+		s.refs.packed = next
+		s.refs.loose = map[plumbing.ReferenceName]*plumbing.Reference{}
+		s.refs.built = true
+		s.refs.mu.Unlock()
+
+		return s.dropFoldedLooseRefs(folded, removes)
+	}
+	return fmt.Errorf("%w after %d attempts", ErrRefContention, maxRefCASRetries)
+}
+
+// checkRefExpectations compares a caller's CheckAndSetReference preconditions
+// against the pre-write view. It runs on every attempt, not once: a retry
+// happens precisely because somebody else wrote, so the expectation must be
+// re-tested against what they wrote.
+func checkRefExpectations(view map[plumbing.ReferenceName]*plumbing.Reference, expect []refExpectation) error {
+	for _, e := range expect {
+		cur, ok := view[e.name]
+		switch {
+		case e.old == nil:
+			// A nil old is lenient, matching the in-memory storer: a missing
+			// current reference falls through to creation.
+		case !ok:
+			// Also lenient, and for the same reason.
+		case cur.Hash() != e.old.Hash():
+			return storage.ErrReferenceHasChanged
+		}
+	}
+	return nil
+}
+
+// dropFoldedLooseRefs deletes the legacy loose keys the commit superseded.
+// Task 6 gives it a body; until then a fold leaves its keys in place, which is
+// correct under the merge rule but means the loose layer never shrinks.
+func (s *Storer) dropFoldedLooseRefs(folded, removed []plumbing.ReferenceName) error {
+	return nil
 }

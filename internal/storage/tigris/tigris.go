@@ -61,6 +61,12 @@ var (
 	// ErrModulesNotSupported marks Module: submodule storers need their own
 	// per-module bucket story first.
 	ErrModulesNotSupported = errors.New("tigris: submodule storers are not supported")
+	// ErrRefContention marks a ref write that lost maxRefCASRetries
+	// compare-and-swap races in a row without any of its own expectations
+	// failing. It is deliberately not storage.ErrReferenceHasChanged: nothing
+	// the caller asked for was violated, so a retry is reasonable, where a
+	// changed ref means the caller's view of the world is stale.
+	ErrRefContention = errors.New("tigris: packed-refs contention: too many failed compare-and-swap attempts")
 
 	errBadMetadata  = errors.New("tigris: object has invalid user metadata")
 	errMalformedRef = errors.New("tigris: malformed loose ref")
@@ -91,15 +97,18 @@ type Storer struct {
 	// payloadObserver reports each pack payload's codec and sizes; see
 	// WithPayloadObserver.
 	payloadObserver func(codec string, raw, stored int64)
-	up              *uploader  // batches loose-object PutObject calls off of Close; see upload.go
-	packs           *packIndex // pack containers this Storer knows about; see packindex.go
+	// refCASObserver fires once per retried packed-refs compare-and-swap; see
+	// WithRefCASObserver.
+	refCASObserver func()
+	up             *uploader  // batches loose-object PutObject calls off of Close; see upload.go
+	packs          *packIndex // pack containers this Storer knows about; see packindex.go
 	// refs is this Storer's memoized ref view; see refcache.go. Reads always
 	// consult it. Writes only go through it when packedRefs is set.
 	refs *refCache
 	// packedRefs enables writing the packed-refs object. Reading it is
 	// unconditional — see WithPackedRefs for why the two differ.
 	packedRefs bool
-	cache           *PackCache // optional process-wide local pack cache; see packcache.go
+	cache      *PackCache // optional process-wide local pack cache; see packcache.go
 	// fetchSem bounds whole-pack downloads in flight; see maxLivePackFetches.
 	// Scoped shares it rather than replacing it, so one root Storer's
 	// descendants — every repository, in production — share one budget.
@@ -188,6 +197,18 @@ func WithPackedRefs(enabled bool) Option {
 // here from main.
 func WithPayloadObserver(fn func(codec string, raw, stored int64)) Option {
 	return func(s *Storer) { s.payloadObserver = fn }
+}
+
+// WithRefCASObserver installs a callback fired once for every retried
+// packed-refs compare-and-swap. Contention is the only way the packed-ref
+// design degrades quietly, so it is the one thing worth a metric of its own.
+// A callback rather than a direct metrics call, for the same reason
+// WithPayloadObserver is one: this package stays free of any Prometheus
+// import. Wire metrics.ObserveRefCASRetry here from main.
+//
+// The callback must be safe for concurrent use.
+func WithRefCASObserver(fn func()) Option {
+	return func(s *Storer) { s.refCASObserver = fn }
 }
 
 func withClient(c s3API) Option {

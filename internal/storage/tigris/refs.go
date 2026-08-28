@@ -45,13 +45,23 @@ func decodeRefValue(name plumbing.ReferenceName, v string) (*plumbing.Reference,
 	return plumbing.NewHashReference(name, h), nil
 }
 
-// SetReference flushes every upload queued through this Storer before writing
-// the ref, so a ref can never point at an object that failed — or hasn't yet
-// finished — its asynchronous upload (see upload.go).
+// SetReference writes one ref. With WithPackedRefs set it goes through
+// commitRefs, which is one conditional PutObject; otherwise it writes one
+// loose object, which is what every release before packed refs did.
 func (s *Storer) SetReference(ref *plumbing.Reference) error {
 	if ref == nil {
 		return nil // tolerated identically by the in-memory storer
 	}
+	if s.packedRefs {
+		return s.commitRefs([]*plumbing.Reference{ref}, nil, nil)
+	}
+	return s.setLooseReference(ref)
+}
+
+// setLooseReference writes one refs/<name> object. It flushes every upload
+// queued through this Storer first, so a ref can never point at an object that
+// failed — or hasn't yet finished — its asynchronous upload (see upload.go).
+func (s *Storer) setLooseReference(ref *plumbing.Reference) error {
 	if err := s.up.flush(); err != nil {
 		return fmt.Errorf("tigris: set ref %s: %w", ref.Name().String(), err)
 	}
@@ -72,10 +82,20 @@ func (s *Storer) SetReference(ref *plumbing.Reference) error {
 	return nil
 }
 
+// CheckAndSetReference writes newRef only if the ref currently holds old.
+//
+// With WithPackedRefs set, the compare and the write are one conditional
+// request, so the check cannot go stale between them. Without it, the two
+// steps race exactly as every release before packed refs did.
 func (s *Storer) CheckAndSetReference(newRef, old *plumbing.Reference) error {
 	if newRef == nil {
 		return nil
 	}
+	if s.packedRefs {
+		expect := []refExpectation{{name: newRef.Name(), old: old}}
+		return s.commitRefs([]*plumbing.Reference{newRef}, nil, expect)
+	}
+
 	if old != nil {
 		current, err := s.Reference(newRef.Name())
 		if err == nil && current.Hash() != old.Hash() {
@@ -84,7 +104,7 @@ func (s *Storer) CheckAndSetReference(newRef, old *plumbing.Reference) error {
 		// Missing current reference falls through to creation, mirroring the
 		// in-memory storer's lenient behavior.
 	}
-	return s.SetReference(newRef)
+	return s.setLooseReference(newRef)
 }
 
 func (s *Storer) Reference(n plumbing.ReferenceName) (*plumbing.Reference, error) {
@@ -173,6 +193,9 @@ func (s *Storer) IterReferences() (storer.ReferenceIter, error) {
 }
 
 func (s *Storer) RemoveReference(n plumbing.ReferenceName) error {
+	if s.packedRefs {
+		return s.commitRefs(nil, []plumbing.ReferenceName{n}, nil)
+	}
 	if err := s.removeSimple(s.prefix + refKey(n)); err != nil {
 		return fmt.Errorf("tigris: remove ref %s: %w", n.String(), err)
 	}
