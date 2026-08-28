@@ -104,3 +104,23 @@ in `ioutil.WriteNopCloser` from `go-git/v6/utils/ioutil`.
 An `ssh.Session` is a persistent two-way stream. `handleSSH` therefore uses
 the same no-op closers. It also relies on the same Scanner-bounded
 `writePack`, because it has no request-body EOF like the one HTTP enjoys.
+
+### 3. A push's reference updates are all-or-nothing
+
+`updateReferences` in `receivepack.go` used to apply one reference at a time. A
+failure in the middle left some updates applied and some not.
+
+A storer can now offer a `refUpdater`, which takes the whole push in one call.
+The tigris storer has one, and it commits the batch with a single conditional
+`PutObject` (see
+[tigris-storer.md](tigris-storer.md)). That one call is the commit point, so the
+batch either lands whole or not at all.
+
+This changes what `report-status` carries. On failure every command in the push
+reports the same error, where the first N used to succeed. The protocol permits
+this, and it matches what `git push --atomic` means. Per-command rejections
+still work as before: a command that fails validation never reaches the batch,
+and it reports its own error.
+
+A storer with no `refUpdater` keeps the per-reference path, which is what
+`memory.Storage` uses in the tests.

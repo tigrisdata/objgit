@@ -8,7 +8,13 @@
 //
 //	objects/<hex>       loose object keyed by content hash; user metadata
 //	                    carries the git type (git-type) and size (git-size)
-//	refs/<name>         one loose ref (hash hex, or "ref: target" for symbolics)
+//	packed-refs         every ref in one object, under a compare-and-swap; see
+//	                    packedrefs.go for the format and refcache.go for the
+//	                    read and write paths
+//	refs/<name>         one legacy loose ref (hash hex, or "ref: target" for
+//	                    symbolics). Read-only: the first packed write folds
+//	                    these in and deletes them. A loose ref still wins over
+//	                    a packed one — refView explains why.
 //	shallow             newline separated commit hashes
 //	index               plumbing/format/index-encoded worktree index
 //	config              config.Config.Marshal output
