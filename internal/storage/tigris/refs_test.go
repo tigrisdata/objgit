@@ -13,12 +13,16 @@ const (
 	headCD = "2222222222222222222222222222222222222222"
 )
 
-func hashRef(name, hexval string) *plumbing.Reference {
+func mustHash(hexval string) plumbing.Hash {
 	h, ok := plumbing.FromHex(hexval)
 	if !ok {
 		panic("refs_test bug: bad hex fixture " + hexval)
 	}
-	return plumbing.NewHashReference(plumbing.ReferenceName(name), h)
+	return h
+}
+
+func hashRef(name, hexval string) *plumbing.Reference {
+	return plumbing.NewHashReference(plumbing.ReferenceName(name), mustHash(hexval))
 }
 
 func TestReferenceRoundTrip(t *testing.T) {
