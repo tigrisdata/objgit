@@ -104,6 +104,21 @@ func encoder() *zstd.Encoder {
 	return zstdEnc
 }
 
+// streamEncPool holds *zstd.Encoder values dedicated to copyCompressed's
+// streaming path (packwriter.go), separate from the encoder() singleton
+// above: that singleton serves concurrent EncodeAll calls and must never be
+// Reset out from under them, while a streaming copy owns its encoder for the
+// duration of one object and can safely Reset it at a new io.Writer for the
+// next. Pooling avoids paying for a fresh match-history buffer — tens of
+// megabytes, sized off the encoder's window — on every large object.
+var streamEncPool = sync.Pool{
+	New: func() any {
+		// Same error-impossibility reasoning as encoder() above.
+		zw, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
+		return zw
+	},
+}
+
 func cueDecoder() *zstd.Decoder {
 	cueDecOnce.Do(func() {
 		cueDec, _ = zstd.NewReader(nil, zstd.WithDecoderMaxMemory(cueMaxDecoded))

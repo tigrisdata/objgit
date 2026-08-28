@@ -70,7 +70,7 @@ func (w *packWriter) Close() error {
 		return fmt.Errorf("tigris: decode incoming pack: %w", err)
 	}
 
-	plan, err := w.planObjects()
+	objs, order, err := w.planObjects()
 	if err != nil {
 		return err
 	}
@@ -108,7 +108,8 @@ func (w *packWriter) Close() error {
 	inSeg := map[plumbing.Hash]struct{}{}
 
 	walkErr := func() error {
-		for _, p := range plan {
+		for _, idx := range order {
+			p := objs[idx]
 			so, err := w.payloadFor(p, inSeg)
 			if err != nil {
 				return err
@@ -197,57 +198,76 @@ type storedObject struct {
 	base    plumbing.Hash // zero when payload is the whole object
 }
 
-// planObjects walks the scratch storage once and returns every object in an
-// order where a delta always follows its base.
+// planObjects walks the scratch storage once and returns every object
+// (flat) alongside an order — indices into flat — where a delta always
+// follows its base.
 //
 // The ordering is the reason this pass exists. IterEncodedObjects yields in
 // index order, which is hash order, so a delta can arrive long before the
 // object it is built from — and the containment rule cannot be checked against
 // a container that has not been filled yet.
-func (w *packWriter) planObjects() ([]plannedObject, error) {
+//
+// order and placed hold indices/flags rather than copies of plannedObject or
+// a second map keyed by plumbing.Hash: a 32-byte SHA256 hash makes a
+// map[plumbing.Hash]* expensive per entry, and a push the size of a large
+// repository's full history has enough objects that the difference is the
+// gap between this fitting in memory and not. flat is already hash-sorted
+// (the property above), so base lookups use binary search instead of a
+// second map.
+func (w *packWriter) planObjects() ([]plannedObject, []int32, error) {
 	iter, err := w.scratch.IterEncodedObjects(plumbing.AnyObject)
 	if err != nil {
-		return nil, fmt.Errorf("tigris: walk scratch objects: %w", err)
+		return nil, nil, fmt.Errorf("tigris: walk scratch objects: %w", err)
 	}
 	defer iter.Close()
 
 	var flat []plannedObject
-	byHash := map[plumbing.Hash]int{}
 	if err := iter.ForEach(func(obj plumbing.EncodedObject) error {
 		p := plannedObject{hash: obj.Hash(), typ: obj.Type(), size: obj.Size()}
 		if do, ok := w.deltaForm(p.hash); ok {
 			p.base = do.BaseHash()
 		}
-		byHash[p.hash] = len(flat)
 		flat = append(flat, p)
 		return nil
 	}); err != nil {
-		return nil, fmt.Errorf("tigris: plan pack container: %w", err)
+		return nil, nil, fmt.Errorf("tigris: plan pack container: %w", err)
 	}
 
 	// Emit bases first. Marking before recursing is what makes a cycle
 	// terminate: a chain that loops back on itself simply places the object it
 	// looped to, and the delta behind it is demoted when its base turns out not
 	// to be in the container yet.
-	order := make([]plannedObject, 0, len(flat))
-	placed := make(map[plumbing.Hash]bool, len(flat))
-	var emit func(p plannedObject)
-	emit = func(p plannedObject) {
-		if placed[p.hash] {
+	order := make([]int32, 0, len(flat))
+	placed := make([]bool, len(flat))
+	var emit func(i int32)
+	emit = func(i int32) {
+		if placed[i] {
 			return
 		}
-		placed[p.hash] = true
-		if p.base != plumbing.ZeroHash {
-			if i, ok := byHash[p.base]; ok {
-				emit(flat[i])
+		placed[i] = true
+		if base := flat[i].base; base != plumbing.ZeroHash {
+			if j, ok := findByHash(flat, base); ok {
+				emit(j)
 			}
 		}
-		order = append(order, p)
+		order = append(order, i)
 	}
-	for _, p := range flat {
-		emit(p)
+	for i := range flat {
+		emit(int32(i))
 	}
-	return order, nil
+	return flat, order, nil
+}
+
+// findByHash locates h in flat by binary search. Callers hold flat in the
+// hash order IterEncodedObjects produced, which is the order this depends on.
+func findByHash(flat []plannedObject, h plumbing.Hash) (int32, bool) {
+	i := sort.Search(len(flat), func(i int) bool {
+		return bytes.Compare(flat[i].hash.Bytes(), h.Bytes()) >= 0
+	})
+	if i < len(flat) && flat[i].hash == h {
+		return int32(i), true
+	}
+	return -1, false
 }
 
 // deltaForm asks the scratch storage for h's delta, if the client sent one.
@@ -471,23 +491,26 @@ func (g *packSegment) copyRawWithHead(obj plumbing.EncodedObject, head []byte, r
 }
 
 // copyCompressed streams head followed by the rest of rd through a zstd
-// encoder into the .bin, returning the raw and stored byte counts. A dedicated
-// streaming encoder rather than the shared one: the shared encoder serves
-// concurrent EncodeAll calls and must never be Reset underneath them. Objects
-// reaching this path are larger than inMemoryCap, so they are rare enough to
-// afford the allocation.
+// encoder into the .bin, returning the raw and stored byte counts. The
+// encoder comes from streamEncPool (compress.go) rather than the shared
+// encoder() singleton: the singleton serves concurrent EncodeAll calls and
+// must never be Reset underneath them, while a pooled streaming encoder is
+// owned for the duration of one object and returned after. That reuse is
+// what keeps this path from allocating a fresh match-history buffer per
+// object — objects reaching this path are larger than inMemoryCap, but a
+// repository's history can still hold enough of them that the allocation
+// adds up.
 func (g *packSegment) copyCompressed(obj plumbing.EncodedObject, head []byte, rd io.Reader) (int64, int64, error) {
 	before, err := g.file.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return 0, 0, fmt.Errorf("locate %s in pack staging file: %w", obj.Hash(), err)
 	}
 
-	zw, err := zstd.NewWriter(g.file, zstd.WithEncoderLevel(zstd.SpeedDefault))
-	if err != nil {
-		return 0, 0, fmt.Errorf("open encoder for %s: %w", obj.Hash(), err)
-	}
+	zw := streamEncPool.Get().(*zstd.Encoder)
+	zw.Reset(g.file)
 	rawN, copyErr := io.Copy(zw, io.MultiReader(bytes.NewReader(head), rd))
 	closeErr := zw.Close()
+	streamEncPool.Put(zw)
 	switch {
 	case copyErr != nil:
 		return 0, 0, fmt.Errorf("compress %s: %w", obj.Hash(), copyErr)
