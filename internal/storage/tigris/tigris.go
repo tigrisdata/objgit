@@ -93,6 +93,12 @@ type Storer struct {
 	payloadObserver func(codec string, raw, stored int64)
 	up              *uploader  // batches loose-object PutObject calls off of Close; see upload.go
 	packs           *packIndex // pack containers this Storer knows about; see packindex.go
+	// refs is this Storer's memoized ref view; see refcache.go. Reads always
+	// consult it. Writes only go through it when packedRefs is set.
+	refs *refCache
+	// packedRefs enables writing the packed-refs object. Reading it is
+	// unconditional — see WithPackedRefs for why the two differ.
+	packedRefs bool
 	cache           *PackCache // optional process-wide local pack cache; see packcache.go
 	// fetchSem bounds whole-pack downloads in flight; see maxLivePackFetches.
 	// Scoped shares it rather than replacing it, so one root Storer's
@@ -158,6 +164,20 @@ func WithPackCache(c *PackCache) Option {
 // window empty.
 func WithPackCompression(enabled bool) Option {
 	return func(s *Storer) { s.packCompression = enabled }
+}
+
+// WithPackedRefs controls whether ref writes go to the single packed-refs
+// object under a compare-and-swap, instead of one loose object per ref.
+// Reading packed-refs is never gated: a Storer merges the packed object and
+// the loose layer no matter how this is set.
+//
+// The asymmetry is the same rollback story WithPackCompression tells. A binary
+// that cannot read packed-refs sees every ref written through it vanish, which
+// makes a repository look empty rather than failing loudly. Shipping the
+// reader in one release and turning writes on in a later one makes that window
+// empty.
+func WithPackedRefs(enabled bool) Option {
+	return func(s *Storer) { s.packedRefs = enabled }
 }
 
 // WithPayloadObserver installs a callback fired once for every object written
@@ -226,6 +246,7 @@ func New(ctx context.Context, bucket string, opts ...Option) (*Storer, error) {
 	}
 	s.up = newUploader(s)
 	s.packs = newPackIndex()
+	s.refs = newRefCache()
 	s.fetchSem = make(chan struct{}, maxLivePackFetches)
 	return s, nil
 }
@@ -240,9 +261,10 @@ var _ storer.PackfileWriter = (*Storer)(nil)
 // Storer value. Prefixes nest: scoping an already-scoped Storer extends its
 // existing prefix. Cheap: it copies the Storer value and dials nothing.
 //
-// The returned Storer gets its own uploader and pack index (see upload.go,
-// packindex.go), independent of s's: one repository's push, pending/failed
-// uploads, or pack read history can never block or leak into another's.
+// The returned Storer gets its own uploader, pack index, and ref cache (see
+// upload.go, packindex.go, refcache.go), independent of s's: one repository's
+// push, pending/failed uploads, ref view, or pack read history can never block
+// or leak into another's.
 //
 // Two things are shared on purpose. The pack cache, because sharing downloaded
 // packs across requests is the whole point of it, and its keys are content
@@ -260,6 +282,7 @@ func (s *Storer) Scoped(prefix string) *Storer {
 	}
 	cp.up = newUploader(&cp)
 	cp.packs = newPackIndex()
+	cp.refs = newRefCache()
 	return &cp
 }
 

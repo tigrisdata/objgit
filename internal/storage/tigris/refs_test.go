@@ -162,7 +162,7 @@ func TestIterReferencesSortedAndComplete(t *testing.T) {
 		t.Fatalf("walk: %v", err)
 	}
 
-	want := []string{"refs/heads/alpha", "refs/heads/zeta", "refs/tags/v1"} // S3-sorted
+	want := []string{"refs/heads/alpha", "refs/heads/zeta", "refs/tags/v1"} // IterReferences sorts by name
 	if len(names) != len(want) {
 		t.Fatalf("walked %d refs, want %d: %v", len(names), len(want), names)
 	}
