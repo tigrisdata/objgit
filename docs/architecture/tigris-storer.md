@@ -206,22 +206,30 @@ format can add a third tab-separated field for the peeled hash. A v1 reader
 refuses such a line rather than misreading it, so adding the field is a version
 bump and not a new key.
 
-### Turning packed-ref writes on
+### The `-packed-refs` flag
 
-`WithPackedRefs` is off by default. Reading packed references is not gated, so
-every binary that carries this code can already read the format.
+Packed-reference writes are **on by default**. The `-packed-refs` flag turns
+them off, and `PACKED_REFS` sets it through the environment. This mirrors
+`-pack-compression`, which carries the same shape for the same reason.
 
-Flip the default only when every node runs a binary that can read packed
-references. Two steps, in one commit:
+Reading packed references is never gated, so the flag only chooses where a
+write goes.
 
-1. In `New` (`internal/storage/tigris/tigris.go`), set the `packedRefs` field's
-   initial value to `true`.
-2. In `internal/storage/tigris/refcommit_test.go`, delete
-   `TestPackedWritesAreGated` and add its opposite: a default storer writes
-   `packed-refs` and not a loose key.
+Turn it off for one release before rolling a deploy back to a binary that
+predates the format. That binary cannot read `packed-refs`, so it sees every
+reference written through it vanish, and the repository looks empty rather than
+failing loudly. One release with writes off leaves the window empty.
 
-CAUTION: Do not flip the default and change the format in one release. A
-rollback then has no binary that can read what the window wrote.
+The flag is safe in both directions:
+
+- Off does not hide references an earlier release packed. Reads still merge the
+  packed object.
+- On again folds the loose keys written while it was off, on the first write.
+
+`TestPackedRefsOffStillReadsPackedRefs` pins both halves.
+
+CAUTION: Do not change the format and flip this flag in one release. A rollback
+then has no binary that can read what the window wrote.
 
 ## Writes are asynchronous (`upload.go`)
 

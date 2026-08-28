@@ -47,6 +47,7 @@ var (
 	packCacheBytes = flag.Int64("pack-cache-bytes", 2<<30, "disk budget for the local pack cache, least-recently-used eviction; 0 disables caching")
 
 	packCompression = flag.Bool("pack-compression", true, "store zstd-compressed payloads in newly written pack containers; reading compressed containers is always enabled, so this is safe to turn off for one release before a rollback")
+	packedRefs      = flag.Bool("packed-refs", true, "write every ref into one packed-refs object under a compare-and-swap, instead of one object per ref; reading packed refs is always enabled, so this is safe to turn off for one release before a rollback")
 )
 
 // tigrisBase adapts *tigris.Storer to repofs.Base: Storer.Scoped returns the
@@ -108,6 +109,7 @@ func main() {
 		tigris.WithPayloadObserver(metrics.ObservePackPayload),
 		tigris.WithRefCASObserver(metrics.ObserveRefCASRetry),
 		tigris.WithPackCompression(*packCompression),
+		tigris.WithPackedRefs(*packedRefs),
 	}
 	var packCache *tigris.PackCache
 	if *packCacheBytes > 0 {

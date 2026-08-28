@@ -40,14 +40,12 @@ func TestReferenceRoundTrip(t *testing.T) {
 		t.Fatalf("set sym: %v", err)
 	}
 
-	t.Run("loose values mirror dotgit encoding", func(t *testing.T) {
-		o := f.get(t, "refs/refs/heads/main")
-		if got := string(o.body); got != headAB+"\n" {
-			t.Errorf("want %q, got %q", headAB+"\n", got)
+	t.Run("writes land in packed-refs, not loose keys", func(t *testing.T) {
+		if _, ok := f.objs[packedRefsKey]; !ok {
+			t.Error("no packed-refs object was written")
 		}
-		osym := f.get(t, "refs/HEAD")
-		if got := string(osym.body); got != "ref: refs/heads/main\n" {
-			t.Errorf("want symbolic encoding, got %q", got)
+		if _, ok := f.objs["refs/refs/heads/main"]; ok {
+			t.Error("a loose key was written with packed refs on")
 		}
 	})
 
@@ -80,6 +78,45 @@ func TestReferenceRoundTrip(t *testing.T) {
 			t.Errorf("nil SetReference errored: %v", err)
 		}
 	})
+}
+
+// TestLooseReferenceEncodingWithPackedRefsOff pins the loose write path, which
+// -packed-refs=false selects. It stays covered because that flag is the lever
+// an operator pulls for one release before rolling back to a binary that
+// predates the packed format.
+func TestLooseReferenceEncodingWithPackedRefsOff(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeS3(t)
+	s := newTestStorer(t, f, WithPackedRefs(false))
+
+	if err := s.SetReference(hashRef("refs/heads/main", headAB)); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	sym := plumbing.NewSymbolicReference(plumbing.HEAD, plumbing.ReferenceName("refs/heads/main"))
+	if err := s.SetReference(sym); err != nil {
+		t.Fatalf("set sym: %v", err)
+	}
+
+	// Values mirror dotgit encoding exactly.
+	if got := string(f.get(t, "refs/refs/heads/main").body); got != headAB+"\n" {
+		t.Errorf("want %q, got %q", headAB+"\n", got)
+	}
+	if got := string(f.get(t, "refs/HEAD").body); got != "ref: refs/heads/main\n" {
+		t.Errorf("want symbolic encoding, got %q", got)
+	}
+	if _, ok := f.objs[packedRefsKey]; ok {
+		t.Error("packed-refs was written with the flag off")
+	}
+
+	// And a binary with the flag off still reads what it wrote.
+	back, err := s.Reference(plumbing.ReferenceName("refs/heads/main"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if back.Hash().String() != headAB {
+		t.Errorf("main = %s, want %s", back.Hash(), headAB)
+	}
 }
 
 func TestCheckAndSetReferenceCas(t *testing.T) {
@@ -172,12 +209,16 @@ func TestIterReferencesSortedAndComplete(t *testing.T) {
 		}
 	}
 
+	// CountLooseRefs counts only the legacy layer, so packed writes leave it at
+	// zero. That is the assertion worth making here: it proves the writes above
+	// left no loose keys behind. TestFoldedRefCountDropsToZero covers the
+	// number's other half, a bucket that starts with loose keys.
 	n, cerr := s.CountLooseRefs()
 	if cerr != nil {
 		t.Fatalf("count: %v", cerr)
 	}
-	if n != len(want) {
-		t.Errorf("count disagrees with walk: %d vs %d", n, len(want))
+	if n != 0 {
+		t.Errorf("packed writes left %d loose refs behind", n)
 	}
 }
 

@@ -87,7 +87,7 @@ func TestPackRefsIsGated(t *testing.T) {
 	t.Parallel()
 
 	f := newFakeS3(t)
-	s := newTestStorer(t, f) // default: off
+	s := newTestStorer(t, f, WithPackedRefs(false))
 	f.put(refPrefix+"refs/heads/main", headAB+"\n", nil)
 
 	if err := s.PackRefs(); err != nil {

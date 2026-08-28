@@ -112,8 +112,8 @@ type Storer struct {
 	// refs is this Storer's memoized ref view; see refcache.go. Reads always
 	// consult it. Writes only go through it when packedRefs is set.
 	refs *refCache
-	// packedRefs enables writing the packed-refs object. Reading it is
-	// unconditional — see WithPackedRefs for why the two differ.
+	// packedRefs enables writing the packed-refs object. Defaults to true.
+	// Reading it is unconditional — see WithPackedRefs for why the two differ.
 	packedRefs bool
 	cache      *PackCache // optional process-wide local pack cache; see packcache.go
 	// fetchSem bounds whole-pack downloads in flight; see maxLivePackFetches.
@@ -184,14 +184,19 @@ func WithPackCompression(enabled bool) Option {
 
 // WithPackedRefs controls whether ref writes go to the single packed-refs
 // object under a compare-and-swap, instead of one loose object per ref.
-// Reading packed-refs is never gated: a Storer merges the packed object and
-// the loose layer no matter how this is set.
+// Defaults to true.
 //
-// The asymmetry is the same rollback story WithPackCompression tells. A binary
-// that cannot read packed-refs sees every ref written through it vanish, which
-// makes a repository look empty rather than failing loudly. Shipping the
-// reader in one release and turning writes on in a later one makes that window
-// empty.
+// Reading packed-refs is never gated: a Storer merges the packed object and
+// the loose layer no matter how this is set. That asymmetry is the same
+// rollback story WithPackCompression tells. A binary that cannot read
+// packed-refs sees every ref written through it vanish, which makes a
+// repository look empty rather than failing loudly — so turn writes off for
+// one release before rolling back to a binary that predates the format, and
+// the window it could have written in is empty.
+//
+// Turning it off does not hide the refs already in a packed-refs object. Reads
+// still merge it, and the first write with it back on folds the loose keys
+// written in between. So this is a safe lever in both directions.
 func WithPackedRefs(enabled bool) Option {
 	return func(s *Storer) { s.packedRefs = enabled }
 }
@@ -256,6 +261,7 @@ func New(ctx context.Context, bucket string, opts ...Option) (*Storer, error) {
 		inMemoryCap:     inMemoryCap,
 		probeWindow:     probeWindow,
 		packCompression: true,
+		packedRefs:      true,
 	}
 	for _, opt := range opts {
 		opt(s)

@@ -261,22 +261,114 @@ func TestCommitRefsFlushesOnce(t *testing.T) {
 	}
 }
 
-// TestPackedWritesAreGated pins that WithPackedRefs off keeps every write on
-// the loose path, which is what makes a rollback safe.
-func TestPackedWritesAreGated(t *testing.T) {
+// TestPackedRefsFlagSelectsTheWritePath pins both directions of the flag. The
+// default is on, which is what -packed-refs=true means. Off keeps every write
+// on the loose path, which is the lever for one release before a rollback to a
+// binary that predates the format.
+func TestPackedRefsFlagSelectsTheWritePath(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		opts      []Option
+		wantKey   string
+		unwantKey string
+	}{
+		{
+			name:      "default writes packed-refs",
+			wantKey:   packedRefsKey,
+			unwantKey: refPrefix + "refs/heads/main",
+		},
+		{
+			name:      "explicitly on writes packed-refs",
+			opts:      []Option{WithPackedRefs(true)},
+			wantKey:   packedRefsKey,
+			unwantKey: refPrefix + "refs/heads/main",
+		},
+		{
+			name:      "off writes a loose key",
+			opts:      []Option{WithPackedRefs(false)},
+			wantKey:   refPrefix + "refs/heads/main",
+			unwantKey: packedRefsKey,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newFakeS3(t)
+			s := newTestStorer(t, f, tt.opts...)
+
+			if err := s.SetReference(hashRef("refs/heads/main", headAB)); err != nil {
+				t.Fatalf("set: %v", err)
+			}
+			if _, ok := f.objs[tt.wantKey]; !ok {
+				t.Errorf("expected key %q was not written; bucket holds %d keys", tt.wantKey, len(f.objs))
+			}
+			if _, ok := f.objs[tt.unwantKey]; ok {
+				t.Errorf("unexpected key %q was written", tt.unwantKey)
+			}
+
+			// Either way the ref reads back, because reads are never gated.
+			got, err := s.Reference(plumbing.ReferenceName("refs/heads/main"))
+			if err != nil {
+				t.Fatalf("read: %v", err)
+			}
+			if got.Hash().String() != headAB {
+				t.Errorf("main = %s, want %s", got.Hash(), headAB)
+			}
+		})
+	}
+}
+
+// TestPackedRefsOffStillReadsPackedRefs pins that turning the flag off is safe
+// in both directions: it does not hide refs a previous release packed, and the
+// first write with it back on folds the loose keys written in between.
+func TestPackedRefsOffStillReadsPackedRefs(t *testing.T) {
 	t.Parallel()
 
 	f := newFakeS3(t)
-	s := newTestStorer(t, f) // default: off
 
-	if err := s.SetReference(hashRef("refs/heads/main", headAB)); err != nil {
-		t.Fatalf("set: %v", err)
+	// An earlier release, with the flag on, packed two refs.
+	on := packedTestStorer(t, f)
+	if err := on.UpdateReferences([]*plumbing.Reference{
+		hashRef("refs/heads/main", headAB),
+		hashRef("refs/tags/v1", headAB),
+	}, nil); err != nil {
+		t.Fatalf("packed write: %v", err)
 	}
-	if _, ok := f.objs["refs/refs/heads/main"]; !ok {
-		t.Error("write did not land as a loose ref")
+
+	// A rolled-back binary has the flag off. It must still see both, and its own
+	// write goes to a loose key.
+	off := newTestStorer(t, f, WithPackedRefs(false))
+	for _, name := range []string{"refs/heads/main", "refs/tags/v1"} {
+		if _, err := off.Reference(plumbing.ReferenceName(name)); err != nil {
+			t.Errorf("flag off cannot see packed ref %s: %v", name, err)
+		}
 	}
-	if _, ok := f.objs[packedRefsKey]; ok {
-		t.Error("packed-refs was written while WithPackedRefs was off")
+	if err := off.SetReference(hashRef("refs/heads/topic", headCD)); err != nil {
+		t.Fatalf("loose write: %v", err)
+	}
+
+	// Rolling forward again: the next packed write folds that loose key in.
+	fwd := packedTestStorer(t, f)
+	if err := fwd.SetReference(hashRef("refs/heads/fourth", headAB)); err != nil {
+		t.Fatalf("packed write after roll-forward: %v", err)
+	}
+	if _, ok := f.objs[refPrefix+"refs/heads/topic"]; ok {
+		t.Error("the loose key written while off was not folded away")
+	}
+
+	view, err := packedTestStorer(t, f).refView()
+	if err != nil {
+		t.Fatalf("refView: %v", err)
+	}
+	if len(view) != 4 {
+		t.Errorf("view holds %d refs, want 4: %v", len(view), view)
+	}
+	if got := view[plumbing.ReferenceName("refs/heads/topic")]; got == nil || got.Hash().String() != headCD {
+		t.Errorf("the ref written while off did not survive the fold: %v", got)
 	}
 }
 
