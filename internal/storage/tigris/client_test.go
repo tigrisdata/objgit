@@ -62,10 +62,12 @@ type fakeS3 struct {
 	livePuts    int // PutObject calls inside putDelay right now
 	maxLivePuts int // high-water mark of livePuts, for upload-concurrency tests
 
-	puts    int
-	deletes int
-	etagSeq int   // monotone source of fake ETags
-	listMax int64 // ListObjectsV2 page size knob; 0 = unlimited
+	puts         int
+	deletes      int
+	batchDeletes int   // DeleteObjects calls
+	batchDelErr  error // injected DeleteObjects failure
+	etagSeq      int   // monotone source of fake ETags
+	listMax      int64 // ListObjectsV2 page size knob; 0 = unlimited
 
 	headOverride map[string]*headShape
 
@@ -302,6 +304,12 @@ func (f *fakeS3) ndeletes() int {
 	return f.deletes
 }
 
+func (f *fakeS3) nbatchDeletes() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.batchDeletes
+}
+
 func (f *fakeS3) nrangedGets() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -490,6 +498,29 @@ func (f *fakeS3) DeleteObject(_ context.Context, p *s3.DeleteObjectInput, _ ...f
 	return &s3.DeleteObjectOutput{}, nil
 }
 
+// DeleteObjects removes every named key. Real S3 caps a request at 1000 keys
+// and reports per-key failures in the response; the fake enforces the cap so a
+// caller that ignores it fails a test rather than production, and returns a
+// whole-call error for injected failures.
+func (f *fakeS3) DeleteObjects(_ context.Context, p *s3.DeleteObjectsInput, _ ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.batchDeletes++
+	if f.batchDelErr != nil {
+		return nil, f.batchDelErr
+	}
+	if p.Delete == nil {
+		return &s3.DeleteObjectsOutput{}, nil
+	}
+	if n := len(p.Delete.Objects); n > maxDeleteBatch {
+		f.t.Fatalf("fake DeleteObjects: %d keys exceeds the %d-key limit", n, maxDeleteBatch)
+	}
+	for _, o := range p.Delete.Objects {
+		delete(f.objs, sv(o.Key))
+	}
+	return &s3.DeleteObjectsOutput{}, nil
+}
+
 // ListObjectsV2 returns matching keys sorted (as real S3 promises), paginated
 // at f.listMax pages when >0, honoring opaque numeric continuation tokens.
 func (f *fakeS3) ListObjectsV2(_ context.Context, p *s3.ListObjectsV2Input, _ ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
@@ -527,7 +558,6 @@ func (f *fakeS3) ListObjectsV2(_ context.Context, p *s3.ListObjectsV2Input, _ ..
 }
 
 func ip(v int64) *int64 { return &v }
-func bp(v bool) *bool   { return &v }
 
 func TestNewDefaults(t *testing.T) {
 	t.Parallel()

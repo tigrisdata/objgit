@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/storage"
 )
@@ -246,9 +247,62 @@ func checkRefExpectations(view map[plumbing.ReferenceName]*plumbing.Reference, e
 	return nil
 }
 
-// dropFoldedLooseRefs deletes the legacy loose keys the commit superseded.
-// Task 6 gives it a body; until then a fold leaves its keys in place, which is
-// correct under the merge rule but means the loose layer never shrinks.
+// maxDeleteBatch is the most keys one DeleteObjects request accepts. It is an
+// S3 protocol limit, not a tuning knob.
+const maxDeleteBatch = 1000
+
+// dropFoldedLooseRefs deletes the legacy loose keys that the commit just
+// superseded: the folded ones, whose values now live in packed-refs, and the
+// removed ones, whose values must not exist anywhere.
+//
+// It runs after the commit PUT, never before. That order is what makes a
+// crash safe. Stop between the two and the loose keys still win under the
+// merge rule, which is the correct value, and the next write folds and deletes
+// them again. Reverse the order and a ref that existed only as a loose key is
+// gone for good if the PUT then fails.
+//
+// A failure here surfaces to the caller rather than being logged and dropped.
+// For a removal the reason is hard: a surviving loose key resurrects the ref.
+// For a fold it is softer — the refs are all still correct — but a caller that
+// sees success has no other way to learn the cleanup is outstanding.
+//
+// Deleting a key that is not there is not worth avoiding: S3 treats it as
+// success, and checking first would cost a round trip to save one.
 func (s *Storer) dropFoldedLooseRefs(folded, removed []plumbing.ReferenceName) error {
+	seen := make(map[plumbing.ReferenceName]struct{}, len(folded)+len(removed))
+	keys := make([]string, 0, len(folded)+len(removed))
+	for _, group := range [][]plumbing.ReferenceName{folded, removed} {
+		for _, n := range group {
+			if _, dup := seen[n]; dup {
+				continue
+			}
+			seen[n] = struct{}{}
+			keys = append(keys, s.prefix+refKey(n))
+		}
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+
+	for start := 0; start < len(keys); start += maxDeleteBatch {
+		batch := keys[start:min(start+maxDeleteBatch, len(keys))]
+		ids := make([]types.ObjectIdentifier, 0, len(batch))
+		for _, k := range batch {
+			ids = append(ids, types.ObjectIdentifier{Key: sp(k)})
+		}
+
+		st := time.Now()
+		_, err := s.client.DeleteObjects(s.ctx, &s3.DeleteObjectsInput{
+			Bucket: sp(s.bucket),
+			Delete: &types.Delete{Objects: ids, Quiet: bp(true)},
+		})
+		s.observe("DeleteObjects", st, err)
+		if err != nil {
+			// The cache says these names are packed and no longer loose, which
+			// is now a lie: the keys are still there and will win the merge.
+			s.invalidateRefs()
+			return fmt.Errorf("tigris: delete %d folded loose refs: %w", len(batch), err)
+		}
+	}
 	return nil
 }

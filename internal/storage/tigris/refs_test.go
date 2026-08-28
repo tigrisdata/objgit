@@ -236,11 +236,18 @@ func TestMalformedRefEntriesAreSkipped(t *testing.T) {
 	}
 }
 
-func TestPackRefsIsDeliberateNoOp(t *testing.T) {
+// TestPackRefsIsANoOpOnAnEmptyRepo keeps the vacuous case pinned. PackRefs is
+// no longer a no-op in general — see TestFoldedRefCountDropsToZero and
+// TestPackRefsIsGated — but it must still succeed with nothing to fold.
+func TestPackRefsIsANoOpOnAnEmptyRepo(t *testing.T) {
 	t.Parallel()
 
-	if err := newTestStorer(t, newFakeS3(t)).PackRefs(); err != nil {
+	f := newFakeS3(t)
+	if err := newTestStorer(t, f, WithPackedRefs(true)).PackRefs(); err != nil {
 		t.Errorf("PackRefs must succeed vacuously, got %v", err)
+	}
+	if _, ok := f.objs[packedRefsKey]; ok {
+		t.Error("PackRefs wrote an object with nothing to fold")
 	}
 }
 

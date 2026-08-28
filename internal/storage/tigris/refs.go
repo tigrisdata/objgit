@@ -216,10 +216,38 @@ func (s *Storer) CountLooseRefs() (int, error) {
 	return len(s.refs.loose), nil
 }
 
-// PackRefs is deliberately a no-op: every ref stays individually addressable,
-// so packed-refs compaction offers nothing in a flat bucket.
+// PackRefs folds the legacy loose refs into packed-refs and deletes them.
+//
+// It used to be a no-op, on the reasoning that every ref stayed individually
+// addressable so compaction bought nothing. Packed refs change that: the fold
+// is what turns an advertisement from one GetObject per ref into one for the
+// whole repository. Exposing it here gives an operator a way to pay that cost
+// on demand instead of on whichever push happens to be first.
+//
+// It is a no-op while WithPackedRefs is off, so a release that can only read
+// the new format never creates it.
 func (s *Storer) PackRefs() error {
-	return nil
+	if !s.packedRefs {
+		return nil
+	}
+	if err := s.ensureRefsBuilt(); err != nil {
+		return err
+	}
+
+	s.refs.mu.Lock()
+	loose := make([]*plumbing.Reference, 0, len(s.refs.loose))
+	for _, r := range s.refs.loose {
+		loose = append(loose, r)
+	}
+	s.refs.mu.Unlock()
+
+	if len(loose) == 0 {
+		return nil
+	}
+	// commitRefs folds the whole loose layer on any write, so handing it the
+	// loose refs as sets is enough — and it keeps one commit path rather than
+	// two.
+	return s.commitRefs(loose, nil, nil)
 }
 
 // --- shallow marks ---

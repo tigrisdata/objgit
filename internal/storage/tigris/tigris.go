@@ -83,6 +83,7 @@ type s3API interface {
 	HeadObject(ctx context.Context, params *s3.HeadObjectInput, optFns ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
 	ListObjectsV2(ctx context.Context, params *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
 	DeleteObject(ctx context.Context, params *s3.DeleteObjectInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
+	DeleteObjects(ctx context.Context, params *s3.DeleteObjectsInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error)
 }
 
 // Storer is one bucket-worth of git data speaking go-git's storage.Storer.
@@ -361,3 +362,5 @@ func sv(v *string) string {
 }
 
 func bv(v *bool) bool { return v != nil && *v }
+
+func bp(v bool) *bool { return &v }
