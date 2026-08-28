@@ -19,6 +19,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/cache"
 	"github.com/go-git/go-git/v6/storage/filesystem"
 	"github.com/klauspost/compress/zstd"
+	"golang.org/x/sync/errgroup"
 )
 
 // PackfileWriter accepts an incoming git packfile — already exactly
@@ -221,15 +222,19 @@ func (w *packWriter) planObjects() ([]plannedObject, []int32, error) {
 	}
 	defer iter.Close()
 
+	// Hash, type, and size only: IterEncodedObjects' iterator, like the rest
+	// of filesystem.ObjectStorage's packed-object path, is documented as not
+	// safe for concurrent use, so this walk stays on one goroutine. Delta-base
+	// resolution below is the expensive part and is where the concurrency goes.
 	var flat []plannedObject
 	if err := iter.ForEach(func(obj plumbing.EncodedObject) error {
-		p := plannedObject{hash: obj.Hash(), typ: obj.Type(), size: obj.Size()}
-		if do, ok := w.deltaForm(p.hash); ok {
-			p.base = do.BaseHash()
-		}
-		flat = append(flat, p)
+		flat = append(flat, plannedObject{hash: obj.Hash(), typ: obj.Type(), size: obj.Size()})
 		return nil
 	}); err != nil {
+		return nil, nil, fmt.Errorf("tigris: plan pack container: %w", err)
+	}
+
+	if err := w.resolveDeltaBases(flat); err != nil {
 		return nil, nil, fmt.Errorf("tigris: plan pack container: %w", err)
 	}
 
@@ -270,11 +275,69 @@ func findByHash(flat []plannedObject, h plumbing.Hash) (int32, bool) {
 	return -1, false
 }
 
+// deltaScanWorkers bounds how many independent scratch storage handles
+// resolveDeltaBases opens at once. Capped rather than left at GOMAXPROCS so a
+// huge push does not open more file descriptors against the scratch
+// directory than is sensible; the scan is I/O-bound, not CPU-bound, so there
+// is little to gain past a handful of workers anyway.
+const deltaScanWorkers = 8
+
+// resolveDeltaBases fills in flat[i].base for every object the client sent
+// as a delta, by asking the scratch storage whether it has one.
+//
+// filesystem.ObjectStorage's packed-object delta lookup (which this needs)
+// reads through Packfile.Scanner(), a single shared, unsynchronized scanner
+// over one shared file handle — go-git's own doc comment on Scanner marks it
+// not thread-safe. So this cannot fan goroutines out against w.scratch
+// itself. Instead each worker opens its own *filesystem.Storage over the
+// same on-disk scratch directory: lazy init means each gets an independent
+// packfile.Packfile, Scanner, and file descriptor, so there is no shared
+// mutable state to race on. flat is partitioned by index range and each
+// worker only ever writes the indices in its own range, so flat itself needs
+// no synchronization either — distinct slice elements are distinct memory,
+// concurrent writes to them are not a race.
+//
+// Each worker's storage gets a zero-size object cache: every hash here is
+// looked up exactly once, so the cache would only hold memory without ever
+// serving a hit.
+func (w *packWriter) resolveDeltaBases(flat []plannedObject) error {
+	if len(flat) == 0 {
+		return nil
+	}
+
+	workers := min(deltaScanWorkers, len(flat))
+	chunk := (len(flat) + workers - 1) / workers
+
+	var g errgroup.Group
+	for start := 0; start < len(flat); start += chunk {
+		end := min(start+chunk, len(flat))
+		g.Go(func() error {
+			store := filesystem.NewStorageWithOptions(
+				osfs.New(w.dir), cache.NewObjectLRU(0),
+				filesystem.Options{ObjectFormat: w.s.of},
+			)
+			for i := start; i < end; i++ {
+				if do, ok := deltaFormOn(store, flat[i].hash); ok {
+					flat[i].base = do.BaseHash()
+				}
+			}
+			return nil
+		})
+	}
+	return g.Wait()
+}
+
 // deltaForm asks the scratch storage for h's delta, if the client sent one.
 // The scratch storage is a real go-git filesystem.Storage over the pushed
 // packfile, so this is the client's own delta chain, not one we computed.
 func (w *packWriter) deltaForm(h plumbing.Hash) (plumbing.DeltaObject, bool) {
-	obj, err := w.scratch.DeltaObject(plumbing.AnyObject, h)
+	return deltaFormOn(w.scratch, h)
+}
+
+// deltaFormOn is deltaForm against an explicit storage rather than w.scratch,
+// so resolveDeltaBases' workers can each use their own independent instance.
+func deltaFormOn(store *filesystem.Storage, h plumbing.Hash) (plumbing.DeltaObject, bool) {
+	obj, err := store.DeltaObject(plumbing.AnyObject, h)
 	if err != nil {
 		// Not fatal: a base we cannot read as a delta is simply stored whole.
 		return nil, false
