@@ -320,3 +320,29 @@ func TestConcurrentCommitsAllLand(t *testing.T) {
 		t.Errorf("view holds %d refs, want %d — the loop lost writes: %v", len(view), writers, view)
 	}
 }
+
+// TestUpdateReferencesCostsOnePut is the storer-side half of the headline
+// claim, matching TestRefViewCostsTwoCalls on the read side.
+func TestUpdateReferencesCostsOnePut(t *testing.T) {
+	t.Parallel()
+
+	f := newFakeS3(t)
+	obs, snapshot := countingObserver()
+	s := packedTestStorer(t, f, obs)
+
+	sets := make([]*plumbing.Reference, 0, 500)
+	for i := 0; i < 500; i++ {
+		sets = append(sets, hashRef("refs/tags/v"+strconv.Itoa(i), headAB))
+	}
+	if err := s.UpdateReferences(sets, nil); err != nil {
+		t.Fatalf("UpdateReferences: %v", err)
+	}
+
+	seen := snapshot()
+	if seen["PutObject"] != 1 {
+		t.Errorf("PutObject calls = %d, want 1 (map: %v)", seen["PutObject"], seen)
+	}
+	if seen["GetObject"] != 1 {
+		t.Errorf("GetObject calls = %d, want 1 (map: %v)", seen["GetObject"], seen)
+	}
+}

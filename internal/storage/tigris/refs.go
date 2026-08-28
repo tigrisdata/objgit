@@ -58,6 +58,34 @@ func (s *Storer) SetReference(ref *plumbing.Reference) error {
 	return s.setLooseReference(ref)
 }
 
+// UpdateReferences applies a whole batch of ref mutations at once. With
+// WithPackedRefs set that is one conditional PutObject for the entire batch,
+// which is the difference between one round trip and one per ref on a push of
+// many tags.
+//
+// The batch is all-or-nothing: the single commit PUT either lands or it does
+// not. cmd/objgitd/receivepack.go relies on that, and reports one shared error
+// for every command in a failed push.
+//
+// Without WithPackedRefs it walks the loose path, so the method is always safe
+// to call and the transport never needs to know which mode it is in.
+func (s *Storer) UpdateReferences(sets []*plumbing.Reference, removes []plumbing.ReferenceName) error {
+	if s.packedRefs {
+		return s.commitRefs(sets, removes, nil)
+	}
+	for _, r := range sets {
+		if err := s.setLooseReference(r); err != nil {
+			return err
+		}
+	}
+	for _, n := range removes {
+		if err := s.RemoveReference(n); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // setLooseReference writes one refs/<name> object. It flushes every upload
 // queued through this Storer first, so a ref can never point at an object that
 // failed — or hasn't yet finished — its asynchronous upload (see upload.go).
