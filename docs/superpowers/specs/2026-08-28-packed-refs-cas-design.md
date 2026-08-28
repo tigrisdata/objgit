@@ -114,8 +114,8 @@ type refCache struct {
 	mu    sync.Mutex
 	built bool
 	etag  string // CAS token. Empty means packed-refs does not exist.
-	refs  map[plumbing.ReferenceName]*plumbing.Reference
-	loose map[plumbing.ReferenceName]*plumbing.Reference // legacy, empty after the fold
+	packed map[plumbing.ReferenceName]*plumbing.Reference
+	loose  map[plumbing.ReferenceName]*plumbing.Reference // legacy, empty after the fold
 }
 ```
 
