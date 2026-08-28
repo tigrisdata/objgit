@@ -28,10 +28,13 @@ func missingKeyErr() error {
 	return &smithy.GenericAPIError{Code: "NoSuchKey", Message: "no such key"}
 }
 
-// fakeObject is one object in the fake bucket.
+// fakeObject is one object in the fake bucket. etag is the fake's CAS token;
+// it is a plain counter rather than a content digest, which keeps every caller
+// honest about treating an ETag as opaque.
 type fakeObject struct {
 	body []byte
 	meta map[string]string
+	etag string
 }
 
 // headShape lets a test strip normally-automatic fields from one key's HEAD.
@@ -50,12 +53,21 @@ type fakeS3 struct {
 
 	putDelay time.Duration // artificial latency before PutObject lands, for async-upload tests
 
+	// putHook fires inside PutObject after the injected-error check and before
+	// the precondition check, with the attempt number. It exists so a test can
+	// land a competing write between a storer's read and its retry, which is
+	// the only way to exercise the compare-and-swap loop deterministically.
+	putHook func(*putSnapshot)
+
 	livePuts    int // PutObject calls inside putDelay right now
 	maxLivePuts int // high-water mark of livePuts, for upload-concurrency tests
 
-	puts    int
-	deletes int
-	listMax int64 // ListObjectsV2 page size knob; 0 = unlimited
+	puts         int
+	deletes      int
+	batchDeletes int   // DeleteObjects calls
+	batchDelErr  error // injected DeleteObjects failure
+	etagSeq      int   // monotone source of fake ETags
+	listMax      int64 // ListObjectsV2 page size knob; 0 = unlimited
 
 	headOverride map[string]*headShape
 
@@ -212,12 +224,48 @@ func countingObserver() (Option, func() map[string]int) {
 func (f *fakeS3) put(key, body string, meta map[string]string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.putLocked(key, body, meta)
+}
+
+// putLocked is put without the lock, for a putHook, which already holds it.
+func (f *fakeS3) putLocked(key, body string, meta map[string]string) {
 	m := make(map[string]string, len(meta))
 	for k, v := range meta {
 		m[k] = v
 	}
-	f.objs[key] = fakeObject{body: []byte(body), meta: m}
+	f.objs[key] = fakeObject{body: []byte(body), meta: m, etag: f.nextETag()}
 }
+
+// nextETag mints a fresh opaque token. Callers hold f.mu.
+func (f *fakeS3) nextETag() string {
+	f.etagSeq++
+	return `"` + strconv.Itoa(f.etagSeq) + `"`
+}
+
+// etagOf reports one key's current token, or "" when the key is absent.
+func (f *fakeS3) etagOf(key string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.objs[key].etag
+}
+
+// putSnapshot is what a putHook sees: which attempt this is, and which key it
+// targets.
+type putSnapshot struct {
+	n   int
+	key string
+}
+
+// preconditionFailed is what Tigris returns for a refused If-Match or
+// If-None-Match. TestLiveBucketConditionalWrites pins that this is the real
+// code, and isPreconditionFailed is what matches it.
+func preconditionFailed() error {
+	return &smithy.GenericAPIError{Code: "PreconditionFailed", Message: "at least one of the preconditions you specified did not hold"}
+}
+
+// newReader is a tiny shim so a test can build a PutObjectInput body without
+// importing strings at every call site.
+func newReader(s string) io.Reader { return strings.NewReader(s) }
 
 func (f *fakeS3) get(t *testing.T, key string) fakeObject {
 	t.Helper()
@@ -254,6 +302,12 @@ func (f *fakeS3) ndeletes() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.deletes
+}
+
+func (f *fakeS3) nbatchDeletes() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.batchDeletes
 }
 
 func (f *fakeS3) nrangedGets() int {
@@ -323,6 +377,7 @@ func (f *fakeS3) GetObject(_ context.Context, p *s3.GetObjectInput, _ ...func(*s
 	out := &s3.GetObjectOutput{
 		ContentLength: ip(int64(len(body))),
 		Metadata:      o.meta,
+		ETag:          sp(o.etag),
 	}
 	if gated {
 		out.Body = &gatedBody{f: f, g: f.binGate, body: body}
@@ -375,6 +430,24 @@ func (f *fakeS3) PutObject(_ context.Context, p *s3.PutObjectInput, _ ...func(*s
 	if f.putErr != nil {
 		return nil, f.putErr
 	}
+	if f.putHook != nil {
+		// Called with the lock held, so a hook may use f.objs and putLocked
+		// directly. It must not call back into a Storer.
+		f.putHook(&putSnapshot{n: f.puts, key: sv(p.Key)})
+	}
+
+	// Preconditions are evaluated before the write, and a refusal still counts
+	// as a request — which is what real S3 bills and what a call-count test
+	// must see.
+	key := sv(p.Key)
+	cur, exists := f.objs[key]
+	switch {
+	case sv(p.IfNoneMatch) == "*" && exists:
+		return nil, preconditionFailed()
+	case sv(p.IfMatch) != "" && (!exists || cur.etag != sv(p.IfMatch)):
+		return nil, preconditionFailed()
+	}
+
 	var buf bytes.Buffer
 	if p.Body != nil {
 		if _, err := io.Copy(&buf, p.Body); err != nil {
@@ -385,8 +458,9 @@ func (f *fakeS3) PutObject(_ context.Context, p *s3.PutObjectInput, _ ...func(*s
 	for k, v := range p.Metadata {
 		meta[k] = v
 	}
-	f.objs[sv(p.Key)] = fakeObject{body: buf.Bytes(), meta: meta}
-	return &s3.PutObjectOutput{}, nil
+	etag := f.nextETag()
+	f.objs[key] = fakeObject{body: buf.Bytes(), meta: meta, etag: etag}
+	return &s3.PutObjectOutput{ETag: sp(etag)}, nil
 }
 
 func (f *fakeS3) HeadObject(_ context.Context, p *s3.HeadObjectInput, _ ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
@@ -422,6 +496,29 @@ func (f *fakeS3) DeleteObject(_ context.Context, p *s3.DeleteObjectInput, _ ...f
 	}
 	delete(f.objs, sv(p.Key))
 	return &s3.DeleteObjectOutput{}, nil
+}
+
+// DeleteObjects removes every named key. Real S3 caps a request at 1000 keys
+// and reports per-key failures in the response; the fake enforces the cap so a
+// caller that ignores it fails a test rather than production, and returns a
+// whole-call error for injected failures.
+func (f *fakeS3) DeleteObjects(_ context.Context, p *s3.DeleteObjectsInput, _ ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.batchDeletes++
+	if f.batchDelErr != nil {
+		return nil, f.batchDelErr
+	}
+	if p.Delete == nil {
+		return &s3.DeleteObjectsOutput{}, nil
+	}
+	if n := len(p.Delete.Objects); n > maxDeleteBatch {
+		f.t.Fatalf("fake DeleteObjects: %d keys exceeds the %d-key limit", n, maxDeleteBatch)
+	}
+	for _, o := range p.Delete.Objects {
+		delete(f.objs, sv(o.Key))
+	}
+	return &s3.DeleteObjectsOutput{}, nil
 }
 
 // ListObjectsV2 returns matching keys sorted (as real S3 promises), paginated
@@ -461,7 +558,6 @@ func (f *fakeS3) ListObjectsV2(_ context.Context, p *s3.ListObjectsV2Input, _ ..
 }
 
 func ip(v int64) *int64 { return &v }
-func bp(v bool) *bool   { return &v }
 
 func TestNewDefaults(t *testing.T) {
 	t.Parallel()

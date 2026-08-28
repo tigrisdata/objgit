@@ -13,12 +13,16 @@ const (
 	headCD = "2222222222222222222222222222222222222222"
 )
 
-func hashRef(name, hexval string) *plumbing.Reference {
+func mustHash(hexval string) plumbing.Hash {
 	h, ok := plumbing.FromHex(hexval)
 	if !ok {
 		panic("refs_test bug: bad hex fixture " + hexval)
 	}
-	return plumbing.NewHashReference(plumbing.ReferenceName(name), h)
+	return h
+}
+
+func hashRef(name, hexval string) *plumbing.Reference {
+	return plumbing.NewHashReference(plumbing.ReferenceName(name), mustHash(hexval))
 }
 
 func TestReferenceRoundTrip(t *testing.T) {
@@ -158,7 +162,7 @@ func TestIterReferencesSortedAndComplete(t *testing.T) {
 		t.Fatalf("walk: %v", err)
 	}
 
-	want := []string{"refs/heads/alpha", "refs/heads/zeta", "refs/tags/v1"} // S3-sorted
+	want := []string{"refs/heads/alpha", "refs/heads/zeta", "refs/tags/v1"} // IterReferences sorts by name
 	if len(names) != len(want) {
 		t.Fatalf("walked %d refs, want %d: %v", len(names), len(want), names)
 	}
@@ -232,11 +236,18 @@ func TestMalformedRefEntriesAreSkipped(t *testing.T) {
 	}
 }
 
-func TestPackRefsIsDeliberateNoOp(t *testing.T) {
+// TestPackRefsIsANoOpOnAnEmptyRepo keeps the vacuous case pinned. PackRefs is
+// no longer a no-op in general — see TestFoldedRefCountDropsToZero and
+// TestPackRefsIsGated — but it must still succeed with nothing to fold.
+func TestPackRefsIsANoOpOnAnEmptyRepo(t *testing.T) {
 	t.Parallel()
 
-	if err := newTestStorer(t, newFakeS3(t)).PackRefs(); err != nil {
+	f := newFakeS3(t)
+	if err := newTestStorer(t, f, WithPackedRefs(true)).PackRefs(); err != nil {
 		t.Errorf("PackRefs must succeed vacuously, got %v", err)
+	}
+	if _, ok := f.objs[packedRefsKey]; ok {
+		t.Error("PackRefs wrote an object with nothing to fold")
 	}
 }
 

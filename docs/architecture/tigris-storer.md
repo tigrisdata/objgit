@@ -30,7 +30,8 @@ call has run.
 | `objects/<hex>`    | One loose git object.                               |
 | `packs/<id>.bin`   | One flat container of full objects.                 |
 | `packs/<id>.cue`   | The record index for one container.                 |
-| `refs/<name>`      | Reference text. A symbolic ref reads `ref: target`. |
+| `packed-refs`      | Every reference in one object. See "References".     |
+| `refs/<name>`      | One legacy loose reference. Read-only.               |
 
 Shallow marks, the worktree index, and the repository configuration sit at
 root-level keys. They carry the same prefix as everything else.
@@ -50,6 +51,177 @@ refuses the write.
 create-on-first-push signal. This is the same role that the "config file
 present" check of dotgit played when repository storage was a
 `billy.Filesystem`.
+
+## References (`packedrefs.go`, `refcache.go`)
+
+One object holds every reference. Before this, one object held one reference.
+That cost a push of N refs N `GetObject` calls and N `PutObject` calls. It also
+cost every clone, fetch and push one `GetObject` per reference, because the
+listing gave only key names.
+
+Two keys hold reference state:
+
+| Key            | Role                                                      |
+| -------------- | --------------------------------------------------------- |
+| `packed-refs`  | Every reference. Its ETag is the compare-and-swap token.   |
+| `refs/<name>`  | One legacy loose reference. Read-only. The fold deletes it. |
+
+`packed-refs` does not start with `refs/`, so the loose listing cannot return
+it.
+
+### Format
+
+A 16-byte plaintext header, then a body that is raw or one zstd frame. The
+header copies the shape `.cue` uses: magic `OGR`, a version byte, a body-codec
+byte, and the reference count as a big-endian `uint32`.
+
+The body is text. It holds one reference per line, sorted by name:
+
+```
+HEAD	ref: refs/heads/main
+refs/heads/main	0a1b2c...
+refs/tags/v1.0.0	3d4e5f...
+```
+
+The separator is a tab. `git-check-ref-format` forbids whitespace inside a
+reference name, so a tab can never be ambiguous.
+
+Sorting buys three things. Tag names that share a prefix become adjacent, so
+zstd collapses them. One set of references always encodes to identical bytes,
+so a test can assert bytes. A person who decompresses the body can grep it.
+
+A value is a hex hash, or `ref: <target>` for a symbolic reference. Both come
+from `encodeRefValue`, which the loose layer also uses, so the two formats
+cannot drift apart. Git keeps `HEAD` loose because its own `packed-refs` cannot
+hold a symbolic reference. This format can.
+
+A corrupt object is an error, and never an empty reference set. An empty set
+makes a repository look brand new, and git then accepts a force-push over the
+top of it. This matches what `errBadCue` does for a pack index, and it is
+stricter than the loose layer, which logs and skips one bad key. Every packed
+reference shares one object, so one bad line makes all of them untrustworthy.
+
+### Reading
+
+`refCache` mirrors `packIndex`. It builds once per instance, and it is not
+sticky on error. `repofs` calls `Scoped` once per request, so one cache serves
+one request.
+
+A build costs two calls: one `GetObject` for `packed-refs`, and one
+`ListObjectsV2` for the loose layer. A 404 on the first is an empty map, and
+not an error. After the fold the list returns nothing, so a build is one round
+trip.
+
+The list runs on every build. No flag records that a repository is folded. One
+cheap round trip is the price of a safety net, and the net catches anything that
+writes a loose reference outside this code.
+
+### The merge rule
+
+**A loose reference wins over a packed reference with the same name.**
+
+That rule holds because of one invariant: a write through the packed path
+deletes the loose keys for every name it touched, before it reports success. So
+a loose key can exist only if something wrote it after the last packed write. It
+is therefore newer.
+
+The opposite rule is a bug. If a packed reference wins, and if a fleet runs two
+releases at once, that fleet swallows every push made by the older binaries.
+
+### Writing
+
+`commitRefs` is the one path behind every mutator. It flushes the upload queue
+once for the whole batch, which holds the rule that a reference never names an
+object whose upload did not finish. Then it applies the batch to a copy of the
+merged view and writes it with one conditional `PutObject`.
+
+**That single `PutObject` is the commit point.** A fresh repository sends
+`If-None-Match: *`. Every later write sends `If-Match: <etag>`. A refused
+precondition drops the cache, re-reads, re-validates, re-applies, and retries,
+up to `maxRefCASRetries` times.
+
+This is also what makes `CheckAndSetReference` atomic. The compare and the write
+are now one request. Earlier releases compared and then wrote, and the window
+between the two raced.
+
+Two errors come out of the retry loop, and they say different things:
+
+- A caller expectation that fails after a rebuild is
+  `storage.ErrReferenceHasChanged`. That is go-git's own error, and receive-pack
+  turns it into a per-reference rejection.
+- Exhausting the retries with no failed expectation is `ErrRefContention`.
+  Nothing the caller asked for was violated, so a retry is reasonable.
+
+`objgit_ref_cas_retries_total` counts the retries. Contention is the only way
+this path degrades quietly: every retry rewrites the whole object, so it shows
+up as push latency long before it shows up as an error.
+
+### The fold
+
+The fold runs once per repository. The first reference-mutating operation folds
+every loose reference into its own commit `PutObject`, then deletes the loose
+keys with `DeleteObjects`, 1000 keys per call.
+
+The order is `PutObject` and then `DeleteObjects`. If the process stops between
+the two, the loose keys still win under the merge rule, which is the correct
+value, and the next write retries the delete. The opposite order loses a
+reference outright. If the delete runs first, and if the write then fails, a
+reference that existed only as a loose key is gone.
+
+A failed delete surfaces to the caller. For a removal the reason is hard, since
+a surviving loose key resurrects the reference.
+
+`PackRefs` runs the fold on demand, so an operator can pay the cost before a
+large push rather than on it. It used to be a no-op. `CountLooseRefs` now counts
+only the legacy layer, so it returns 0 once folded, which is what go-git reads
+the number to mean.
+
+### Batching
+
+`cmd/objgitd/receivepack.go` hands a whole push over through one optional
+method:
+
+```go
+UpdateReferences(sets []*plumbing.Reference, removes []plumbing.ReferenceName) error
+```
+
+It is one flattened method and not a batch object, because Go needs an exact
+signature match. A storer without the method falls back to the per-reference
+path.
+
+A push of 100,000 tags costs one `PutObject`. An advertisement costs two calls.
+
+### Two constraints
+
+CAUTION: This design needs a Single-region or Multi-region bucket. A Global or
+Dual-region bucket reads eventually, so a compare-and-swap can evaluate against
+a stale read. See
+<https://www.tigrisdata.com/docs/concepts/consistency/>.
+
+Peeled tags are a known gap. Git writes a `^<hash>` line so an advertisement
+does not open every annotated tag object. This format does not, so advertising
+100,000 annotated tags still reads 100,000 tag objects. Those reads go through
+`packIndex` and the pack cache, so they are cheap, but they are not free. The
+format can add a third tab-separated field for the peeled hash. A v1 reader
+refuses such a line rather than misreading it, so adding the field is a version
+bump and not a new key.
+
+### Turning packed-ref writes on
+
+`WithPackedRefs` is off by default. Reading packed references is not gated, so
+every binary that carries this code can already read the format.
+
+Flip the default only when every node runs a binary that can read packed
+references. Two steps, in one commit:
+
+1. In `New` (`internal/storage/tigris/tigris.go`), set the `packedRefs` field's
+   initial value to `true`.
+2. In `internal/storage/tigris/refcommit_test.go`, delete
+   `TestPackedWritesAreGated` and add its opposite: a default storer writes
+   `packed-refs` and not a loose key.
+
+CAUTION: Do not flip the default and change the format in one release. A
+rollback then has no binary that can read what the window wrote.
 
 ## Writes are asynchronous (`upload.go`)
 

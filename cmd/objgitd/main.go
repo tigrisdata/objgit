@@ -106,6 +106,7 @@ func main() {
 	storerOpts := []tigris.Option{
 		tigris.WithObserver(metrics.ObserveS3),
 		tigris.WithPayloadObserver(metrics.ObservePackPayload),
+		tigris.WithRefCASObserver(metrics.ObserveRefCASRetry),
 		tigris.WithPackCompression(*packCompression),
 	}
 	var packCache *tigris.PackCache
