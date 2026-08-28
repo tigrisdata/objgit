@@ -293,6 +293,19 @@ func isNotFound(err error) bool {
 	}
 }
 
+// isPreconditionFailed reports whether err is a rejected conditional write.
+// Tigris and S3 both answer a failed If-Match or If-None-Match with HTTP 412
+// and the code "PreconditionFailed". Two writers racing on packed-refs is the
+// normal way to see this, so commitRefs treats it as retryable and not as a
+// failure. Callers must never map it to absence the way isNotFound does.
+func isPreconditionFailed(err error) bool {
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.ErrorCode() == "PreconditionFailed"
+}
+
 // Pointer shims so call sites stay free of aws-sdk-go-v2/aws imports.
 func sp(v string) *string { return &v }
 
