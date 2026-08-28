@@ -61,6 +61,108 @@ type fakeS3 struct {
 
 	rangedGets  int // GetObject calls that carried a Range header
 	fullBinGets int // full (non-ranged) GetObject calls on a pack .bin — i.e. bulk pack downloads
+
+	binGate        *binGate // when set, paces every full .bin body; see holdBinBodies
+	liveBinBodies  int      // full .bin bodies being read right now
+	maxLiveBinGets int      // high-water mark of liveBinBodies, for prefetch-concurrency tests
+}
+
+// binGate paces the bodies of full .bin GETs so a test can park a background
+// pack download at a known number of bytes and inspect what reads do while it
+// sits there. Without one, a fake body is delivered in a single unpaced read
+// and the download is over before a test can look at it.
+//
+// A gated body hands out prefix bytes and then blocks until release is closed.
+// prefix of 0 means it blocks before yielding anything at all, which is how a
+// test pins a download open indefinitely.
+type binGate struct {
+	prefix  int
+	release chan struct{}
+	started chan struct{} // closed by the first gated body to reach the block
+	once    sync.Once
+}
+
+// holdBinBodies makes every full .bin body stop after prefix bytes. The
+// returned release lets them all finish; waitStarted blocks until at least one
+// body has reached the stop.
+func (f *fakeS3) holdBinBodies(t *testing.T, prefix int) (release func(), waitStarted func()) {
+	t.Helper()
+	g := &binGate{prefix: prefix, release: make(chan struct{}), started: make(chan struct{})}
+
+	f.mu.Lock()
+	f.binGate = g
+	f.mu.Unlock()
+
+	var closeOnce sync.Once
+	release = func() { closeOnce.Do(func() { close(g.release) }) }
+	t.Cleanup(release) // never leave a download goroutine parked past the test
+
+	waitStarted = func() {
+		t.Helper()
+		select {
+		case <-g.started:
+		case <-time.After(10 * time.Second):
+			t.Fatal("no gated .bin body ever started")
+		}
+	}
+	return release, waitStarted
+}
+
+// peakLiveBinGets is the most full .bin bodies the fake ever had open at one
+// time. Meaningful only with a gate installed.
+func (f *fakeS3) peakLiveBinGets() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.maxLiveBinGets
+}
+
+// gatedBody is a full .bin body that stops after g.prefix bytes until the gate
+// releases. It also maintains the fake's live-body high-water mark, which is
+// what the prefetch concurrency cap is measured against.
+type gatedBody struct {
+	f    *fakeS3
+	g    *binGate
+	body []byte
+	pos  int
+	held bool // this body is counted in liveBinBodies
+}
+
+func (b *gatedBody) Read(p []byte) (int, error) {
+	if b.pos >= len(b.body) {
+		return 0, io.EOF
+	}
+
+	limit := min(b.g.prefix, len(b.body))
+	if b.pos >= limit {
+		// At the stop line. Register as parked — which is what the live-body
+		// high-water mark counts — and wait to be let through.
+		if !b.held {
+			b.held = true
+			b.f.mu.Lock()
+			b.f.liveBinBodies++
+			if b.f.liveBinBodies > b.f.maxLiveBinGets {
+				b.f.maxLiveBinGets = b.f.liveBinBodies
+			}
+			b.f.mu.Unlock()
+			b.g.once.Do(func() { close(b.g.started) })
+		}
+		<-b.g.release
+		limit = len(b.body)
+	}
+
+	n := copy(p, b.body[b.pos:limit])
+	b.pos += n
+	return n, nil
+}
+
+func (b *gatedBody) Close() error {
+	if b.held {
+		b.f.mu.Lock()
+		b.f.liveBinBodies--
+		b.f.mu.Unlock()
+		b.held = false
+	}
+	return nil
 }
 
 func newFakeS3(t *testing.T) *fakeS3 {
@@ -76,6 +178,35 @@ func newTestStorer(t *testing.T, f *fakeS3, opts ...Option) *Storer {
 		t.Fatalf("failed to create test storer: %v", err)
 	}
 	return s
+}
+
+// countingObserver returns a WithObserver option that tallies operations, plus
+// a snapshot function.
+//
+// The mutex is not decoration. A Storer's observer fires from whatever
+// goroutine made the call, and background pack prefetches (see startPackFetch)
+// make S3 calls of their own — so an observer over a bare map races with the
+// test that reads it. Production wires metrics.ObserveS3, which is a set of
+// Prometheus vectors and already safe.
+func countingObserver() (Option, func() map[string]int) {
+	var mu sync.Mutex
+	seen := map[string]int{}
+
+	opt := WithObserver(func(op string, _ time.Duration, _ error) {
+		mu.Lock()
+		defer mu.Unlock()
+		seen[op]++
+	})
+	snapshot := func() map[string]int {
+		mu.Lock()
+		defer mu.Unlock()
+		out := make(map[string]int, len(seen))
+		for k, v := range seen {
+			out[k] = v
+		}
+		return out
+	}
+	return opt, snapshot
 }
 
 func (f *fakeS3) put(key, body string, meta map[string]string) {
@@ -176,6 +307,7 @@ func (f *fakeS3) GetObject(_ context.Context, p *s3.GetObjectInput, _ ...func(*s
 	}
 
 	body := o.body
+	gated := false
 	if rng := sv(p.Range); rng != "" {
 		f.rangedGets++
 		start, end, ok := parseByteRange(rng, len(o.body))
@@ -185,13 +317,18 @@ func (f *fakeS3) GetObject(_ context.Context, p *s3.GetObjectInput, _ ...func(*s
 		body = o.body[start : end+1]
 	} else if strings.HasSuffix(sv(p.Key), binSuffix) {
 		f.fullBinGets++
+		gated = f.binGate != nil
 	}
 
 	out := &s3.GetObjectOutput{
 		ContentLength: ip(int64(len(body))),
 		Metadata:      o.meta,
 	}
-	out.Body = io.NopCloser(bytes.NewReader(body))
+	if gated {
+		out.Body = &gatedBody{f: f, g: f.binGate, body: body}
+	} else {
+		out.Body = io.NopCloser(bytes.NewReader(body))
+	}
 	return out, nil
 }
 
@@ -445,15 +582,14 @@ func TestObserverIsInvokedByOperation(t *testing.T) {
 	// Seed a blob so we can test HasEncodedObject finds it via observer.
 	h := seed(t, f, formatcfg.DefaultObjectFormat, plumbing.BlobObject, "x")
 
-	seen := map[string]int{}
-	s := newTestStorer(t, f, WithObserver(func(op string, _ time.Duration, _ error) {
-		seen[op]++
-	}))
+	obs, snapshot := countingObserver()
+	s := newTestStorer(t, f, obs)
 
 	// HasEncodedObject should succeed (object exists) and observer records the op.
 	if err := s.HasEncodedObject(h); err != nil {
 		t.Fatalf("HasEncodedObject failed for existing object: %v", err)
 	}
+	seen := snapshot()
 	if got := seen["HeadObject"]; got != 1 {
 		t.Errorf("observer recorded HeadObject calls: got %d, want 1 (map: %v)", got, seen)
 	}

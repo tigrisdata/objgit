@@ -145,8 +145,8 @@ first push becomes a series of bounded containers, instead of one enormous PUT.
 
 An object count alone is a poor proxy for container size. 32768 tiny objects
 make a few megabytes. 32768 large blobs make tens of gigabytes. Container size
-is what sets the size of one PUT, of one bulk `.bin` download, and of one pack
-cache eviction, so the byte cap bounds all three.
+is what sets the size of one PUT, of one prefetched `.bin` download, and of one
+pack cache eviction, so the byte cap bounds all three.
 
 The two caps differ in where they run. The walk checks the byte cap *before* it
 adds an object, and the object cap after. A container at 127 MiB must not
@@ -163,7 +163,8 @@ pack. Any number of containers, of any size, therefore resolves the same way.
 
 One consequence is worth keeping. `snapshotEntries` sorts by pack and then by
 offset, so a full iteration drains one container at a time. It does not hold
-the bulk download of every container open at once.
+the download of every container open at once. That offset order is also what
+makes the watermark tier work; see [Reads](#reads).
 
 ## Reads
 
@@ -180,17 +181,53 @@ A packed read is one ranged `GetObject` over the record's `stored` span. There
 is no delta chain to reconstruct. When the record names the zstd codec, the
 read decompresses one frame; otherwise the bytes are already the object.
 
-After one `Storer` reads more than 32 **distinct** objects from one pack
-(`packBulkFetchThreshold`), it downloads that whole `.bin` once. It then
-serves every later read locally. This is what turns a clone into roughly one
-large GET instead of thousands of small ones.
+## The pack prefetch (`packindex.go`)
+
+The first packed read of a container starts a download of that whole `.bin`
+(`startPackFetch`). The download runs in the background. The read that started
+it does not wait for it.
+
+This is what turns a clone into roughly one large GET instead of thousands of
+small ones. A container holds up to `maxPackBytes`, so a read that waited for
+one stalled the clone in the middle of itself.
+
+`packObject` therefore has four tiers, and no tier waits:
+
+1. The local staging file of an unfinished push.
+2. A finished download of the container.
+3. The part of a running download that is already on disk.
+4. One ranged `GetObject`.
+
+Tier 3 is a watermark. A `.bin` streams to disk in offset order, so a read is
+local as soon as the download passes the end of that object. `snapshotEntries`
+hands objects out in offset order too, so a full iteration reaches this tier
+early and stays on it.
+
+A read above the watermark takes tier 4, and pays for those bytes twice. This
+is the cost of never blocking, and the watermark is what keeps it small.
+
+The download verifies the SHA-256 of the bytes against the pack id before tier
+2 accepts them. Tier 3 does not, because the digest is only known at the end.
+This is the same trust tier 4 gives: a ranged GET verifies no digest either.
+
+NOTE: A failed download is sticky for that `Storer`. Later reads stay on ranged
+GETs. They do not retry, and they do not fail.
+
+`maxLivePackFetches` (4) bounds how many downloads run at once. The cap used to
+exist by accident, because the read that started a download blocked on it.
+`Storer.fetchSem` holds it, and `Scoped` shares that channel, so one root
+`Storer` gives the whole process one budget.
+
+CAUTION: A `Storer`'s observer callback (`WithObserver`) now fires from these
+background goroutines as well as from request goroutines. It must be safe for
+concurrent use. `metrics.ObserveS3` already is.
 
 ## The pack cache (`packcache.go`)
 
-`WithPackCache` decides where that bulk-downloaded copy lands.
+`WithPackCache` decides where the downloaded copy lands.
 
 Without the option, each `Storer` gets a private temp file that is unlinked
-but still open. The file dies with the request, so the *next* clone downloads
+but still open. The file dies with the `Storer`, so the *next* clone downloads
 the pack again.
 
 With the option, one process-wide `*PackCache` keeps whole `.bin` files in a
@@ -208,15 +245,23 @@ the bytes of the `.bin` itself. A hit across two repositories is therefore
 byte-identical content, which makes it deduplication and not leakage. The
 cache also re-verifies that digest while the download streams to disk.
 
-Two design notes are worth not deriving a second time:
+The cache also owns the watermark stream of a download it is running, on
+`cacheEntry.stream`. `PackCache.partial` hands it to any caller, and not only
+to the one that started the download. This is what lets a second `Storer`,
+parked in the cache's singleflight wait, still read tier 3.
+
+Three design notes are worth not deriving a second time:
 
 - **There is no refcounting.** The cache owns the file on disk, each caller
   owns its own descriptor, and eviction is `os.Remove`. An open descriptor
   outlives the unlink, so a clone that is mid-read never breaks, and the space
   returns when the last reader closes.
 - **A failed download is not cached.** The entry is dropped, so a later
-  request can retry. The `packAccess.once` of each `Storer`, in
-  `packindex.go`, is what prevents a retry storm inside one request.
+  request can retry. The `packAccess.start` of each `Storer`, in
+  `packindex.go`, is what prevents a retry storm inside one `Storer`.
+- **The stream is cleared before the download settles.** A reader can then
+  take one ranged GET in that window, which is correct. The alternative
+  serves bytes out of a body that failed its checksum.
 
 ## Testing seams
 

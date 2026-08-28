@@ -748,8 +748,8 @@ func TestPackfileWriterRoundTrip(t *testing.T) {
 	// object — this is the delta-resolution proof, since the scratch storer
 	// that produced the .bin already flattened every delta before we ever
 	// touched S3.
-	seen := map[string]int{}
-	s2 := newTestStorer(t, f, WithObserver(func(op string, _ time.Duration, _ error) { seen[op]++ }))
+	obs, snapshot := countingObserver()
+	s2 := newTestStorer(t, f, obs)
 
 	for _, h := range fx.hashes {
 		want := fx.byHash[h]
@@ -783,7 +783,7 @@ func TestPackfileWriterRoundTrip(t *testing.T) {
 			}
 		}
 	}
-	if seen["HeadObject"] != 0 {
+	if seen := snapshot(); seen["HeadObject"] != 0 {
 		t.Errorf("Has/SizeEncodedObject used HeadObject %d times, want 0 (pack lookups cost nothing extra)", seen["HeadObject"])
 	}
 }
@@ -1344,72 +1344,90 @@ func blobHashes(fx packFixture) []plumbing.Hash {
 	return out
 }
 
-func TestPackBulkDownloadThreshold(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not installed")
-	}
-	t.Parallel()
+// packRecords parses every .cue in the fake bucket, returning each container's
+// records sorted by offset — the order a .bin is written in, and therefore the
+// order a download fills it in. Zero-length records are dropped, since
+// packObject answers those without touching any tier.
+func packRecords(t *testing.T, s *Storer, f *fakeS3) map[string][]cueRecord {
+	t.Helper()
+	_, cues, _ := packContents(t, f)
 
-	fx := buildPackFixture(t, 40, false)
-	blobs := blobHashes(fx)
-	if len(blobs) < packBulkFetchThreshold+1 {
-		t.Fatalf("fixture too small: %d blobs, need > %d", len(blobs), packBulkFetchThreshold)
-	}
-
-	f := newFakeS3(t)
-	s := newTestStorer(t, f)
-	writePack(t, s, fx)
-	if err := s.up.flush(); err != nil {
-		t.Fatalf("flush: %v", err)
-	}
-
-	s2 := newTestStorer(t, f)
-
-	for i := 0; i < packBulkFetchThreshold; i++ {
-		if _, err := s2.EncodedObject(plumbing.BlobObject, blobs[i]); err != nil {
-			t.Fatalf("read %d: %v", i, err)
+	out := make(map[string][]cueRecord, len(cues))
+	for id, raw := range cues {
+		recs, err := parseCue(s.oh.Size(), raw)
+		if err != nil {
+			t.Fatalf("parse cue %s: %v", id, err)
 		}
-	}
-	if got := f.nrangedGets(); got != packBulkFetchThreshold {
-		t.Errorf("ranged GETs after %d distinct reads = %d, want %d", packBulkFetchThreshold, got, packBulkFetchThreshold)
-	}
-	if f.nfullBinGets() != 0 {
-		t.Error("bulk pack download fired before crossing the threshold")
-	}
-
-	// Re-reading an already-seen hash below the threshold: still a ranged
-	// GET (no bulk copy exists yet), but must not trigger a download.
-	if _, err := s2.EncodedObject(plumbing.BlobObject, blobs[0]); err != nil {
-		t.Fatalf("re-read: %v", err)
-	}
-	if f.nfullBinGets() != 0 {
-		t.Error("re-reading a seen hash below threshold triggered a bulk download")
-	}
-
-	// The (threshold+1)th distinct object crosses the line.
-	if _, err := s2.EncodedObject(plumbing.BlobObject, blobs[packBulkFetchThreshold]); err != nil {
-		t.Fatalf("crossing read: %v", err)
-	}
-	if got := f.nfullBinGets(); got != 1 {
-		t.Errorf("bulk pack downloads after crossing threshold = %d, want 1", got)
-	}
-	rangedAtCrossing := f.nrangedGets()
-
-	// Every further read — new or repeated — costs nothing more.
-	for i := 0; i <= packBulkFetchThreshold; i++ {
-		if _, err := s2.EncodedObject(plumbing.BlobObject, blobs[i]); err != nil {
-			t.Fatalf("post-bulk read %d: %v", i, err)
+		kept := recs[:0]
+		for _, r := range recs {
+			if r.stored > 0 {
+				kept = append(kept, r)
+			}
 		}
+		sort.Slice(kept, func(i, j int) bool { return kept[i].offset < kept[j].offset })
+		out[id] = kept
 	}
-	if f.nfullBinGets() != 1 {
-		t.Errorf("bulk pack downloads after further reads = %d, want 1", f.nfullBinGets())
+	return out
+}
+
+// onlyPack is packRecords for a fixture that produced exactly one container.
+func onlyPack(t *testing.T, s *Storer, f *fakeS3) (string, []cueRecord) {
+	t.Helper()
+	byID := packRecords(t, s, f)
+	if len(byID) != 1 {
+		t.Fatalf("expected exactly one pack container, got %d", len(byID))
 	}
-	if f.nrangedGets() != rangedAtCrossing {
-		t.Errorf("ranged GETs grew after the bulk download landed: %d -> %d", rangedAtCrossing, f.nrangedGets())
+	for id, recs := range byID {
+		return id, recs
+	}
+	panic("unreachable: the map holds exactly one entry")
+}
+
+// waitPackFetch blocks until s's background download of id has settled, either
+// way. Reads never wait on that, so a test that wants to observe the landed
+// state has to.
+func waitPackFetch(t *testing.T, s *Storer, id string) {
+	t.Helper()
+	select {
+	case <-s.packs.getAccess(id).done:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the background download of pack %s never settled", id)
 	}
 }
 
-func TestPackBulkDownloadVerifies(t *testing.T) {
+// waitWatermark blocks until s can see at least want bytes of id's container
+// on local disk.
+func waitWatermark(t *testing.T, s *Storer, id string, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if ps := s.partialPack(id); ps != nil && ps.n.Load() >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the download of pack %s never reached %d bytes on disk", id, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// seededReader writes fx into a fresh bucket and returns a fake plus a cold
+// Storer over it, which is the opening move of every prefetch test here.
+func seededReader(t *testing.T, fx packFixture, wopts ...Option) (*fakeS3, *Storer) {
+	t.Helper()
+	f := newFakeS3(t)
+	w := newTestStorer(t, f, wopts...)
+	writePack(t, w, fx)
+	if err := w.up.flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	return f, newTestStorer(t, f)
+}
+
+// TestPackPrefetchStartsOnFirstRead pins the trigger: one packed read is enough
+// to start the container's download, and that read serves itself over a ranged
+// GET rather than waiting for it.
+func TestPackPrefetchStartsOnFirstRead(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
 	}
@@ -1417,9 +1435,261 @@ func TestPackBulkDownloadVerifies(t *testing.T) {
 
 	fx := buildPackFixture(t, 40, false)
 	blobs := blobHashes(fx)
-	if len(blobs) < packBulkFetchThreshold+1 {
-		t.Fatalf("fixture too small: %d blobs, need > %d", len(blobs), packBulkFetchThreshold)
+	f, reader := seededReader(t, fx)
+	id, _ := onlyPack(t, reader, f)
+
+	if _, err := reader.EncodedObject(plumbing.AnyObject, blobs[0]); err != nil {
+		t.Fatalf("first read: %v", err)
 	}
+	if got := f.nrangedGets(); got != 1 {
+		t.Errorf("ranged GETs for the first read = %d, want 1", got)
+	}
+
+	waitPackFetch(t, reader, id)
+	if got := f.nfullBinGets(); got != 1 {
+		t.Errorf("whole-pack downloads started by one read = %d, want 1", got)
+	}
+
+	// With the container on disk, nothing else goes to the network.
+	settled := f.nrangedGets()
+	for _, h := range blobs {
+		if _, err := reader.EncodedObject(plumbing.AnyObject, h); err != nil {
+			t.Fatalf("read of %s after the download landed: %v", h, err)
+		}
+	}
+	if got := f.nrangedGets(); got != settled {
+		t.Errorf("ranged GETs grew after the download landed: %d -> %d", settled, got)
+	}
+	if got := f.nfullBinGets(); got != 1 {
+		t.Errorf("whole-pack downloads = %d, want 1", got)
+	}
+}
+
+// TestPackReadNeverBlocksOnPrefetch is the point of the whole design. With a
+// container's download wedged open and yielding nothing, every read of that
+// container must still come back — over ranged GETs — instead of queueing
+// behind it.
+func TestPackReadNeverBlocksOnPrefetch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	t.Parallel()
+
+	fx := buildPackFixture(t, 40, false)
+	blobs := blobHashes(fx)
+	f, reader := seededReader(t, fx)
+
+	release, waitStarted := f.holdBinBodies(t, 0) // the download never yields a byte
+	defer release()
+
+	if _, err := reader.EncodedObject(plumbing.AnyObject, blobs[0]); err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	waitStarted()
+
+	done := make(chan error, 1)
+	go func() {
+		for _, h := range blobs[1:] {
+			if _, err := reader.EncodedObject(plumbing.AnyObject, h); err != nil {
+				done <- fmt.Errorf("read %s: %w", h, err)
+				return
+			}
+		}
+		done <- nil
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("reading while the download was stalled: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a packed read blocked on the stalled whole-pack download")
+	}
+
+	if got, want := f.nrangedGets(), len(blobs); got != want {
+		t.Errorf("ranged GETs = %d, want %d — every read should have taken the ranged tier", got, want)
+	}
+	if got := f.nfullBinGets(); got != 1 {
+		t.Errorf("whole-pack downloads = %d, want 1", got)
+	}
+}
+
+// TestPackWatermarkServesPartialDownload covers the tier that keeps the
+// non-blocking design from paying for the same bytes twice: an object whose
+// span has already reached disk is read locally, and only one past the
+// watermark costs a ranged GET.
+func TestPackWatermarkServesPartialDownload(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	t.Parallel()
+
+	fx := buildPackFixture(t, 40, false)
+	f, reader := seededReader(t, fx)
+	id, recs := onlyPack(t, reader, f)
+	if len(recs) < 4 {
+		t.Fatalf("fixture produced only %d records, need at least 4", len(recs))
+	}
+
+	// Park the download exactly at the end of a record in the middle.
+	mid := recs[len(recs)/2]
+	stop := mid.offset + mid.stored
+	last := recs[len(recs)-1]
+
+	release, waitStarted := f.holdBinBodies(t, int(stop))
+	defer release()
+
+	// The read that starts the prefetch sees a watermark of zero, so it is a
+	// ranged GET no matter where its object lives.
+	if _, err := reader.EncodedObject(plumbing.AnyObject, last.hash); err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	waitStarted()
+	waitWatermark(t, reader, id, stop)
+
+	before := f.nrangedGets()
+	below := 0
+	for _, r := range recs {
+		if r.offset+r.stored > stop {
+			continue
+		}
+		below++
+		obj, err := reader.EncodedObject(plumbing.AnyObject, r.hash)
+		if err != nil {
+			t.Fatalf("read of %s below the watermark: %v", r.hash, err)
+		}
+		if want := fx.byHash[r.hash].size; obj.Size() != want {
+			t.Errorf("read of %s below the watermark: size %d, want %d", r.hash, obj.Size(), want)
+		}
+	}
+	if below == 0 {
+		t.Fatal("no record ended at or below the watermark; the fixture cannot exercise this tier")
+	}
+	if got := f.nrangedGets(); got != before {
+		t.Errorf("%d reads below the watermark cost %d ranged GETs, want 0", below, got-before)
+	}
+
+	// One past it still goes to the network.
+	if _, err := reader.EncodedObject(plumbing.AnyObject, last.hash); err != nil {
+		t.Fatalf("read past the watermark: %v", err)
+	}
+	if got := f.nrangedGets(); got != before+1 {
+		t.Errorf("a read past the watermark cost %d ranged GETs, want 1", got-before)
+	}
+}
+
+// TestPackWatermarkThroughCacheSingleflight covers the reason the in-progress
+// stream lives on the cache entry: a Storer whose own download is parked behind
+// another Storer's must still read out of the bytes that one has landed.
+func TestPackWatermarkThroughCacheSingleflight(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	t.Parallel()
+
+	fx := buildPackFixture(t, 40, false)
+	f := newFakeS3(t)
+	cache := newTestPackCache(t, 0)
+
+	w := newTestStorer(t, f, WithPackCache(cache))
+	writePack(t, w, fx)
+	if err := w.up.flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	owner := newTestStorer(t, f, WithPackCache(cache))
+	waiter := newTestStorer(t, f, WithPackCache(cache))
+	id, recs := onlyPack(t, owner, f)
+
+	mid := recs[len(recs)/2]
+	stop := mid.offset + mid.stored
+	release, waitStarted := f.holdBinBodies(t, int(stop))
+	// Let the download finish before the test ends, so it cannot be renaming a
+	// file into the cache directory while the cache's own cleanup removes it.
+	defer func() {
+		release()
+		waitPackFetch(t, owner, id)
+	}()
+
+	if _, err := owner.EncodedObject(plumbing.AnyObject, recs[len(recs)-1].hash); err != nil {
+		t.Fatalf("owner's first read: %v", err)
+	}
+	waitStarted()
+	waitWatermark(t, owner, id, stop)
+
+	// The waiter's own prefetch lands in the cache's singleflight and downloads
+	// nothing, but its reads below the watermark are still local.
+	before := f.nrangedGets()
+	obj, err := waiter.EncodedObject(plumbing.AnyObject, recs[0].hash)
+	if err != nil {
+		t.Fatalf("waiter's read below the watermark: %v", err)
+	}
+	if want := fx.byHash[recs[0].hash].size; obj.Size() != want {
+		t.Errorf("waiter read size %d, want %d", obj.Size(), want)
+	}
+	if got := f.nrangedGets(); got != before {
+		t.Errorf("the waiter's read below the watermark cost %d ranged GETs, want 0", got-before)
+	}
+	if got := f.nfullBinGets(); got != 1 {
+		t.Errorf("whole-pack downloads = %d, want 1 — the cache should have deduplicated them", got)
+	}
+}
+
+// TestPackPrefetchConcurrencyCap pins maxLivePackFetches. Backgrounding the
+// download removed the accidental throttle that blocking gave us, so the cap
+// is now the only thing between a repository with many containers and every
+// one of them on the wire at once.
+func TestPackPrefetchConcurrencyCap(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	t.Parallel()
+
+	fx := buildPackFixture(t, 40, false)
+	f, reader := seededReader(t, fx, withMaxPackObjects(2))
+	byID := packRecords(t, reader, f)
+	if len(byID) <= maxLivePackFetches {
+		t.Fatalf("fixture produced %d containers, need more than %d", len(byID), maxLivePackFetches)
+	}
+
+	release, _ := f.holdBinBodies(t, 0)
+	defer release()
+
+	// One read per container, so every container wants a download. None of
+	// these reads blocks, so a plain loop starts them all.
+	for id, recs := range byID {
+		if _, err := reader.EncodedObject(plumbing.AnyObject, recs[0].hash); err != nil {
+			t.Fatalf("read from pack %s: %v", id, err)
+		}
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for f.peakLiveBinGets() < maxLivePackFetches {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d downloads ever ran at once, want %d", f.peakLiveBinGets(), maxLivePackFetches)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// Give any download that the cap should have held back a chance to show up.
+	time.Sleep(200 * time.Millisecond)
+	if got := f.peakLiveBinGets(); got != maxLivePackFetches {
+		t.Errorf("%d whole-pack downloads ran at once, want at most %d", got, maxLivePackFetches)
+	}
+}
+
+// TestPackPrefetchChecksumFailure covers the failure posture. A container whose
+// bytes do not hash to its id is refused, the failure is sticky for this
+// Storer, and — the part the watermark tier adds — no read is ever served out
+// of the partial file it left behind.
+func TestPackPrefetchChecksumFailure(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	t.Parallel()
+
+	fx := buildPackFixture(t, 40, false)
+	blobs := blobHashes(fx)
 
 	f := newFakeS3(t)
 	s := newTestStorer(t, f)
@@ -1445,62 +1715,89 @@ func TestPackBulkDownloadVerifies(t *testing.T) {
 	f.objs[binKey] = o
 	f.mu.Unlock()
 
-	s2 := newTestStorer(t, f)
-	for i := 0; i <= packBulkFetchThreshold; i++ {
-		if _, err := s2.EncodedObject(plumbing.BlobObject, blobs[i]); err != nil {
-			t.Fatalf("read %d: %v", i, err)
-		}
+	reader := newTestStorer(t, f)
+	id, _ := onlyPack(t, reader, f)
+
+	if _, err := reader.EncodedObject(plumbing.AnyObject, blobs[0]); err != nil {
+		t.Fatalf("first read: %v", err)
 	}
+	waitPackFetch(t, reader, id)
 	if f.nfullBinGets() == 0 {
-		t.Error("expected a bulk-download attempt")
+		t.Error("expected a whole-pack download attempt")
+	}
+	if ps := reader.partialPack(id); ps != nil {
+		t.Error("a failed download left its partial file readable")
 	}
 
+	// Every later read still works, over ranged GETs, and never retries.
 	before := f.nfullBinGets()
-	if _, err := s2.EncodedObject(plumbing.BlobObject, blobs[0]); err != nil {
-		t.Fatalf("read after sticky failure: %v", err)
+	for _, h := range blobs {
+		obj, err := reader.EncodedObject(plumbing.AnyObject, h)
+		if err != nil {
+			t.Fatalf("read of %s after the sticky failure: %v", h, err)
+		}
+		if want := fx.byHash[h].size; obj.Size() != want {
+			t.Errorf("read of %s: size %d, want %d", h, obj.Size(), want)
+		}
 	}
 	if f.nfullBinGets() != before {
-		t.Error("bulk download retried after a sticky checksum failure")
+		t.Error("the whole-pack download was retried after a sticky checksum failure")
 	}
 }
 
-func TestIterUsesBulkDownload(t *testing.T) {
+// TestIterConvergesOnTheLocalCopy checks the iteration case end to end. The
+// walk hands objects out in offset order and the download fills the file in
+// offset order, so one download covers the whole walk and a second walk over
+// the same Storer costs nothing at all.
+func TestIterConvergesOnTheLocalCopy(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
 	}
 	t.Parallel()
 
 	fx := buildPackFixture(t, 40, false)
+	f, reader := seededReader(t, fx)
+	id, _ := onlyPack(t, reader, f)
 
-	f := newFakeS3(t)
-	s := newTestStorer(t, f)
-	writePack(t, s, fx)
-	if err := s.up.flush(); err != nil {
-		t.Fatalf("flush: %v", err)
+	iterate := func() int {
+		t.Helper()
+		iter, err := reader.IterEncodedObjects(plumbing.BlobObject)
+		if err != nil {
+			t.Fatalf("IterEncodedObjects: %v", err)
+		}
+		defer iter.Close()
+
+		count := 0
+		if err := iter.ForEach(func(obj plumbing.EncodedObject) error {
+			count++
+			if want := fx.byHash[obj.Hash()].size; obj.Size() != want {
+				t.Errorf("iterated %s: size %d, want %d", obj.Hash(), obj.Size(), want)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("iterate: %v", err)
+		}
+		return count
 	}
 
-	s2 := newTestStorer(t, f)
-	iter, err := s2.IterEncodedObjects(plumbing.BlobObject)
-	if err != nil {
-		t.Fatalf("IterEncodedObjects: %v", err)
-	}
-	defer iter.Close()
-
-	count := 0
-	if err := iter.ForEach(func(plumbing.EncodedObject) error {
-		count++
-		return nil
-	}); err != nil {
-		t.Fatalf("iterate: %v", err)
-	}
-	if count == 0 {
+	if count := iterate(); count == 0 {
 		t.Fatal("iterator yielded nothing")
 	}
 
+	// Not asserted before the wait: the walk never blocks on the download, so a
+	// small fixture can finish iterating before the download goroutine has even
+	// issued its GET.
+	waitPackFetch(t, reader, id)
 	if got := f.nfullBinGets(); got != 1 {
-		t.Errorf("bulk pack downloads after full iteration = %d, want 1", got)
+		t.Errorf("whole-pack downloads after a full iteration = %d, want 1", got)
 	}
-	if got := f.nrangedGets(); got > packBulkFetchThreshold {
-		t.Errorf("ranged GETs = %d, want <= %d (should self-convert to bulk)", got, packBulkFetchThreshold)
+
+	settled := f.nrangedGets()
+	iterate()
+	if got := f.nrangedGets(); got != settled {
+		t.Errorf("a second iteration cost %d ranged GETs, want 0", got-settled)
+	}
+	if got := f.nfullBinGets(); got != 1 {
+		t.Errorf("whole-pack downloads after two iterations = %d, want 1", got)
 	}
 }

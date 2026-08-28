@@ -141,8 +141,8 @@ func TestLiveBucketPackRoundTrip(t *testing.T) {
 	}
 	s := base.Scoped(prefix)
 
-	// Enough objects to exercise both read tiers on one pack.
-	fx := buildPackFixture(t, packBulkFetchThreshold+8, false)
+	// Enough objects to exercise every read tier on one pack.
+	fx := buildPackFixture(t, 40, false)
 	writePack(t, s, fx)
 	if ferr := s.up.flush(); ferr != nil {
 		t.Fatalf("flush: %v", ferr)
@@ -165,35 +165,42 @@ func TestLiveBucketPackRoundTrip(t *testing.T) {
 	reader := base.Scoped(prefix)
 
 	blobs := blobHashes(fx)
-	if len(blobs) <= packBulkFetchThreshold {
-		t.Fatalf("fixture produced only %d blobs, need > %d", len(blobs), packBulkFetchThreshold)
+	if len(blobs) < 4 {
+		t.Fatalf("fixture produced only %d blobs, need at least 4", len(blobs))
 	}
 
-	// Sub-threshold: every read here is a single ranged GET against the .bin.
-	for i := 0; i < packBulkFetchThreshold; i++ {
-		h := blobs[i]
+	// The first packed read is a ranged GET, and it also starts the whole
+	// container's download in the background.
+	obj, gerr := reader.EncodedObject(plumbing.AnyObject, blobs[0])
+	if gerr != nil {
+		t.Fatalf("ranged read of %s: %v", blobs[0], gerr)
+	}
+	assertLiveBlob(t, obj, fx.byHash[blobs[0]])
+
+	e, ok, lerr := reader.packLookup(blobs[0])
+	if lerr != nil || !ok {
+		t.Fatalf("pack lookup of %s: ok=%v err=%v", blobs[0], ok, lerr)
+	}
+
+	// Reads keep flowing while that download runs — some over ranged GETs, some
+	// out of the part of the container already on disk. Which one a given read
+	// takes is a race with the network, and correctness is the same either way.
+	for _, h := range blobs[1:] {
 		obj, gerr := reader.EncodedObject(plumbing.AnyObject, h)
 		if gerr != nil {
-			t.Fatalf("ranged read of %s: %v", h, gerr)
+			t.Fatalf("read of %s during the download: %v", h, gerr)
 		}
 		assertLiveBlob(t, obj, fx.byHash[h])
 	}
 
-	// Crossing the threshold downloads the whole .bin once and verifies its
-	// sha256 against the pack id — a real end-to-end integrity check.
-	crossing := blobs[packBulkFetchThreshold]
-	obj, gerr := reader.EncodedObject(plumbing.AnyObject, crossing)
-	if gerr != nil {
-		t.Fatalf("bulk-tier read of %s: %v", crossing, gerr)
-	}
-	assertLiveBlob(t, obj, fx.byHash[crossing])
-
-	// Post-bulk reads come off the local copy; correctness must be unchanged.
-	for i := 0; i < 3; i++ {
-		h := blobs[i]
+	// The download verifies the container's sha256 against the pack id — a real
+	// end-to-end integrity check — and every read after it comes off the local
+	// copy.
+	waitPackFetch(t, reader, e.id)
+	for _, h := range blobs[:3] {
 		obj, gerr := reader.EncodedObject(plumbing.AnyObject, h)
 		if gerr != nil {
-			t.Fatalf("post-bulk read of %s: %v", h, gerr)
+			t.Fatalf("read of %s after the download landed: %v", h, gerr)
 		}
 		assertLiveBlob(t, obj, fx.byHash[h])
 	}

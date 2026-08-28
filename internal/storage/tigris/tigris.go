@@ -94,7 +94,11 @@ type Storer struct {
 	up              *uploader  // batches loose-object PutObject calls off of Close; see upload.go
 	packs           *packIndex // pack containers this Storer knows about; see packindex.go
 	cache           *PackCache // optional process-wide local pack cache; see packcache.go
-	maxPack         int        // objects per written pack container; see maxPackObjects
+	// fetchSem bounds whole-pack downloads in flight; see maxLivePackFetches.
+	// Scoped shares it rather than replacing it, so one root Storer's
+	// descendants — every repository, in production — share one budget.
+	fetchSem chan struct{}
+	maxPack  int // objects per written pack container; see maxPackObjects
 	// maxPackBytes caps a written container's payload; see maxPackBytes. Both
 	// caps apply at once, and the writer seals on whichever it reaches first.
 	maxPackBytes int64
@@ -124,6 +128,11 @@ func WithObjectFormat(of formatcfg.ObjectFormat) Option {
 // operation name (e.g. "GetObject"), duration, and error. Instance-level on
 // purpose: unlike s3fs, our constructors hold the Storer itself, so nothing
 // needs a process-global setter. Wire metrics.ObserveS3 here from main.
+//
+// The callback must be safe for concurrent use. It fires on whatever goroutine
+// made the call, and a background pack prefetch (see startPackFetch) makes S3
+// calls of its own, outside any request. metrics.ObserveS3 is a set of
+// Prometheus vectors and already satisfies this.
 func WithObserver(fn func(operation string, dur time.Duration, err error)) Option {
 	return func(s *Storer) { s.observer = fn }
 }
@@ -226,6 +235,7 @@ func New(ctx context.Context, bucket string, opts ...Option) (*Storer, error) {
 	}
 	s.up = newUploader(s)
 	s.packs = newPackIndex()
+	s.fetchSem = make(chan struct{}, maxLivePackFetches)
 	return s, nil
 }
 
@@ -241,10 +251,12 @@ var _ storer.PackfileWriter = (*Storer)(nil)
 //
 // The returned Storer gets its own uploader and pack index (see upload.go,
 // packindex.go), independent of s's: one repository's push, pending/failed
-// uploads, or pack read history can never block or leak into another's. The
-// pack cache is the deliberate exception — it is shared, because sharing
-// downloaded packs across requests is the whole point of it, and its keys are
-// content hashes, so a hit is always the exact bytes the caller named.
+// uploads, or pack read history can never block or leak into another's.
+//
+// Two things are shared on purpose. The pack cache, because sharing downloaded
+// packs across requests is the whole point of it, and its keys are content
+// hashes, so a hit is always the exact bytes the caller named. And fetchSem,
+// because the bandwidth it rations is the process's, not one repository's.
 func (s *Storer) Scoped(prefix string) *Storer {
 	cp := *s
 	prefix = strings.Trim(prefix, "/")

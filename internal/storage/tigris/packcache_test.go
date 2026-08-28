@@ -326,25 +326,21 @@ func TestPackCacheSharedAcrossStorers(t *testing.T) {
 		t.Skip("git not installed")
 	}
 
-	fx := buildPackFixture(t, packBulkFetchThreshold+8, false)
+	fx := buildPackFixture(t, 40, false)
 	blobs := blobHashes(fx)
-	if len(blobs) <= packBulkFetchThreshold {
-		t.Fatalf("fixture produced only %d blobs, need > %d", len(blobs), packBulkFetchThreshold)
-	}
 
-	// crossThreshold reads enough distinct objects through s to trip the bulk
-	// download tier.
-	crossThreshold := func(s *Storer) {
+	// readAndSettle does one packed read through s — which is all it takes to
+	// start the container's download — and waits for that download to land.
+	readAndSettle := func(s *Storer, id string) {
 		t.Helper()
-		for i := 0; i <= packBulkFetchThreshold; i++ {
-			obj, err := s.EncodedObject(plumbing.AnyObject, blobs[i])
-			if err != nil {
-				t.Fatalf("read %s: %v", blobs[i], err)
-			}
-			if want := fx.byHash[blobs[i]]; obj.Size() != want.size {
-				t.Fatalf("read %s: size %d, want %d", blobs[i], obj.Size(), want.size)
-			}
+		obj, err := s.EncodedObject(plumbing.AnyObject, blobs[0])
+		if err != nil {
+			t.Fatalf("read %s: %v", blobs[0], err)
 		}
+		if want := fx.byHash[blobs[0]]; obj.Size() != want.size {
+			t.Fatalf("read %s: size %d, want %d", blobs[0], obj.Size(), want.size)
+		}
+		waitPackFetch(t, s, id)
 	}
 
 	f := newFakeS3(t)
@@ -354,16 +350,17 @@ func TestPackCacheSharedAcrossStorers(t *testing.T) {
 	if err := writer.up.flush(); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
+	id, _ := onlyPack(t, writer, f)
 
 	// First reader: cold cache, so it pays for the download.
-	crossThreshold(newTestStorer(t, f, WithPackCache(cache)))
+	readAndSettle(newTestStorer(t, f, WithPackCache(cache)), id)
 	if got := f.nfullBinGets(); got != 1 {
 		t.Fatalf("first reader caused %d whole-pack GETs, want 1", got)
 	}
 
 	// Second reader: separate Storer, separate pack index, same process-wide
 	// cache. It must serve the bulk tier off local disk.
-	crossThreshold(newTestStorer(t, f, WithPackCache(cache)))
+	readAndSettle(newTestStorer(t, f, WithPackCache(cache)), id)
 	if got := f.nfullBinGets(); got != 1 {
 		t.Errorf("second reader caused %d whole-pack GETs in total, want 1 — the cache did not hold", got)
 	}
@@ -375,8 +372,8 @@ func TestPackCacheSharedAcrossStorers(t *testing.T) {
 	if err := uncachedWriter.up.flush(); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
-	crossThreshold(newTestStorer(t, f2))
-	crossThreshold(newTestStorer(t, f2))
+	readAndSettle(newTestStorer(t, f2), id)
+	readAndSettle(newTestStorer(t, f2), id)
 	if got := f2.nfullBinGets(); got != 2 {
 		t.Errorf("without a cache two readers caused %d whole-pack GETs, want 2", got)
 	}

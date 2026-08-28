@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -22,16 +23,20 @@ const (
 	binSuffix  = ".bin"
 	cueSuffix  = ".cue"
 
-	// packBulkFetchThreshold is how many distinct objects may be served out of
-	// one pack via individual ranged GETs, within one Storer instance, before
-	// switching to downloading that pack's whole .bin once and serving every
-	// later read from the local copy.
+	// maxLivePackFetches bounds how many whole-pack downloads run at once.
 	//
-	// Tuned when payloads were uncompressed, so it is conservative now: a
-	// ranged GET moves fewer bytes than it used to, and a bulk download moves
-	// fewer too. Left alone deliberately — the crossover is a measurement, not
-	// a guess.
-	packBulkFetchThreshold = 32
+	// This cap used to exist by accident: the read that started a download
+	// blocked on it, so one request could never have two in flight. Now that a
+	// download runs in the background, nothing throttles it but this. Without a
+	// cap, a handful of concurrent clones over a repository with several
+	// containers would put every one of them on the wire at the same time and
+	// starve the ranged GETs that are actually serving the request.
+	//
+	// The semaphore hangs off the Storer (see tigris.go) rather than a package
+	// variable so that tests do not contend with each other. It is process-wide
+	// in production for the simple reason that main.go builds one root Storer
+	// and Scopes every repository off it.
+	maxLivePackFetches = 4
 
 	// maxPackObjects caps how many objects one *written* pack container holds,
 	// so a large initial push lands as several bin/cue pairs instead of one
@@ -43,8 +48,8 @@ const (
 	// maxPackBytes caps a written container's payload. An object count alone is
 	// a poor proxy for size — 32768 tiny objects is a few megabytes, 32768
 	// large blobs is tens of gigabytes — and container size is what sets the
-	// size of one PutObject, of one bulk .bin download on the read side
-	// (packBulkFetchThreshold), and of one PackCache eviction.
+	// size of one PutObject, of one prefetched .bin download on the read side
+	// (startPackFetch), and of one PackCache eviction.
 	//
 	// packwriter.go checks this cap *before* adding an object, so a container
 	// sitting just under it never grows past it by swallowing a large object
@@ -310,14 +315,40 @@ type packedEntry struct {
 	e    packEntry
 }
 
-// packAccess tracks one pack's read history within this Storer instance: how
-// many distinct objects have been served via individual ranged GETs, and
-// (past the threshold) the bulk-downloaded local copy.
+// packStream is the in-progress view of a whole-pack download: a descriptor
+// over the file being filled, and how many of its bytes are committed. Reads
+// go through ReadAt, which is a pread and therefore safe alongside the writer
+// appending to the same file.
+//
+// It exists so that a read whose bytes have already landed costs nothing
+// instead of a duplicate ranged GET. Since a .bin streams in offset order and
+// snapshotEntries hands objects out in offset order too, an iteration converges
+// on this tier almost as soon as the download starts.
+type packStream struct {
+	f *os.File
+	n atomic.Int64 // bytes written and counted; everything below this is readable
+}
+
+// readerFor reports a reader over [off, off+length) when the download has got
+// that far, and false when it has not — the watermark test.
+func (ps *packStream) readerFor(off, length int64) (*io.SectionReader, bool) {
+	if ps == nil || off+length > ps.n.Load() {
+		return nil, false
+	}
+	return io.NewSectionReader(ps.f, off, length), true
+}
+
+// packAccess tracks one pack's whole-container download within this Storer
+// instance. The download runs in the background — see startPackFetch — so
+// every field but start is written once by that goroutine and read by everyone
+// else; done closing is the happens-before edge that makes f and err safe to
+// look at.
 type packAccess struct {
-	seen map[plumbing.Hash]struct{}
-	once sync.Once
-	f    *os.File
-	err  error
+	start  sync.Once
+	done   chan struct{}              // closed when the download settles
+	stream atomic.Pointer[packStream] // in-progress view; see partialPack for why only the cache-less path fills it
+	f      *os.File                   // the local copy; valid after done closes with err == nil
+	err    error
 }
 
 // packIndex is a Storer's view of every pack it can reach: entries already
@@ -414,40 +445,29 @@ func (p *packIndex) snapshotEntries() []packedEntry {
 	return out
 }
 
-// recordAccess registers h as a distinct ranged-GET read of pack id and
-// reports whether this call is the one that crosses packBulkFetchThreshold —
-// distinct objects, not reads: re-reading the same handful of hashes never
-// triggers a bulk download.
-func (p *packIndex) recordAccess(id string, h plumbing.Hash) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	a, ok := p.access[id]
-	if !ok {
-		a = &packAccess{seen: make(map[plumbing.Hash]struct{})}
-		p.access[id] = a
-	}
-	a.seen[h] = struct{}{}
-	return len(a.seen) > packBulkFetchThreshold
-}
-
 func (p *packIndex) getAccess(id string) *packAccess {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	a, ok := p.access[id]
 	if !ok {
-		a = &packAccess{seen: make(map[plumbing.Hash]struct{})}
+		a = &packAccess{done: make(chan struct{})}
 		p.access[id] = a
 	}
 	return a
 }
 
-// bulkCopy reports the pack's already-downloaded local copy, if any.
+// bulkCopy reports the pack's fully downloaded local copy, if the download has
+// finished. It never waits: a download still in flight reports nothing, and the
+// caller falls through to the watermark and ranged-GET tiers instead of
+// blocking on a whole container.
 func (p *packIndex) bulkCopy(id string) (*os.File, bool) {
 	a := p.getAccess(id)
-	if a.f == nil {
+	select {
+	case <-a.done:
+		return a.f, a.f != nil
+	default:
 		return nil, false
 	}
-	return a.f, true
 }
 
 // ensurePacksBuilt lists packs/*.cue under this Storer's prefix and merges
@@ -511,18 +531,54 @@ func (s *Storer) packLookup(h plumbing.Hash) (packEntry, bool, error) {
 	return e, ok, nil
 }
 
-// downloadPack fetches packs/<id>.bin whole, once per pack per Storer
-// instance (guarded by packAccess.once). Failure is sticky for this instance —
-// later reads quietly fall back to ranged GETs rather than retrying or
-// erroring.
-func (s *Storer) downloadPack(id string) (*os.File, error) {
+// startPackFetch kicks off the whole-container download of packs/<id>.bin in
+// the background, once per pack per Storer instance. It returns immediately:
+// the caller goes on serving its read out of the watermark or a ranged GET,
+// and only later reads get the local copy.
+//
+// Backgrounding is the whole point. Downloading inline made one read pay for a
+// container of up to maxPackBytes, and parked every concurrent read of the
+// same pack behind the same sync.Once, so a clone stalled outright in the
+// middle of itself.
+//
+// Failure is sticky for this instance — later reads quietly stay on ranged
+// GETs rather than retrying or erroring. That is what start being a sync.Once
+// buys, and it is the same posture the blocking version had.
+//
+// The goroutine captures s, so this Storer's packIndex stays reachable for as
+// long as the download runs and the cleanup in fetchWholePack cannot fire
+// early. s.ctx is the process context (nothing rebinds it per request), so a
+// download outlives the request that started it — deliberately, because with a
+// PackCache installed it is still warming the cache for the next clone. At
+// shutdown it is abandoned, not waited on.
+func (s *Storer) startPackFetch(id string) {
 	a := s.packs.getAccess(id)
-	a.once.Do(func() {
-		slog.Debug("pack read threshold crossed, bulk-fetching pack",
-			"pack", id, "threshold", packBulkFetchThreshold, "prefix", s.prefix)
-		a.f, a.err = s.fetchWholePack(id)
+	a.start.Do(func() {
+		slog.Debug("prefetching pack in the background", "pack", id, "prefix", s.prefix)
+		go func() {
+			defer close(a.done)
+			a.f, a.err = s.fetchWholePack(id, a)
+		}()
 	})
-	return a.f, a.err
+}
+
+// partialPack reports the in-progress view of id's download, from whichever of
+// the two download paths is running it.
+//
+// There are two because there are two places a pack can be staged. Without a
+// PackCache the file is this Storer's own private temp file, so the stream sits
+// on its packAccess. With one the file belongs to the cache, and the stream
+// sits on the cache entry — which is what lets a Storer parked in the cache's
+// singleflight wait, downloading nothing itself, still read the bytes another
+// Storer's download has landed.
+func (s *Storer) partialPack(id string) *packStream {
+	if ps := s.packs.getAccess(id).stream.Load(); ps != nil {
+		return ps
+	}
+	if s.cache != nil {
+		return s.cache.partial(id)
+	}
+	return nil
 }
 
 // fetchWholePack produces a local descriptor over the whole .bin. With a
@@ -531,8 +587,8 @@ func (s *Storer) downloadPack(id string) (*os.File, error) {
 // without one it is a private unlinked-but-open temp file, whose disk space the
 // kernel reclaims as soon as every descriptor referencing it closes. Both paths
 // verify the bytes' sha256 against id — the pack's name is its checksum.
-func (s *Storer) fetchWholePack(id string) (*os.File, error) {
-	f, err := s.openWholePack(id)
+func (s *Storer) fetchWholePack(id string, a *packAccess) (*os.File, error) {
+	f, err := s.openWholePack(id, a)
 	if err != nil {
 		return nil, err
 	}
@@ -560,8 +616,10 @@ func (s *Storer) fetchWholePack(id string) (*os.File, error) {
 	return f, nil
 }
 
-func (s *Storer) openWholePack(id string) (*os.File, error) {
+func (s *Storer) openWholePack(id string, a *packAccess) (*os.File, error) {
 	if s.cache != nil {
+		// The cache stages the file, so it also publishes the watermark stream;
+		// see PackCache.fill and partialPack.
 		return s.cache.Get(id, s.streamPack(id))
 	}
 
@@ -573,7 +631,15 @@ func (s *Storer) openWholePack(id string) (*os.File, error) {
 	}
 	os.Remove(f.Name()) // unlink now; fd keeps the data alive until it's closed
 
-	if _, err := verifiedCopy(f, id, s.streamPack(id)); err != nil {
+	// One descriptor serves both roles: the copy below appends through it, and
+	// watermark readers pread through it. Clearing the stream before returning
+	// hands every later read to the completed-copy tier instead, and makes sure
+	// nothing is ever served out of a body that failed its checksum.
+	ps := &packStream{f: f}
+	a.stream.Store(ps)
+	_, err = verifiedCopy(f, id, s.streamPack(id), &ps.n)
+	a.stream.Store(nil)
+	if err != nil {
 		f.Close()
 		return nil, err
 	}
@@ -586,8 +652,20 @@ func (s *Storer) openWholePack(id string) (*os.File, error) {
 
 // streamPack returns a fetch function that writes packs/<id>.bin whole into w,
 // in the shape PackCache.Get and verifiedCopy both consume.
+//
+// This closure is also where maxLivePackFetches is enforced, because it is the
+// one place that touches the network — and, with a PackCache installed, it runs
+// only for the caller that owns a download. A caller merely waiting on someone
+// else's download therefore never holds a slot while doing nothing.
 func (s *Storer) streamPack(id string) func(w io.Writer) error {
 	return func(w io.Writer) error {
+		select {
+		case s.fetchSem <- struct{}{}:
+			defer func() { <-s.fetchSem }()
+		case <-s.ctx.Done():
+			return fmt.Errorf("tigris: download pack %s: %w", id, s.ctx.Err())
+		}
+
 		key := s.prefix + packPrefix + id + binSuffix
 		slog.Debug("fetching whole pack", "pack", id, "bucket", s.bucket, "key", key)
 
@@ -614,12 +692,25 @@ func (s *Storer) streamPack(id string) func(w io.Writer) error {
 }
 
 // packObject reads one object out of a pack, in increasing order of cost:
-// this instance's own in-flight (not-yet-uploaded) local copy, an
-// already-bulk-downloaded local copy, triggering a bulk download on the read
-// that crosses packBulkFetchThreshold, or — the common case below that
-// threshold — a single ranged GetObject straight into the object's byte
-// range. Every tier fetches e.stored bytes and decodes through decodePacked,
-// which is what makes a compressed payload invisible to callers.
+//
+//  1. this instance's own in-flight (not-yet-uploaded) local copy;
+//  2. a finished whole-container download;
+//  3. the part of a running download that has already reached disk;
+//  4. a single ranged GetObject straight into the object's byte range.
+//
+// No tier ever waits on a download. The first packed read of a container also
+// starts one in the background (startPackFetch), and every read from then on
+// takes whichever tier is ready at that instant — tier 3 as the file fills in
+// offset order, tier 2 once it lands. Reads keep flowing at ranged-GET latency
+// throughout, which is the point: the container is up to maxPackBytes, and
+// waiting for it stalled a clone in the middle of itself.
+//
+// Starting the prefetch before consulting tier 3 is deliberate: on the very
+// first read it costs nothing, and it gives that read a chance at a stream
+// another request has already warmed.
+//
+// Every tier fetches e.stored bytes and decodes through decodePacked, which is
+// what makes a compressed payload invisible to callers.
 func (s *Storer) packObject(t plumbing.ObjectType, h plumbing.Hash, e packEntry) (plumbing.EncodedObject, error) {
 	if t != plumbing.AnyObject && e.typ != t {
 		return nil, plumbing.ErrObjectNotFound
@@ -649,14 +740,10 @@ func (s *Storer) packObject(t plumbing.ObjectType, h plumbing.Hash, e packEntry)
 		return s.decodePacked(h, hs, e.codec, io.NewSectionReader(f, e.offset, e.stored))
 	}
 
-	if s.packs.recordAccess(e.id, h) {
-		f, err := s.downloadPack(e.id)
-		if err == nil {
-			return s.decodePacked(h, hs, e.codec, io.NewSectionReader(f, e.offset, e.stored))
-		}
-		// Sticky failure: degrade to the ranged GET below rather than fail
-		// the read outright.
-		slog.Debug("bulk pack fetch unavailable, falling back to ranged reads", "pack", e.id, "err", err)
+	s.startPackFetch(e.id)
+
+	if r, ok := s.partialPack(e.id).readerFor(e.offset, e.stored); ok {
+		return s.decodePacked(h, hs, e.codec, r)
 	}
 
 	start := time.Now()

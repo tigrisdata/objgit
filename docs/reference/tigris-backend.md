@@ -242,17 +242,29 @@ no `.bin` body.
 A read of a packed object sends one ranged `GetObject` into the `.bin`,
 over the `stored` byte span, and then decompresses the frame if the
 record says zstd.
-After a `Storer` reads more than 32 different objects from one pack, it
-downloads the whole `.bin` one time. All later reads of that pack use
-the local copy. A clone therefore costs about one large GET for each
-pack, and not one GET for each object.
+
+The first packed read of a pack also starts a download of the whole
+`.bin`. That download runs in the background, and no read ever waits for
+it. A clone therefore costs about one large GET for each pack, and not
+one GET for each object, but it never stops in the middle to pay for
+one.
+
+While the download runs, a read whose bytes are already on disk uses the
+local file. A `.bin` fills in offset order, so a read below that point
+costs nothing. A read above it takes a ranged GET, and pays for those
+bytes a second time.
 
 Iteration returns the packed objects one pack at a time, in offset
 order. A push above the write limit spans several packs, and this order
 keeps one whole-pack copy open at a time instead of one for each pack.
+The same order is what makes a walk reach the local file early.
 
 The code verifies the SHA-256 of the copy against the pack name before
-it trusts the bytes.
+it trusts the whole copy. A read out of the file while it fills is not
+covered by that check, because the digest is only known at the end. A
+ranged GET carries no digest either, so the two are equally trusted.
+
+At most four whole-pack downloads run at one time.
 
 ### The pack cache
 
@@ -278,17 +290,20 @@ Eviction is least-recently-used. A read of a cached pack makes that pack
 recent again. The cache admits a pack that is larger than the whole
 budget, because the read must succeed.
 
-Two more properties are deliberate:
+Three more properties are deliberate:
 
 - Many concurrent readers cause one download. The cache publishes an
   entry before the download starts, so a second caller waits instead of
   starting a second download.
+- The cache holds the in-progress view of the download it runs, and
+  hands it to any caller. A `Storer` that waits on another `Storer`'s
+  download can therefore still read the bytes already on disk.
 - The cache does not keep a failed download. The entry goes away, so a
-  later request can try again. The `once` guard in `packindex.go` stops
-  a retry storm inside one request.
+  later request can try again. The `packAccess.start` guard in
+  `packindex.go` stops a retry storm inside one `Storer`.
 
 Without a cache, a `Storer` puts its copy in a temporary file that the
-code unlinks at once, and the copy dies with the request.
+code unlinks at once, and the copy dies with the `Storer`.
 
 The daemon builds the cache from two flags. `-pack-cache-dir` gives the
 parent directory, and defaults to the OS temporary directory.
@@ -427,8 +442,9 @@ Items 1 to 4 and item 6 are complete.
    PUT for each object. With it, a push sends two PUTs for each
    container. See [The pack container](#the-pack-container).
 4. **Done.** Load pack indexes into memory. Serve packed objects with
-   ranged `GetObject` requests into the pack. A `Storer` downloads a
-   whole pack after 32 different objects from it.
+   ranged `GetObject` requests into the pack. The first packed read of a
+   pack starts a background download of the whole pack, and no read
+   waits for it.
 5. Add repacking and garbage collection. Today packs collect forever, one
    for each container that a push fills. A cold index build costs one
    small GET for each pack. A compaction pass must also delete a `.bin` that has
