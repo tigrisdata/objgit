@@ -1,3 +1,26 @@
+# [1.3.0](https://github.com/tigrisdata/objgit/compare/v1.2.0...v1.3.0) (2026-08-31)
+
+### Bug Fixes
+
+- **storage/tigris:** bound PackfileWriter's push-sized memory ([16cba4b](https://github.com/tigrisdata/objgit/commit/16cba4bb7945865607dc25b03c40eac87ce59ff5))
+
+### Features
+
+- **objgitd:** hand a whole push's ref updates over in one call ([8a3558a](https://github.com/tigrisdata/objgit/commit/8a3558a717085912347cc3986c581caadbe4474a))
+- pack refs by default, behind -packed-refs ([e366ed1](https://github.com/tigrisdata/objgit/commit/e366ed1c8d2cfb345bbc79eaf1e92de7a99f5b9e))
+- **storage/tigris:** add the packed-refs object format ([5de5668](https://github.com/tigrisdata/objgit/commit/5de56686c33d9a6a4da2563d88a0ad8d7bca847c))
+- **storage/tigris:** compress pack payloads and cue indexes with zstd ([7bea058](https://github.com/tigrisdata/objgit/commit/7bea0581ba2358ac49c09a52a72c7b649ad63d25))
+- **storage/tigris:** fold legacy loose refs on the first write ([b20935b](https://github.com/tigrisdata/objgit/commit/b20935be4189e41b2dc6dcb550e733946eda965d))
+- **storage/tigris:** keep pushed deltas, drop the pack object cap ([ea4d362](https://github.com/tigrisdata/objgit/commit/ea4d362c94a686f7210c8508594c2bf9312fd325))
+- **storage/tigris:** read refs through a memoized packed view ([6da6390](https://github.com/tigrisdata/objgit/commit/6da639084b00e4c8809e3bd499b5fa7fc6ec30a0))
+- **storage/tigris:** trace pack fetches and cache evictions ([2293f76](https://github.com/tigrisdata/objgit/commit/2293f76cf0e738140bb4e59682f12e16695876d9))
+- **storage/tigris:** write refs under a compare-and-swap ([4ca06c4](https://github.com/tigrisdata/objgit/commit/4ca06c4d56fd217ec51131ee94766da91fdfb944))
+
+### Performance Improvements
+
+- **storage/tigris:** prefetch packs in the background ([eea720d](https://github.com/tigrisdata/objgit/commit/eea720dc64d82048b31754cf0f5f9a7f7954dcd3))
+- **storage/tigris:** resolve delta bases across scratch storages ([0e86b3f](https://github.com/tigrisdata/objgit/commit/0e86b3fc47948f6fc095f6f808b739e788180c79))
+
 # [1.2.0](https://github.com/tigrisdata/objgit/compare/v1.1.0...v1.2.0) (2026-08-27)
 
 - refactor(objgitd)!: serve every repository from one bucket via the storer ([ebfe4e3](https://github.com/tigrisdata/objgit/commit/ebfe4e315aa387386c98ccef269d44cd98077470))
