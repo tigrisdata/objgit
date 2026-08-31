@@ -1,3 +1,9 @@
+## [1.4.1](https://github.com/tigrisdata/objgit/compare/v1.4.0...v1.4.1) (2026-08-31)
+
+### Performance Improvements
+
+- **storage/tigris:** cap zstd encoder concurrency ([#6](https://github.com/tigrisdata/objgit/issues/6)) ([b130832](https://github.com/tigrisdata/objgit/commit/b1308322d9dae0eaa78ac743615b03ab3d970f8c))
+
 # [1.4.0](https://github.com/tigrisdata/objgit/compare/v1.3.0...v1.4.0) (2026-08-31)
 
 ### Features
