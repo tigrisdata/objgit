@@ -141,8 +141,8 @@ func TestLiveBucketPackRoundTrip(t *testing.T) {
 	}
 	s := base.Scoped(prefix)
 
-	// Enough objects to exercise both read tiers on one pack.
-	fx := buildPackFixture(t, packBulkFetchThreshold+8, false)
+	// Enough objects to exercise every read tier on one pack.
+	fx := buildPackFixture(t, 40, false)
 	writePack(t, s, fx)
 	if ferr := s.up.flush(); ferr != nil {
 		t.Fatalf("flush: %v", ferr)
@@ -165,35 +165,42 @@ func TestLiveBucketPackRoundTrip(t *testing.T) {
 	reader := base.Scoped(prefix)
 
 	blobs := blobHashes(fx)
-	if len(blobs) <= packBulkFetchThreshold {
-		t.Fatalf("fixture produced only %d blobs, need > %d", len(blobs), packBulkFetchThreshold)
+	if len(blobs) < 4 {
+		t.Fatalf("fixture produced only %d blobs, need at least 4", len(blobs))
 	}
 
-	// Sub-threshold: every read here is a single ranged GET against the .bin.
-	for i := 0; i < packBulkFetchThreshold; i++ {
-		h := blobs[i]
+	// The first packed read is a ranged GET, and it also starts the whole
+	// container's download in the background.
+	obj, gerr := reader.EncodedObject(plumbing.AnyObject, blobs[0])
+	if gerr != nil {
+		t.Fatalf("ranged read of %s: %v", blobs[0], gerr)
+	}
+	assertLiveBlob(t, obj, fx.byHash[blobs[0]])
+
+	e, ok, lerr := reader.packLookup(blobs[0])
+	if lerr != nil || !ok {
+		t.Fatalf("pack lookup of %s: ok=%v err=%v", blobs[0], ok, lerr)
+	}
+
+	// Reads keep flowing while that download runs — some over ranged GETs, some
+	// out of the part of the container already on disk. Which one a given read
+	// takes is a race with the network, and correctness is the same either way.
+	for _, h := range blobs[1:] {
 		obj, gerr := reader.EncodedObject(plumbing.AnyObject, h)
 		if gerr != nil {
-			t.Fatalf("ranged read of %s: %v", h, gerr)
+			t.Fatalf("read of %s during the download: %v", h, gerr)
 		}
 		assertLiveBlob(t, obj, fx.byHash[h])
 	}
 
-	// Crossing the threshold downloads the whole .bin once and verifies its
-	// sha256 against the pack id — a real end-to-end integrity check.
-	crossing := blobs[packBulkFetchThreshold]
-	obj, gerr := reader.EncodedObject(plumbing.AnyObject, crossing)
-	if gerr != nil {
-		t.Fatalf("bulk-tier read of %s: %v", crossing, gerr)
-	}
-	assertLiveBlob(t, obj, fx.byHash[crossing])
-
-	// Post-bulk reads come off the local copy; correctness must be unchanged.
-	for i := 0; i < 3; i++ {
-		h := blobs[i]
+	// The download verifies the container's sha256 against the pack id — a real
+	// end-to-end integrity check — and every read after it comes off the local
+	// copy.
+	waitPackFetch(t, reader, e.id)
+	for _, h := range blobs[:3] {
 		obj, gerr := reader.EncodedObject(plumbing.AnyObject, h)
 		if gerr != nil {
-			t.Fatalf("post-bulk read of %s: %v", h, gerr)
+			t.Fatalf("read of %s after the download landed: %v", h, gerr)
 		}
 		assertLiveBlob(t, obj, fx.byHash[h])
 	}
@@ -222,4 +229,93 @@ func assertLiveBlob(t *testing.T, obj plumbing.EncodedObject, want fixtureObj) {
 	if !bytes.Equal(got, want.blob) {
 		t.Errorf("body mismatch:\ngot:  %q\nwant: %q", got, want.blob)
 	}
+}
+
+// TestLiveBucketConditionalWrites is the gate on the packed-refs design (see
+// docs/superpowers/specs/2026-08-28-packed-refs-cas-design.md). Every other
+// part of that design assumes real Tigris rejects a failed precondition with
+// an error whose code is "PreconditionFailed". Nothing else in this repository
+// sends a conditional header, so this is the only place that claim is checked.
+//
+// CAUTION: conditional operations evaluate against the latest state only on
+// Single-region and Multi-region buckets. A Global or Dual-region bucket reads
+// eventually, and this test can pass there while production races.
+// See https://www.tigrisdata.com/docs/concepts/consistency/
+func TestLiveBucketConditionalWrites(t *testing.T) {
+	bucket := os.Getenv("OBJGIT_TIGRIS_LIVE_BUCKET")
+	if bucket == "" {
+		t.Skip("OBJGIT_TIGRIS_LIVE_BUCKET not set; skipping conditional-write verification")
+	}
+
+	ctx := context.Background()
+	s, err := New(ctx, bucket, WithObserver(func(op string, dur time.Duration, oerr error) {
+		t.Logf("s3 %-14s dur=%-12s err=%v", op, dur, oerr)
+	}))
+	if err != nil {
+		t.Fatalf("live construct: %v", err)
+	}
+
+	key := "conditional-write-probe-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	t.Cleanup(func() {
+		if derr := s.removeSimple(key); derr != nil {
+			t.Logf("probe cleanup failed (harmless, key %q): %v", key, derr)
+		}
+	})
+
+	// 1. Create-if-absent succeeds on a key that does not exist, and reports an
+	//    ETag we can compare against later.
+	first, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      sp(bucket),
+		Key:         sp(key),
+		Body:        strings.NewReader("one"),
+		IfNoneMatch: sp("*"),
+	})
+	if err != nil {
+		t.Fatalf("IfNoneMatch:* on an absent key must succeed, got: %v", err)
+	}
+	etag := sv(first.ETag)
+	if etag == "" {
+		t.Fatal("PutObject returned no ETag; packed-refs has no CAS token without one")
+	}
+	t.Logf("live create-if-absent succeeded, etag=%s", etag)
+
+	// 2. Create-if-absent now fails, because the key exists.
+	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      sp(bucket),
+		Key:         sp(key),
+		Body:        strings.NewReader("two"),
+		IfNoneMatch: sp("*"),
+	})
+	if !isPreconditionFailed(err) {
+		t.Fatalf("IfNoneMatch:* on a present key must fail the precondition, got: %v", err)
+	}
+	t.Logf("live create-if-absent correctly refused the second write")
+
+	// 3. Compare-and-swap succeeds against the current ETag.
+	second, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:  sp(bucket),
+		Key:     sp(key),
+		Body:    strings.NewReader("three"),
+		IfMatch: sp(etag),
+	})
+	if err != nil {
+		t.Fatalf("IfMatch against the current ETag must succeed, got: %v", err)
+	}
+	if sv(second.ETag) == etag {
+		t.Error("ETag did not change across a write; it cannot serve as a CAS token")
+	}
+
+	// 4. Compare-and-swap fails against the now-stale ETag. This is the case
+	//    commitRefs retries on, and the reason CheckAndSetReference becomes
+	//    atomic.
+	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:  sp(bucket),
+		Key:     sp(key),
+		Body:    strings.NewReader("four"),
+		IfMatch: sp(etag),
+	})
+	if !isPreconditionFailed(err) {
+		t.Fatalf("IfMatch against a stale ETag must fail the precondition, got: %v", err)
+	}
+	t.Logf("live compare-and-swap correctly refused a stale ETag")
 }

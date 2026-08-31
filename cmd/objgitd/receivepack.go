@@ -284,7 +284,92 @@ func referenceExists(s storer.ReferenceStorer, n plumbing.ReferenceName) (bool, 
 	return err == nil, err
 }
 
+// refUpdater is the optional bulk ref-update surface. A storer that has one
+// turns a push's N ref writes into a single round trip; a storer without one
+// falls back to updateReferencesOneByOne.
+//
+// It is one flattened method rather than a batch object, because Go needs an
+// exact signature match: a method returning *tigris.RefBatch would not satisfy
+// an interface declaring NewRefBatch() refBatch. Every type here comes from
+// plumbing, which both packages already import, so the seam needs no shared
+// package.
+type refUpdater interface {
+	UpdateReferences(sets []*plumbing.Reference, removes []plumbing.ReferenceName) error
+}
+
 func updateReferences(st storage.Storer, req *packp.UpdateRequests, cmdStatus map[plumbing.ReferenceName]error, firstErr *error) {
+	if bu, ok := st.(refUpdater); ok {
+		updateReferencesBatched(bu, st, req, cmdStatus, firstErr)
+		return
+	}
+	updateReferencesOneByOne(st, req, cmdStatus, firstErr)
+}
+
+// updateReferencesBatched validates every command first, then applies the
+// whole push in one call.
+//
+// Validation is cheap here in a way it is not on the one-by-one path: the
+// tigris storer answers every referenceExists out of its per-request ref
+// cache, so N existence checks cost N map lookups instead of N GetObject
+// calls.
+//
+// A commit failure fails every staged command, because the batch is
+// all-or-nothing. That differs from the one-by-one path, where a failure
+// mid-loop leaves earlier commands applied. All-or-nothing is the better
+// behavior — it is what git push --atomic means — but report-status now
+// carries one shared error where it used to carry a mix.
+func updateReferencesBatched(bu refUpdater, st storage.Storer, req *packp.UpdateRequests, cmdStatus map[plumbing.ReferenceName]error, firstErr *error) {
+	var (
+		sets    []*plumbing.Reference
+		removes []plumbing.ReferenceName
+		staged  []plumbing.ReferenceName
+	)
+
+	for _, cmd := range req.Commands {
+		exists, err := referenceExists(st, cmd.Name)
+		if err != nil {
+			setStatus(cmdStatus, firstErr, cmd.Name, err)
+			continue
+		}
+
+		switch cmd.Action() {
+		case packp.Create:
+			if exists {
+				setStatus(cmdStatus, firstErr, cmd.Name, transport.ErrUpdateReference)
+				continue
+			}
+			sets = append(sets, plumbing.NewHashReference(cmd.Name, cmd.New))
+		case packp.Delete:
+			if !exists {
+				setStatus(cmdStatus, firstErr, cmd.Name, transport.ErrUpdateReference)
+				continue
+			}
+			removes = append(removes, cmd.Name)
+		case packp.Update:
+			if !exists {
+				setStatus(cmdStatus, firstErr, cmd.Name, transport.ErrUpdateReference)
+				continue
+			}
+			sets = append(sets, plumbing.NewHashReference(cmd.Name, cmd.New))
+		default:
+			continue
+		}
+		staged = append(staged, cmd.Name)
+	}
+
+	if len(staged) == 0 {
+		return
+	}
+
+	err := bu.UpdateReferences(sets, removes)
+	for _, n := range staged {
+		setStatus(cmdStatus, firstErr, n, err)
+	}
+}
+
+// updateReferencesOneByOne is the pre-batch path, kept for any storer without
+// a refUpdater — memory.Storage in the tests, most notably.
+func updateReferencesOneByOne(st storage.Storer, req *packp.UpdateRequests, cmdStatus map[plumbing.ReferenceName]error, firstErr *error) {
 	for _, cmd := range req.Commands {
 		exists, err := referenceExists(st, cmd.Name)
 		if err != nil {

@@ -8,15 +8,22 @@
 //
 //	objects/<hex>       loose object keyed by content hash; user metadata
 //	                    carries the git type (git-type) and size (git-size)
-//	refs/<name>         one loose ref (hash hex, or "ref: target" for symbolics)
+//	packed-refs         every ref in one object, under a compare-and-swap; see
+//	                    packedrefs.go for the format and refcache.go for the
+//	                    read and write paths
+//	refs/<name>         one legacy loose ref (hash hex, or "ref: target" for
+//	                    symbolics). Read-only: the first packed write folds
+//	                    these in and deletes them. A loose ref still wins over
+//	                    a packed one — refView explains why.
 //	shallow             newline separated commit hashes
 //	index               plumbing/format/index-encoded worktree index
 //	config              config.Config.Marshal output
-//	packs/<id>.bin      up to maxPackObjects objects or maxPackBytes bytes,
-//	                    concatenated raw bytes (one push writes as many
-//	                    containers as it needs)
-//	packs/<id>.cue      that pack's index (hash, type, offset, length per
-//	                    object) — see packindex.go for the binary format
+//	packs/<id>.bin      up to maxPackBytes bytes of
+//	                    concatenated payloads, each raw or one zstd frame
+//	                    (one push writes as many containers as it needs)
+//	packs/<id>.cue      that pack's index (hash, type, codec, offset, stored
+//	                    length and raw size per object) — see packindex.go for
+//	                    the binary format and compress.go for the codec policy
 //
 // Methods hold no per-call state on the Storer, so a Storer value is safe for
 // concurrent use.
@@ -60,6 +67,12 @@ var (
 	// ErrModulesNotSupported marks Module: submodule storers need their own
 	// per-module bucket story first.
 	ErrModulesNotSupported = errors.New("tigris: submodule storers are not supported")
+	// ErrRefContention marks a ref write that lost maxRefCASRetries
+	// compare-and-swap races in a row without any of its own expectations
+	// failing. It is deliberately not storage.ErrReferenceHasChanged: nothing
+	// the caller asked for was violated, so a retry is reasonable, where a
+	// changed ref means the caller's view of the world is stale.
+	ErrRefContention = errors.New("tigris: packed-refs contention: too many failed compare-and-swap attempts")
 
 	errBadMetadata  = errors.New("tigris: object has invalid user metadata")
 	errMalformedRef = errors.New("tigris: malformed loose ref")
@@ -76,6 +89,7 @@ type s3API interface {
 	HeadObject(ctx context.Context, params *s3.HeadObjectInput, optFns ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
 	ListObjectsV2(ctx context.Context, params *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
 	DeleteObject(ctx context.Context, params *s3.DeleteObjectInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
+	DeleteObjects(ctx context.Context, params *s3.DeleteObjectsInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error)
 }
 
 // Storer is one bucket-worth of git data speaking go-git's storage.Storer.
@@ -87,13 +101,37 @@ type Storer struct {
 	of       formatcfg.ObjectFormat
 	oh       *plumbing.ObjectHasher
 	observer func(operation string, dur time.Duration, err error)
-	up       *uploader  // batches loose-object PutObject calls off of Close; see upload.go
-	packs    *packIndex // pack containers this Storer knows about; see packindex.go
-	cache    *PackCache // optional process-wide local pack cache; see packcache.go
-	maxPack  int        // objects per written pack container; see maxPackObjects
-	// maxPackBytes caps a written container's payload; see maxPackBytes. Both
-	// caps apply at once, and the writer seals on whichever it reaches first.
+	// payloadObserver reports each pack payload's codec and sizes; see
+	// WithPayloadObserver.
+	payloadObserver func(codec string, raw, stored int64)
+	// refCASObserver fires once per retried packed-refs compare-and-swap; see
+	// WithRefCASObserver.
+	refCASObserver func()
+	up             *uploader  // batches loose-object PutObject calls off of Close; see upload.go
+	packs          *packIndex // pack containers this Storer knows about; see packindex.go
+	// refs is this Storer's memoized ref view; see refcache.go. Reads always
+	// consult it. Writes only go through it when packedRefs is set.
+	refs *refCache
+	// packedRefs enables writing the packed-refs object. Defaults to true.
+	// Reading it is unconditional — see WithPackedRefs for why the two differ.
+	packedRefs bool
+	cache      *PackCache // optional process-wide local pack cache; see packcache.go
+	// fetchSem bounds whole-pack downloads in flight; see maxLivePackFetches.
+	// Scoped shares it rather than replacing it, so one root Storer's
+	// descendants — every repository, in production — share one budget.
+	fetchSem chan struct{}
+	// maxPackBytes caps a written container's payload; see maxPackBytes. It is
+	// the only bound on a container: nothing caps the object count.
 	maxPackBytes int64
+	// inMemoryCap is the largest object whose codec is decided exactly rather
+	// than by a head probe; see inMemoryCap and compress.go.
+	inMemoryCap int64
+	// probeWindow is how much of an over-cap object gets compressed to decide
+	// the whole object's fate; see probeWindow and compress.go.
+	probeWindow int
+	// packCompression enables writing zstd payloads. Reading them is
+	// unconditional — see WithPackCompression for why the two differ.
+	packCompression bool
 }
 
 // Option configures a Storer at construction time.
@@ -111,6 +149,11 @@ func WithObjectFormat(of formatcfg.ObjectFormat) Option {
 // operation name (e.g. "GetObject"), duration, and error. Instance-level on
 // purpose: unlike s3fs, our constructors hold the Storer itself, so nothing
 // needs a process-global setter. Wire metrics.ObserveS3 here from main.
+//
+// The callback must be safe for concurrent use. It fires on whatever goroutine
+// made the call, and a background pack prefetch (see startPackFetch) makes S3
+// calls of its own, outside any request. metrics.ObserveS3 is a set of
+// Prometheus vectors and already satisfies this.
 func WithObserver(fn func(operation string, dur time.Duration, err error)) Option {
 	return func(s *Storer) { s.observer = fn }
 }
@@ -125,32 +168,100 @@ func WithPackCache(c *PackCache) Option {
 	return func(s *Storer) { s.cache = c }
 }
 
+// WithPackCompression controls whether newly written pack containers store
+// zstd payloads. Reading them is never gated: a Storer resolves compressed and
+// raw containers alike no matter how this is set.
+//
+// The asymmetry is deliberate, and it is a rollback story. A cue written by
+// this code carries format version 2, which an older binary refuses outright
+// rather than misreading — the right direction to fail, but it means rolling a
+// deploy back loses access to every container written in the window. Shipping
+// the reader first and turning writes on in a later release makes that
+// window empty.
+func WithPackCompression(enabled bool) Option {
+	return func(s *Storer) { s.packCompression = enabled }
+}
+
+// WithPackedRefs controls whether ref writes go to the single packed-refs
+// object under a compare-and-swap, instead of one loose object per ref.
+// Defaults to true.
+//
+// Reading packed-refs is never gated: a Storer merges the packed object and
+// the loose layer no matter how this is set. That asymmetry is the same
+// rollback story WithPackCompression tells. A binary that cannot read
+// packed-refs sees every ref written through it vanish, which makes a
+// repository look empty rather than failing loudly — so turn writes off for
+// one release before rolling back to a binary that predates the format, and
+// the window it could have written in is empty.
+//
+// Turning it off does not hide the refs already in a packed-refs object. Reads
+// still merge it, and the first write with it back on folds the loose keys
+// written in between. So this is a safe lever in both directions.
+func WithPackedRefs(enabled bool) Option {
+	return func(s *Storer) { s.packedRefs = enabled }
+}
+
+// WithPayloadObserver installs a callback fired once for every object written
+// into a pack container, with the codec it was stored under ("raw" or "zstd")
+// and its size before and after. Instance-level for the same reason as
+// WithObserver, and a callback rather than a direct metrics call so this
+// package stays free of any Prometheus import. Wire metrics.ObservePackPayload
+// here from main.
+func WithPayloadObserver(fn func(codec string, raw, stored int64)) Option {
+	return func(s *Storer) { s.payloadObserver = fn }
+}
+
+// WithRefCASObserver installs a callback fired once for every retried
+// packed-refs compare-and-swap. Contention is the only way the packed-ref
+// design degrades quietly, so it is the one thing worth a metric of its own.
+// A callback rather than a direct metrics call, for the same reason
+// WithPayloadObserver is one: this package stays free of any Prometheus
+// import. Wire metrics.ObserveRefCASRetry here from main.
+//
+// The callback must be safe for concurrent use.
+func WithRefCASObserver(fn func()) Option {
+	return func(s *Storer) { s.refCASObserver = fn }
+}
+
 func withClient(c s3API) Option {
 	return func(s *Storer) { s.client = c }
 }
 
-// withMaxPackObjects lowers the per-container object cap from maxPackObjects.
-// Test-only: it exists so the write-side split can be exercised without a
-// 32768-object git fixture.
-func withMaxPackObjects(n int) Option {
-	return func(s *Storer) { s.maxPack = n }
-}
-
 // withMaxPackBytes lowers the per-container byte cap from maxPackBytes.
-// Test-only, for the same reason as withMaxPackObjects: exercising the split
-// otherwise needs a 128 MiB git fixture.
+// Test-only: it exists so the write-side split can be exercised without a
+// 128 MiB git fixture.
 func withMaxPackBytes(n int64) Option {
 	return func(s *Storer) { s.maxPackBytes = n }
+}
+
+// withInMemoryCap lowers the exact-decision size from inMemoryCap. Test-only,
+// for the same reason as the two caps above: reaching the probe path — and the
+// rewind behind it — otherwise needs a multi-megabyte git fixture.
+func withInMemoryCap(n int64) Option {
+	return func(s *Storer) { s.inMemoryCap = n }
+}
+
+// withProbeWindow shrinks the head window from probeWindow. Test-only: with
+// the production 64 KiB window, an object whose head compresses but whose tail
+// does not still comes out smaller overall, because zstd stores incompressible
+// data with only ~0.015% overhead while a 64 KiB compressible head saves ~65
+// KiB. Reaching the rewind honestly would need a fixture of several hundred
+// megabytes; a small window reaches it in a few kilobytes.
+func withProbeWindow(n int) Option {
+	return func(s *Storer) { s.probeWindow = n }
 }
 
 // New returns a Storer owning one whole bucket. ctx bounds every request this
 // storer issues.
 func New(ctx context.Context, bucket string, opts ...Option) (*Storer, error) {
 	s := &Storer{
-		ctx:          ctx,
-		of:           formatcfg.DefaultObjectFormat,
-		maxPack:      maxPackObjects,
-		maxPackBytes: maxPackBytes,
+		ctx:             ctx,
+		of:              formatcfg.DefaultObjectFormat,
+		maxPackBytes:    maxPackBytes,
+		inMemoryCap:     inMemoryCap,
+		probeWindow:     probeWindow,
+		packCompression: true,
+		packedRefs:      true,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -169,6 +280,8 @@ func New(ctx context.Context, bucket string, opts ...Option) (*Storer, error) {
 	}
 	s.up = newUploader(s)
 	s.packs = newPackIndex()
+	s.refs = newRefCache()
+	s.fetchSem = make(chan struct{}, maxLivePackFetches)
 	return s, nil
 }
 
@@ -182,12 +295,15 @@ var _ storer.PackfileWriter = (*Storer)(nil)
 // Storer value. Prefixes nest: scoping an already-scoped Storer extends its
 // existing prefix. Cheap: it copies the Storer value and dials nothing.
 //
-// The returned Storer gets its own uploader and pack index (see upload.go,
-// packindex.go), independent of s's: one repository's push, pending/failed
-// uploads, or pack read history can never block or leak into another's. The
-// pack cache is the deliberate exception — it is shared, because sharing
-// downloaded packs across requests is the whole point of it, and its keys are
-// content hashes, so a hit is always the exact bytes the caller named.
+// The returned Storer gets its own uploader, pack index, and ref cache (see
+// upload.go, packindex.go, refcache.go), independent of s's: one repository's
+// push, pending/failed uploads, ref view, or pack read history can never block
+// or leak into another's.
+//
+// Two things are shared on purpose. The pack cache, because sharing downloaded
+// packs across requests is the whole point of it, and its keys are content
+// hashes, so a hit is always the exact bytes the caller named. And fetchSem,
+// because the bandwidth it rations is the process's, not one repository's.
 func (s *Storer) Scoped(prefix string) *Storer {
 	cp := *s
 	prefix = strings.Trim(prefix, "/")
@@ -200,6 +316,7 @@ func (s *Storer) Scoped(prefix string) *Storer {
 	}
 	cp.up = newUploader(&cp)
 	cp.packs = newPackIndex()
+	cp.refs = newRefCache()
 	return &cp
 }
 
@@ -233,6 +350,19 @@ func isNotFound(err error) bool {
 	}
 }
 
+// isPreconditionFailed reports whether err is a rejected conditional write.
+// Tigris and S3 both answer a failed If-Match or If-None-Match with HTTP 412
+// and the code "PreconditionFailed". Two writers racing on packed-refs is the
+// normal way to see this, so commitRefs treats it as retryable and not as a
+// failure. Callers must never map it to absence the way isNotFound does.
+func isPreconditionFailed(err error) bool {
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.ErrorCode() == "PreconditionFailed"
+}
+
 // Pointer shims so call sites stay free of aws-sdk-go-v2/aws imports.
 func sp(v string) *string { return &v }
 
@@ -244,3 +374,5 @@ func sv(v *string) string {
 }
 
 func bv(v *bool) bool { return v != nil && *v }
+
+func bp(v bool) *bool { return &v }

@@ -92,6 +92,35 @@ var (
 		Name:      "repos_created_total",
 		Help:      "Repositories auto-created on first push.",
 	})
+
+	packPayloads = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "pack",
+		Name:      "payloads_total",
+		Help:      "Objects written into pack containers by payload codec (raw, zstd).",
+	}, []string{"codec"})
+
+	packPayloadBytes = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "pack",
+		Name:      "payload_bytes_total",
+		Help:      "Object bytes written into pack containers by codec, counted both before and after compression.",
+	}, []string{"codec", "stage"})
+
+	packPayloadRatio = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: "pack",
+		Name:      "payload_stored_ratio",
+		Help:      "Stored size as a fraction of raw size for compressed pack payloads; 1.0 means compression saved nothing.",
+		Buckets:   []float64{0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0},
+	})
+
+	refCASRetries = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "ref",
+		Name:      "cas_retries_total",
+		Help:      "Packed-refs compare-and-swap attempts that lost a race and were retried.",
+	})
 )
 
 // ObserveS3 records one S3/Tigris API call. Its signature matches the observer
@@ -154,6 +183,33 @@ func ObserveHook(status string, dur time.Duration) {
 // ReposCreated counts a repository auto-created on first push.
 func ReposCreated() {
 	reposCreated.Inc()
+}
+
+// ObservePackPayload records one object written into a pack container. Its
+// signature matches the observer internal/storage/tigris expects, so main
+// wires it via tigris.WithPayloadObserver — which is what keeps that package
+// free of any Prometheus import.
+//
+// Expect codec="raw" to dominate by count on a normal repository: objects
+// below the compression floor are never compressed, and most git objects are
+// small. Judge the feature by payload_bytes_total, not by payloads_total.
+func ObservePackPayload(codec string, raw, stored int64) {
+	packPayloads.WithLabelValues(codec).Inc()
+	packPayloadBytes.WithLabelValues(codec, "raw").Add(float64(raw))
+	packPayloadBytes.WithLabelValues(codec, "stored").Add(float64(stored))
+	if codec != "raw" && raw > 0 {
+		packPayloadRatio.Observe(float64(stored) / float64(raw))
+	}
+}
+
+// ObserveRefCASRetry records one retried packed-refs compare-and-swap. Wire it
+// into tigris.WithRefCASObserver.
+//
+// A rising rate here is the one quiet way the packed-ref write path degrades:
+// every retry re-reads and re-writes the whole object, so sustained contention
+// shows up as push latency long before it shows up as an error.
+func ObserveRefCASRetry() {
+	refCASRetries.Inc()
 }
 
 // ListingCacheStats is a flat snapshot of the s3fs directory-listing cache's

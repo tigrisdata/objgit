@@ -3,6 +3,7 @@ package tigris
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,10 +12,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/format/packfile"
 )
 
 const (
@@ -22,24 +25,28 @@ const (
 	binSuffix  = ".bin"
 	cueSuffix  = ".cue"
 
-	// packBulkFetchThreshold is how many distinct objects may be served out of
-	// one pack via individual ranged GETs, within one Storer instance, before
-	// switching to downloading that pack's whole .bin once and serving every
-	// later read from the local copy.
-	packBulkFetchThreshold = 32
+	// maxLivePackFetches bounds how many whole-pack downloads run at once.
+	//
+	// This cap used to exist by accident: the read that started a download
+	// blocked on it, so one request could never have two in flight. Now that a
+	// download runs in the background, nothing throttles it but this. Without a
+	// cap, a handful of concurrent clones over a repository with several
+	// containers would put every one of them on the wire at the same time and
+	// starve the ranged GETs that are actually serving the request.
+	//
+	// The semaphore hangs off the Storer (see tigris.go) rather than a package
+	// variable so that tests do not contend with each other. It is process-wide
+	// in production for the simple reason that main.go builds one root Storer
+	// and Scopes every repository off it.
+	maxLivePackFetches = 4
 
-	// maxPackObjects caps how many objects one *written* pack container holds,
-	// so a large initial push lands as several bin/cue pairs instead of one
-	// enormous one. Reads have no matching limit: packIndex merges every
-	// packs/*.cue it lists, so any number of containers, holding any number of
-	// objects, resolves exactly the same way.
-	maxPackObjects = 1 << 15
-
-	// maxPackBytes caps a written container's payload. An object count alone is
-	// a poor proxy for size — 32768 tiny objects is a few megabytes, 32768
-	// large blobs is tens of gigabytes — and container size is what sets the
-	// size of one PutObject, of one bulk .bin download on the read side
-	// (packBulkFetchThreshold), and of one PackCache eviction.
+	// maxPackBytes caps a written container's payload, so a large initial push
+	// lands as several bin/cue pairs instead of one enormous one. Size is the
+	// only cap, and nothing bounds a container's object count: a count is a
+	// poor proxy for size — a thousand tiny objects is a few kilobytes, a
+	// thousand large blobs is tens of gigabytes — while container size is what
+	// sets the size of one PutObject, of one prefetched .bin download on the
+	// read side (startPackFetch), and of one PackCache eviction.
 	//
 	// packwriter.go checks this cap *before* adding an object, so a container
 	// sitting just under it never grows past it by swallowing a large object
@@ -47,92 +54,333 @@ const (
 	// object larger than the cap all by itself; giving it a container of its
 	// own beats bloating whichever container it happened to arrive behind.
 	//
-	// Like maxPackObjects, this is a write-side cap only.
+	// This is a write-side cap only. Reads have no matching limit: packIndex
+	// merges every packs/*.cue it lists, so any number of containers, holding
+	// any number of objects, resolves exactly the same way.
 	maxPackBytes = 128 << 20 // 128 MiB
 )
 
-var cueMagic = [4]byte{'O', 'G', 'C', 1} // "OGC" + format version 1
+// cueMagicPrefix is shared by every .cue format version; the 4th header byte
+// carries the version itself.
+var cueMagicPrefix = [3]byte{'O', 'G', 'C'}
+
+const (
+	cueVersion1 = 1 // fixed-width records, raw payloads, no codecs
+	cueVersion2 = 2 // columnar records, optionally zstd, per-object codecs
+	cueVersion3 = 3 // v2 plus a base-hash column, so a payload may be a delta
+
+	cueHeaderLen = 16
+
+	// cueRecCodecOff is header byte 5: the codec of the *record block*, which
+	// is independent of any object's payload codec. v1 held a reserved zero
+	// here, so a v1 cue reads as codecRaw and stays correct.
+	cueRecCodecOff = 5
+)
 
 // errBadCue marks a malformed pack index: corruption never masquerades as
 // absence, the same posture errBadMetadata takes for loose objects.
 var errBadCue = fmt.Errorf("tigris: malformed pack cue index")
 
-// cueRecord is one object's entry in a .cue index: its hash plus where its
-// raw bytes live in the sibling .bin.
+// cueRecord is one object's entry in a .cue index: its hash, its payload
+// codec, and where its bytes live in the sibling .bin.
+//
+// stored and raw are deliberately separate. stored is the byte span to fetch —
+// the only length a ranged GetObject may ever use — while raw is the git
+// object's own size, which is what every caller outside this file means by
+// "length". They are equal exactly when codec is codecRaw.
 type cueRecord struct {
 	hash   plumbing.Hash
 	typ    plumbing.ObjectType
-	offset int64
-	length int64 // == the git object's size, since .bin payloads are raw
+	codec  uint8
+	offset int64 // byte offset of the stored bytes within the .bin
+	stored int64 // stored byte span; == raw when codec is codecRaw
+	raw    int64 // the git object's size, i.e. the decoded length
+	// base is the hash of the object this one is a delta against, or the zero
+	// hash when the payload is the object itself. A set base is the only thing
+	// that marks a record as a delta — there is no separate flag — and the
+	// column costs nothing once zstd sees a run of zeros.
+	//
+	// typ stays the *real* object type even here, never REFDeltaObject, so
+	// every type filter downstream keeps working untouched. raw likewise stays
+	// the reconstructed object's size, which is what preserves stored <= raw
+	// for a delta: the instruction stream is far smaller than what it rebuilds.
+	base plumbing.Hash
 }
 
-// encodeCue serializes recs (assumed already sorted by hash) into the .cue
-// binary format: a 16-byte header (magic, hash width, reserved, count)
-// followed by one hashLen+17-byte record per entry, all big-endian.
-func encodeCue(hashLen int, recs []cueRecord) []byte {
-	recWidth := hashLen + 17
-	buf := make([]byte, 16+len(recs)*recWidth)
-	copy(buf[0:4], cueMagic[:])
-	buf[4] = byte(hashLen)
-	binary.BigEndian.PutUint64(buf[8:16], uint64(len(recs)))
+// cueRecWidth is one v3 record's contribution to the record block. The block
+// is columnar rather than one struct per record, so this is a total rather
+// than a stride. Two hashes wide: the object's own, and its delta base.
+func cueRecWidth(hashLen int) int { return hashLen*2 + 26 }
 
-	off := 16
-	for _, r := range recs {
-		copy(buf[off:off+hashLen], r.hash.Bytes())
-		buf[off+hashLen] = byte(r.typ)
-		binary.BigEndian.PutUint64(buf[off+hashLen+1:off+hashLen+9], uint64(r.offset))
-		binary.BigEndian.PutUint64(buf[off+hashLen+9:off+hashLen+17], uint64(r.length))
-		off += recWidth
+// cueRecWidthV2 is the same total for a v2 record, which has no base column.
+// Kept so v2 containers already in a bucket keep parsing.
+func cueRecWidthV2(hashLen int) int { return hashLen + 26 }
+
+// appendHashCol appends exactly hashLen bytes for h.
+//
+// plumbing.Hash carries its own object format, and a zero-value one reports
+// the SHA-1 width no matter what the container uses (ObjectFormat.Size falls
+// back to the default). So h.Bytes() returns 20 bytes for the zero hash even
+// in a SHA-256 container, and appending it directly would shift every column
+// after it. Copying into a zeroed slice of the container's width is correct
+// for a real hash and for the zero hash alike.
+func appendHashCol(dst []byte, h plumbing.Hash, hashLen int) []byte {
+	col := make([]byte, hashLen)
+	copy(col, h.Bytes())
+	return append(dst, col...)
+}
+
+// hashFromCol is appendHashCol's inverse. An all-zero column is the zero hash,
+// which marks a record as "not a delta"; returning plumbing.FromBytes's result
+// there instead would stamp a format onto it and stop it comparing equal to
+// plumbing.ZeroHash in a SHA-256 container.
+func hashFromCol(b []byte) (plumbing.Hash, bool) {
+	for _, c := range b {
+		if c != 0 {
+			return plumbing.FromBytes(b)
+		}
 	}
-	return buf
+	return plumbing.Hash{}, true
 }
 
-// parseCue is encodeCue's inverse. hashLen is the caller's expected width
+// encodeCue serializes recs (assumed already sorted by hash) into the v3 .cue
+// format: a 16-byte plaintext header, then a record block holding seven columns
+// — hashes, types, codecs, offsets, stored lengths, raw sizes, base hashes.
+//
+// Columnar, not one record after another, because interleaving puts 20-32
+// bytes of incompressible hash entropy every 26+ bytes and starves zstd's
+// match finder. Split into columns, the noise is quarantined in the hash
+// columns while the others compress nearly to nothing: types take about
+// four distinct values, codecs two, and the three big-endian uint64 columns
+// have all-zero high bytes.
+//
+// The base column is the v3 addition. It pays for itself twice over: in a
+// repository where nothing is a delta it is a run of zeros that zstd erases,
+// and where objects *are* deltas it saves the reader from rebuilding a delta
+// chain go-git already computed at push time.
+func encodeCue(hashLen int, recs []cueRecord) []byte {
+	n := len(recs)
+	block := make([]byte, 0, n*cueRecWidth(hashLen))
+
+	for _, r := range recs {
+		block = append(block, r.hash.Bytes()...)
+	}
+	for _, r := range recs {
+		block = append(block, byte(r.typ))
+	}
+	for _, r := range recs {
+		block = append(block, r.codec)
+	}
+	for _, r := range recs {
+		block = binary.BigEndian.AppendUint64(block, uint64(r.offset))
+	}
+	for _, r := range recs {
+		block = binary.BigEndian.AppendUint64(block, uint64(r.stored))
+	}
+	for _, r := range recs {
+		block = binary.BigEndian.AppendUint64(block, uint64(r.raw))
+	}
+	for _, r := range recs {
+		block = appendHashCol(block, r.base, hashLen)
+	}
+
+	body, compressed := compressBlock(block)
+
+	buf := make([]byte, cueHeaderLen, cueHeaderLen+len(body))
+	copy(buf[0:3], cueMagicPrefix[:])
+	buf[3] = cueVersion3
+	buf[4] = byte(hashLen)
+	if compressed {
+		buf[cueRecCodecOff] = codecZstd
+	}
+	binary.BigEndian.PutUint64(buf[8:16], uint64(n))
+	return append(buf, body...)
+}
+
+// parseCue is encodeCue's inverse, and also the reader for every v1 cue
+// already sitting in a live bucket. hashLen is the caller's expected width
 // (from this Storer's own object format) — a cue written under a different
 // format is rejected rather than silently misparsed.
+//
+// Both versions yield the same []cueRecord, so nothing downstream of here
+// knows or cares which version it came from.
 func parseCue(hashLen int, raw []byte) ([]cueRecord, error) {
-	if len(raw) < 16 {
+	if len(raw) < cueHeaderLen {
 		return nil, fmt.Errorf("%w: header truncated (%d bytes)", errBadCue, len(raw))
 	}
-	if !bytes.Equal(raw[0:4], cueMagic[:]) {
+	if !bytes.Equal(raw[0:3], cueMagicPrefix[:]) {
 		return nil, fmt.Errorf("%w: bad magic", errBadCue)
+	}
+	version := raw[3]
+	if version != cueVersion1 && version != cueVersion2 && version != cueVersion3 {
+		return nil, fmt.Errorf("%w: unsupported format version %d", errBadCue, version)
 	}
 	if got := int(raw[4]); got != hashLen {
 		return nil, fmt.Errorf("%w: hash width %d, want %d", errBadCue, got, hashLen)
 	}
-	if raw[5] != 0 || raw[6] != 0 || raw[7] != 0 {
+	if raw[6] != 0 || raw[7] != 0 {
 		return nil, fmt.Errorf("%w: reserved bytes not zero", errBadCue)
 	}
 
-	count := binary.BigEndian.Uint64(raw[8:16])
+	count := binary.BigEndian.Uint64(raw[8:cueHeaderLen])
+	if count > uint64(len(raw)) {
+		// Cheap guard before any allocation sized by count: even a
+		// one-byte-per-record format could not fit this many.
+		return nil, fmt.Errorf("%w: %d records cannot fit in %d bytes", errBadCue, count, len(raw))
+	}
+
+	if version == cueVersion1 {
+		if raw[cueRecCodecOff] != 0 {
+			return nil, fmt.Errorf("%w: reserved bytes not zero", errBadCue)
+		}
+		return parseCueV1(hashLen, raw, int(count))
+	}
+	return parseCueColumnar(hashLen, raw, int(count), version == cueVersion3)
+}
+
+// parseCueV1 reads the original fixed-width layout: one hashLen+17-byte record
+// per entry, holding hash, type, offset, and length. A v1 payload is raw by
+// definition, so stored == raw and the codec is codecRaw.
+func parseCueV1(hashLen int, raw []byte, count int) ([]cueRecord, error) {
 	recWidth := hashLen + 17
-	if want := 16 + int(count)*recWidth; want != len(raw) {
+	if want := cueHeaderLen + count*recWidth; want != len(raw) {
 		return nil, fmt.Errorf("%w: length %d disagrees with %d records (want %d)", errBadCue, len(raw), count, want)
 	}
 
 	recs := make([]cueRecord, 0, count)
-	off := 16
-	for i := uint64(0); i < count; i++ {
+	off := cueHeaderLen
+	for i := 0; i < count; i++ {
 		h, ok := plumbing.FromBytes(raw[off : off+hashLen])
 		if !ok {
 			return nil, fmt.Errorf("%w: record %d has an unreadable hash", errBadCue, i)
 		}
-		typ := plumbing.ObjectType(int8(raw[off+hashLen]))
-		offset := int64(binary.BigEndian.Uint64(raw[off+hashLen+1 : off+hashLen+9]))
-		length := int64(binary.BigEndian.Uint64(raw[off+hashLen+9 : off+hashLen+17]))
-		recs = append(recs, cueRecord{hash: h, typ: typ, offset: offset, length: length})
+		size := int64(binary.BigEndian.Uint64(raw[off+hashLen+9 : off+hashLen+17]))
+		recs = append(recs, cueRecord{
+			hash:   h,
+			typ:    plumbing.ObjectType(int8(raw[off+hashLen])),
+			codec:  codecRaw,
+			offset: int64(binary.BigEndian.Uint64(raw[off+hashLen+1 : off+hashLen+9])),
+			stored: size,
+			raw:    size,
+		})
 		off += recWidth
 	}
 	return recs, nil
 }
 
+// parseCueColumnar reads a v2 or v3 record block, decompressing it first when
+// the header says it is zstd. The decompressed length taking the place of v1's
+// length-versus-count check is what catches a truncated or lying index.
+//
+// withBase selects the version: v3 carries a seventh column of base hashes,
+// v2 does not and every record it yields is a non-delta. Both produce the same
+// []cueRecord, so nothing downstream of here knows which version it came from.
+func parseCueColumnar(hashLen int, rawCue []byte, count int, withBase bool) ([]cueRecord, error) {
+	block := rawCue[cueHeaderLen:]
+
+	switch codec := rawCue[cueRecCodecOff]; codec {
+	case codecRaw:
+	case codecZstd:
+		out, err := cueDecoder().DecodeAll(block, nil)
+		if err != nil {
+			return nil, fmt.Errorf("%w: record block does not decompress: %w", errBadCue, err)
+		}
+		block = out
+	default:
+		return nil, fmt.Errorf("%w: unknown record block codec %d", errBadCue, codec)
+	}
+
+	width := cueRecWidthV2(hashLen)
+	if withBase {
+		width = cueRecWidth(hashLen)
+	}
+	if want := count * width; want != len(block) {
+		return nil, fmt.Errorf("%w: record block is %d bytes, but %d records need %d", errBadCue, len(block), count, want)
+	}
+
+	// Column bases, in the order encodeCue wrote them.
+	hashes := block
+	types := hashes[count*hashLen:]
+	codecs := types[count:]
+	offsets := codecs[count:]
+	storeds := offsets[count*8:]
+	raws := storeds[count*8:]
+	var bases []byte
+	if withBase {
+		bases = raws[count*8:]
+	}
+
+	recs := make([]cueRecord, 0, count)
+	for i := 0; i < count; i++ {
+		h, ok := plumbing.FromBytes(hashes[i*hashLen : (i+1)*hashLen])
+		if !ok {
+			return nil, fmt.Errorf("%w: record %d has an unreadable hash", errBadCue, i)
+		}
+		codec := codecs[i]
+		if codec != codecRaw && codec != codecZstd {
+			return nil, fmt.Errorf("%w: record %d has unknown payload codec %d", errBadCue, i, codec)
+		}
+		var base plumbing.Hash
+		if withBase {
+			base, ok = hashFromCol(bases[i*hashLen : (i+1)*hashLen])
+			if !ok {
+				return nil, fmt.Errorf("%w: record %d has an unreadable base hash", errBadCue, i)
+			}
+		}
+		recs = append(recs, cueRecord{
+			hash:   h,
+			typ:    plumbing.ObjectType(int8(types[i])),
+			codec:  codec,
+			offset: int64(binary.BigEndian.Uint64(offsets[i*8:])),
+			stored: int64(binary.BigEndian.Uint64(storeds[i*8:])),
+			raw:    int64(binary.BigEndian.Uint64(raws[i*8:])),
+			base:   base,
+		})
+	}
+	return recs, nil
+}
+
 // packEntry is what the in-memory index keeps per object: which pack it's
-// in and where.
+// in, where, and how its bytes are encoded there.
+//
+// raw keeps the meaning the old single length field had — the git object's
+// size — so every caller outside this file is unaffected. stored is the byte
+// span to fetch, and is the only length a ranged GetObject may use.
 type packEntry struct {
 	id     string
 	typ    plumbing.ObjectType
+	codec  uint8
 	offset int64
-	length int64
+	stored int64
+	raw    int64
+	// base mirrors cueRecord.base: the object this payload is a delta against,
+	// or the zero hash when the payload is the object itself. Reads resolve it
+	// by hash through this same index, so a base in a sibling container works —
+	// though the writer keeps base and delta together (see packwriter.go).
+	base plumbing.Hash
+}
+
+// indexRecords folds one pack's cue records into the entry map, returning the
+// .bin's total length. Shared by register (a pack this instance just staged)
+// and ensurePacksBuilt (a pack listed out of the bucket) so the two can never
+// disagree about what an entry means. Callers hold p.mu.
+func (p *packIndex) indexRecords(id string, recs []cueRecord) int64 {
+	var size int64
+	for _, r := range recs {
+		p.entries[r.hash] = packEntry{
+			id:     id,
+			typ:    r.typ,
+			codec:  r.codec,
+			offset: r.offset,
+			stored: r.stored,
+			raw:    r.raw,
+			base:   r.base,
+		}
+		if end := r.offset + r.stored; end > size {
+			size = end
+		}
+	}
+	return size
 }
 
 // packedEntry pairs a hash with its packEntry, for iteration (a map alone
@@ -142,14 +390,40 @@ type packedEntry struct {
 	e    packEntry
 }
 
-// packAccess tracks one pack's read history within this Storer instance: how
-// many distinct objects have been served via individual ranged GETs, and
-// (past the threshold) the bulk-downloaded local copy.
+// packStream is the in-progress view of a whole-pack download: a descriptor
+// over the file being filled, and how many of its bytes are committed. Reads
+// go through ReadAt, which is a pread and therefore safe alongside the writer
+// appending to the same file.
+//
+// It exists so that a read whose bytes have already landed costs nothing
+// instead of a duplicate ranged GET. Since a .bin streams in offset order and
+// snapshotEntries hands objects out in offset order too, an iteration converges
+// on this tier almost as soon as the download starts.
+type packStream struct {
+	f *os.File
+	n atomic.Int64 // bytes written and counted; everything below this is readable
+}
+
+// readerFor reports a reader over [off, off+length) when the download has got
+// that far, and false when it has not — the watermark test.
+func (ps *packStream) readerFor(off, length int64) (*io.SectionReader, bool) {
+	if ps == nil || off+length > ps.n.Load() {
+		return nil, false
+	}
+	return io.NewSectionReader(ps.f, off, length), true
+}
+
+// packAccess tracks one pack's whole-container download within this Storer
+// instance. The download runs in the background — see startPackFetch — so
+// every field but start is written once by that goroutine and read by everyone
+// else; done closing is the happens-before edge that makes f and err safe to
+// look at.
 type packAccess struct {
-	seen map[plumbing.Hash]struct{}
-	once sync.Once
-	f    *os.File
-	err  error
+	start  sync.Once
+	done   chan struct{}              // closed when the download settles
+	stream atomic.Pointer[packStream] // in-progress view; see partialPack for why only the cache-less path fills it
+	f      *os.File                   // the local copy; valid after done closes with err == nil
+	err    error
 }
 
 // packIndex is a Storer's view of every pack it can reach: entries already
@@ -185,14 +459,7 @@ func newPackIndex() *packIndex {
 func (p *packIndex) register(id string, recs []cueRecord, localBin string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	var size int64
-	for _, r := range recs {
-		p.entries[r.hash] = packEntry{id: id, typ: r.typ, offset: r.offset, length: r.length}
-		if end := r.offset + r.length; end > size {
-			size = end
-		}
-	}
-	p.sizes[id] = size
+	p.sizes[id] = p.indexRecords(id, recs)
 	p.local[id] = localBin
 }
 
@@ -253,40 +520,29 @@ func (p *packIndex) snapshotEntries() []packedEntry {
 	return out
 }
 
-// recordAccess registers h as a distinct ranged-GET read of pack id and
-// reports whether this call is the one that crosses packBulkFetchThreshold —
-// distinct objects, not reads: re-reading the same handful of hashes never
-// triggers a bulk download.
-func (p *packIndex) recordAccess(id string, h plumbing.Hash) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	a, ok := p.access[id]
-	if !ok {
-		a = &packAccess{seen: make(map[plumbing.Hash]struct{})}
-		p.access[id] = a
-	}
-	a.seen[h] = struct{}{}
-	return len(a.seen) > packBulkFetchThreshold
-}
-
 func (p *packIndex) getAccess(id string) *packAccess {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	a, ok := p.access[id]
 	if !ok {
-		a = &packAccess{seen: make(map[plumbing.Hash]struct{})}
+		a = &packAccess{done: make(chan struct{})}
 		p.access[id] = a
 	}
 	return a
 }
 
-// bulkCopy reports the pack's already-downloaded local copy, if any.
+// bulkCopy reports the pack's fully downloaded local copy, if the download has
+// finished. It never waits: a download still in flight reports nothing, and the
+// caller falls through to the watermark and ranged-GET tiers instead of
+// blocking on a whole container.
 func (p *packIndex) bulkCopy(id string) (*os.File, bool) {
 	a := p.getAccess(id)
-	if a.f == nil {
+	select {
+	case <-a.done:
+		return a.f, a.f != nil
+	default:
 		return nil, false
 	}
-	return a.f, true
 }
 
 // ensurePacksBuilt lists packs/*.cue under this Storer's prefix and merges
@@ -332,14 +588,7 @@ func (s *Storer) ensurePacksBuilt() error {
 		return nil // lost a race with a concurrent cold build on this instance
 	}
 	for id, recs := range byID {
-		var size int64
-		for _, r := range recs {
-			s.packs.entries[r.hash] = packEntry{id: id, typ: r.typ, offset: r.offset, length: r.length}
-			if end := r.offset + r.length; end > size {
-				size = end
-			}
-		}
-		s.packs.sizes[id] = size
+		s.packs.sizes[id] = s.packs.indexRecords(id, recs)
 	}
 	s.packs.built = true
 	return nil
@@ -357,18 +606,54 @@ func (s *Storer) packLookup(h plumbing.Hash) (packEntry, bool, error) {
 	return e, ok, nil
 }
 
-// downloadPack fetches packs/<id>.bin whole, once per pack per Storer
-// instance (guarded by packAccess.once). Failure is sticky for this instance —
-// later reads quietly fall back to ranged GETs rather than retrying or
-// erroring.
-func (s *Storer) downloadPack(id string) (*os.File, error) {
+// startPackFetch kicks off the whole-container download of packs/<id>.bin in
+// the background, once per pack per Storer instance. It returns immediately:
+// the caller goes on serving its read out of the watermark or a ranged GET,
+// and only later reads get the local copy.
+//
+// Backgrounding is the whole point. Downloading inline made one read pay for a
+// container of up to maxPackBytes, and parked every concurrent read of the
+// same pack behind the same sync.Once, so a clone stalled outright in the
+// middle of itself.
+//
+// Failure is sticky for this instance — later reads quietly stay on ranged
+// GETs rather than retrying or erroring. That is what start being a sync.Once
+// buys, and it is the same posture the blocking version had.
+//
+// The goroutine captures s, so this Storer's packIndex stays reachable for as
+// long as the download runs and the cleanup in fetchWholePack cannot fire
+// early. s.ctx is the process context (nothing rebinds it per request), so a
+// download outlives the request that started it — deliberately, because with a
+// PackCache installed it is still warming the cache for the next clone. At
+// shutdown it is abandoned, not waited on.
+func (s *Storer) startPackFetch(id string) {
 	a := s.packs.getAccess(id)
-	a.once.Do(func() {
-		slog.Debug("pack read threshold crossed, bulk-fetching pack",
-			"pack", id, "threshold", packBulkFetchThreshold, "prefix", s.prefix)
-		a.f, a.err = s.fetchWholePack(id)
+	a.start.Do(func() {
+		slog.Debug("prefetching pack in the background", "pack", id, "prefix", s.prefix)
+		go func() {
+			defer close(a.done)
+			a.f, a.err = s.fetchWholePack(id, a)
+		}()
 	})
-	return a.f, a.err
+}
+
+// partialPack reports the in-progress view of id's download, from whichever of
+// the two download paths is running it.
+//
+// There are two because there are two places a pack can be staged. Without a
+// PackCache the file is this Storer's own private temp file, so the stream sits
+// on its packAccess. With one the file belongs to the cache, and the stream
+// sits on the cache entry — which is what lets a Storer parked in the cache's
+// singleflight wait, downloading nothing itself, still read the bytes another
+// Storer's download has landed.
+func (s *Storer) partialPack(id string) *packStream {
+	if ps := s.packs.getAccess(id).stream.Load(); ps != nil {
+		return ps
+	}
+	if s.cache != nil {
+		return s.cache.partial(id)
+	}
+	return nil
 }
 
 // fetchWholePack produces a local descriptor over the whole .bin. With a
@@ -377,8 +662,8 @@ func (s *Storer) downloadPack(id string) (*os.File, error) {
 // without one it is a private unlinked-but-open temp file, whose disk space the
 // kernel reclaims as soon as every descriptor referencing it closes. Both paths
 // verify the bytes' sha256 against id — the pack's name is its checksum.
-func (s *Storer) fetchWholePack(id string) (*os.File, error) {
-	f, err := s.openWholePack(id)
+func (s *Storer) fetchWholePack(id string, a *packAccess) (*os.File, error) {
+	f, err := s.openWholePack(id, a)
 	if err != nil {
 		return nil, err
 	}
@@ -406,8 +691,10 @@ func (s *Storer) fetchWholePack(id string) (*os.File, error) {
 	return f, nil
 }
 
-func (s *Storer) openWholePack(id string) (*os.File, error) {
+func (s *Storer) openWholePack(id string, a *packAccess) (*os.File, error) {
 	if s.cache != nil {
+		// The cache stages the file, so it also publishes the watermark stream;
+		// see PackCache.fill and partialPack.
 		return s.cache.Get(id, s.streamPack(id))
 	}
 
@@ -419,7 +706,15 @@ func (s *Storer) openWholePack(id string) (*os.File, error) {
 	}
 	os.Remove(f.Name()) // unlink now; fd keeps the data alive until it's closed
 
-	if _, err := verifiedCopy(f, id, s.streamPack(id)); err != nil {
+	// One descriptor serves both roles: the copy below appends through it, and
+	// watermark readers pread through it. Clearing the stream before returning
+	// hands every later read to the completed-copy tier instead, and makes sure
+	// nothing is ever served out of a body that failed its checksum.
+	ps := &packStream{f: f}
+	a.stream.Store(ps)
+	_, err = verifiedCopy(f, id, s.streamPack(id), &ps.n)
+	a.stream.Store(nil)
+	if err != nil {
 		f.Close()
 		return nil, err
 	}
@@ -432,8 +727,20 @@ func (s *Storer) openWholePack(id string) (*os.File, error) {
 
 // streamPack returns a fetch function that writes packs/<id>.bin whole into w,
 // in the shape PackCache.Get and verifiedCopy both consume.
+//
+// This closure is also where maxLivePackFetches is enforced, because it is the
+// one place that touches the network — and, with a PackCache installed, it runs
+// only for the caller that owns a download. A caller merely waiting on someone
+// else's download therefore never holds a slot while doing nothing.
 func (s *Storer) streamPack(id string) func(w io.Writer) error {
 	return func(w io.Writer) error {
+		select {
+		case s.fetchSem <- struct{}{}:
+			defer func() { <-s.fetchSem }()
+		case <-s.ctx.Done():
+			return fmt.Errorf("tigris: download pack %s: %w", id, s.ctx.Err())
+		}
+
 		key := s.prefix + packPrefix + id + binSuffix
 		slog.Debug("fetching whole pack", "pack", id, "bucket", s.bucket, "key", key)
 
@@ -460,29 +767,50 @@ func (s *Storer) streamPack(id string) func(w io.Writer) error {
 }
 
 // packObject reads one object out of a pack, in increasing order of cost:
-// this instance's own in-flight (not-yet-uploaded) local copy, an
-// already-bulk-downloaded local copy, triggering a bulk download on the read
-// that crosses packBulkFetchThreshold, or — the common case below that
-// threshold — a single ranged GetObject straight into the object's byte
-// range. Every tier decodes through decodeBody (objects.go).
+//
+//  1. this instance's own in-flight (not-yet-uploaded) local copy;
+//  2. a finished whole-container download;
+//  3. the part of a running download that has already reached disk;
+//  4. a single ranged GetObject straight into the object's byte range.
+//
+// No tier ever waits on a download. The first packed read of a container also
+// starts one in the background (startPackFetch), and every read from then on
+// takes whichever tier is ready at that instant — tier 3 as the file fills in
+// offset order, tier 2 once it lands. Reads keep flowing at ranged-GET latency
+// throughout, which is the point: the container is up to maxPackBytes, and
+// waiting for it stalled a clone in the middle of itself.
+//
+// Starting the prefetch before consulting tier 3 is deliberate: on the very
+// first read it costs nothing, and it gives that read a chance at a stream
+// another request has already warmed.
+//
+// Every tier fetches e.stored bytes and decodes through decodePacked, which is
+// what makes a compressed payload invisible to callers.
 func (s *Storer) packObject(t plumbing.ObjectType, h plumbing.Hash, e packEntry) (plumbing.EncodedObject, error) {
 	if t != plumbing.AnyObject && e.typ != t {
 		return nil, plumbing.ErrObjectNotFound
 	}
-	hs := objHead{typ: e.typ, size: e.length}
+	payload, err := s.packPayload(h, e)
+	if err != nil {
+		return nil, err
+	}
+	return s.framePacked(h, e, payload, 0)
+}
 
-	if e.length == 0 {
-		obj := plumbing.NewMemoryObject(s.oh)
-		obj.SetType(e.typ)
-		obj.SetSize(0)
-		return obj, nil
+// packPayload runs the tier ladder and returns one record's decoded payload —
+// the object's own bytes, or a delta instruction stream when e.base is set.
+// Framing is deliberately not its job, because a delta payload's length has
+// nothing to do with e.raw and would fail the size check in decodeBody.
+func (s *Storer) packPayload(h plumbing.Hash, e packEntry) ([]byte, error) {
+	if e.stored == 0 {
+		return nil, nil
 	}
 
 	if path, ok := s.packs.localPath(e.id); ok {
 		f, err := os.Open(path)
 		if err == nil {
 			defer f.Close()
-			return s.decodeBody(h, hs, io.NewSectionReader(f, e.offset, e.length))
+			return s.decodePackedPayload(h, e, io.NewSectionReader(f, e.offset, e.stored))
 		}
 		// os.ErrNotExist: evicted underneath us (the upload just finished);
 		// fall through to the tiers below — S3 now has it.
@@ -491,24 +819,20 @@ func (s *Storer) packObject(t plumbing.ObjectType, h plumbing.Hash, e packEntry)
 	}
 
 	if f, ok := s.packs.bulkCopy(e.id); ok {
-		return s.decodeBody(h, hs, io.NewSectionReader(f, e.offset, e.length))
+		return s.decodePackedPayload(h, e, io.NewSectionReader(f, e.offset, e.stored))
 	}
 
-	if s.packs.recordAccess(e.id, h) {
-		f, err := s.downloadPack(e.id)
-		if err == nil {
-			return s.decodeBody(h, hs, io.NewSectionReader(f, e.offset, e.length))
-		}
-		// Sticky failure: degrade to the ranged GET below rather than fail
-		// the read outright.
-		slog.Debug("bulk pack fetch unavailable, falling back to ranged reads", "pack", e.id, "err", err)
+	s.startPackFetch(e.id)
+
+	if r, ok := s.partialPack(e.id).readerFor(e.offset, e.stored); ok {
+		return s.decodePackedPayload(h, e, r)
 	}
 
 	start := time.Now()
 	out, err := s.client.GetObject(s.ctx, &s3.GetObjectInput{
 		Bucket: sp(s.bucket),
 		Key:    sp(s.prefix + packPrefix + e.id + binSuffix),
-		Range:  sp(fmt.Sprintf("bytes=%d-%d", e.offset, e.offset+e.length-1)),
+		Range:  sp(fmt.Sprintf("bytes=%d-%d", e.offset, e.offset+e.stored-1)),
 	})
 	s.observe("GetObject", start, err)
 	switch {
@@ -520,5 +844,105 @@ func (s *Storer) packObject(t plumbing.ObjectType, h plumbing.Hash, e packEntry)
 	}
 	defer out.Body.Close()
 
-	return s.decodeBody(h, hs, out.Body)
+	return s.decodePackedPayload(h, e, out.Body)
 }
+
+// maxDeltaDepth bounds how far a read will walk a delta chain before giving up.
+// It matches go-git's own limit (packfile.maxDepth), which is what bounds the
+// chains a push can hand us in the first place. A .cue is just bytes in a
+// bucket, so this is also the guard that keeps a corrupt or hostile index from
+// recursing without end; the visited set beside it catches short cycles that
+// would otherwise spin until the depth ran out.
+const maxDeltaDepth = 50
+
+// framePacked turns a decoded payload into the finished object. For a whole
+// record that is just framing; for a delta it resolves the base and patches.
+//
+// depth counts links already walked. The base is fetched through EncodedObject
+// rather than packObject so a base that was written loose still resolves.
+func (s *Storer) framePacked(h plumbing.Hash, e packEntry, payload []byte, depth int) (plumbing.EncodedObject, error) {
+	if e.base == plumbing.ZeroHash {
+		obj := plumbing.NewMemoryObject(s.oh)
+		obj.SetType(e.typ)
+		obj.SetSize(e.raw)
+		if _, err := obj.Write(payload); err != nil {
+			return nil, fmt.Errorf("%w: %s body disagrees with declared size %d: %w",
+				errBadMetadata, h.String(), e.raw, err)
+		}
+		return obj, nil
+	}
+
+	if depth >= maxDeltaDepth {
+		return nil, fmt.Errorf("%w: delta chain at %s is deeper than %d links", errBadCue, h.String(), maxDeltaDepth)
+	}
+	if e.base == h {
+		return nil, fmt.Errorf("%w: %s is its own delta base", errBadCue, h.String())
+	}
+
+	base, err := s.deltaBase(e.base, depth+1)
+	if err != nil {
+		return nil, err
+	}
+	baseBytes, err := io.ReadAll(mustReader(base))
+	if err != nil {
+		return nil, fmt.Errorf("tigris: read delta base %s: %w", e.base.String(), err)
+	}
+
+	plain, err := packfile.PatchDelta(baseBytes, payload)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s does not patch onto %s: %w", errBadCue, h.String(), e.base.String(), err)
+	}
+
+	obj := plumbing.NewMemoryObject(s.oh)
+	obj.SetType(e.typ)
+	obj.SetSize(e.raw)
+	if _, err := obj.Write(plain); err != nil {
+		return nil, fmt.Errorf("%w: %s rebuilds to %d bytes, not the declared %d: %w",
+			errBadCue, h.String(), len(plain), e.raw, err)
+	}
+	return obj, nil
+}
+
+// deltaBase resolves one link of a chain. A base that is missing is corruption,
+// never absence: the object naming it is present, so the container promised
+// something it did not keep. Reporting ErrObjectNotFound here would let a
+// damaged index read as "this object was never pushed".
+func (s *Storer) deltaBase(base plumbing.Hash, depth int) (plumbing.EncodedObject, error) {
+	if depth >= maxDeltaDepth {
+		return nil, fmt.Errorf("%w: delta chain through %s is deeper than %d links", errBadCue, base.String(), maxDeltaDepth)
+	}
+
+	if e, ok, err := s.packLookup(base); err != nil {
+		return nil, err
+	} else if ok {
+		payload, perr := s.packPayload(base, e)
+		if perr != nil {
+			if errors.Is(perr, plumbing.ErrObjectNotFound) {
+				return nil, fmt.Errorf("%w: delta base %s is indexed but its bytes are gone", errBadCue, base.String())
+			}
+			return nil, perr
+		}
+		return s.framePacked(base, e, payload, depth)
+	}
+
+	obj, err := s.EncodedObject(plumbing.AnyObject, base)
+	if errors.Is(err, plumbing.ErrObjectNotFound) {
+		return nil, fmt.Errorf("%w: delta base %s is not in this repository", errBadCue, base.String())
+	}
+	return obj, err
+}
+
+// mustReader adapts an EncodedObject to an io.Reader. MemoryObject.Reader never
+// fails, and every object reaching here is one; a reader that does fail surfaces
+// as a read error from the caller's io.ReadAll instead of a second error path.
+func mustReader(o plumbing.EncodedObject) io.Reader {
+	r, err := o.Reader()
+	if err != nil {
+		return errReader{err}
+	}
+	return r
+}
+
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }

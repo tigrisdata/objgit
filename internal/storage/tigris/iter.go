@@ -50,10 +50,13 @@ func (s *Storer) listKeys(prefix string) ([]string, error) {
 // objectIter walks packed objects first — one whole pack at a time, in offset
 // order, as snapshotEntries hands them over — then resolves loose keys one HEAD
 // at a time. Laziness buys the cost profile the spec asks for: type mismatches
-// cost a HEAD, never a body download; a pack with more than
-// packBulkFetchThreshold objects self-converts to one bulk download partway
-// through (see packObject) instead of one ranged GET per object — exactly the
-// clone/fetch case that threshold exists for.
+// cost a HEAD, never a body download.
+//
+// Offset order is also what makes this cheap for a whole pack. The first packed
+// read starts a background download of the container (see packObject), that
+// download fills the file in offset order too, and the iteration is walking the
+// same direction — so it catches up with the watermark early and reads the rest
+// locally, without ever having waited for the download.
 type objectIter struct {
 	s      *Storer
 	want   plumbing.ObjectType

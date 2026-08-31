@@ -3,7 +3,7 @@
 `objgitd` is a single-binary git server. It stores repositories as objects in
 a Tigris bucket, and not on a local filesystem.
 
-Module path: `tangled.org/xeiaso.net/objgit`. Go 1.26.
+Module path: `github.com/tigrisdata/objgit`. Go 1.26.
 
 ## Transports
 
@@ -78,7 +78,7 @@ describes the daemon and links to one page for each subsystem.
 | [auth.md](docs/architecture/auth.md)                   | Credentials, decisions, or a new `Authorizer`.                          |
 | [hooks.md](docs/architecture/hooks.md)                 | Push hooks, output streaming, or the sandbox.                           |
 | [metrics.md](docs/architecture/metrics.md)             | Any metric or instrumentation seam.                                     |
-| [tigris-storer.md](docs/architecture/tigris-storer.md) | Object layout, packs, the pack cache, or the upload path.               |
+| [tigris-storer.md](docs/architecture/tigris-storer.md) | Object layout, refs, packs, the pack cache, or the upload path.               |
 | [s3fs.md](docs/architecture/s3fs.md)                   | The `billy.Filesystem` over the bucket.                                 |
 
 Two more directories carry detail:

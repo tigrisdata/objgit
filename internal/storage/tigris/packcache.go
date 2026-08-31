@@ -9,7 +9,9 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -17,8 +19,12 @@ import (
 // directory, shared by every Storer in the process, and evicts them
 // least-recently-used once their combined size passes a budget. It is what
 // turns a *second* clone of the same repository into zero pack downloads: the
-// bulk-fetch tier in packindex.go otherwise drops its copy when the request
-// that built it ends.
+// prefetch tier in packindex.go otherwise drops its copy when the Storer that
+// built it goes out of scope.
+//
+// It also carries the watermark stream for the download it is running, so that
+// a Storer waiting on another Storer's download can still read the bytes that
+// have landed. See partial, fill, and Storer.partialPack.
 //
 // Entries are keyed by pack id, which is the hex SHA-256 of the .bin's own
 // bytes (see packwriter.go). Two Storers over different prefixes — different
@@ -57,6 +63,13 @@ type cacheEntry struct {
 	used  uint64 // LRU stamp, higher is more recent
 	ready chan struct{}
 	err   error // download outcome; read only after ready closes
+
+	// stream is the in-progress view of this entry's download: set once the
+	// staging file exists, cleared when the download settles either way. It
+	// lives here, and not on the caller, so that a Storer parked in Get's
+	// singleflight wait can still read the bytes that have landed — see
+	// PackCache.partial and Storer.partialPack.
+	stream atomic.Pointer[packStream]
 }
 
 // NewPackCache creates a cache in a fresh directory under parent (the OS temp
@@ -126,6 +139,25 @@ func (c *PackCache) Get(id string, fetch func(io.Writer) error) (*os.File, error
 	return nil, fmt.Errorf("tigris: cached pack %s was evicted faster than it could be read", id)
 }
 
+// partial reports the in-progress view of id's download, or nil when no
+// download of it is running here. Any caller gets it, not only the one that
+// started the download, which is what lets a Storer waiting on another
+// Storer's download still read the bytes that have landed.
+//
+// The bytes it hands back have not been checksummed yet — that only happens
+// when the download ends. This matches the ranged-GET tier it stands in for
+// exactly: that tier never verifies a pack's digest either. The checksum
+// guards what the cache keeps, not what one read sees.
+func (c *PackCache) partial(id string) *packStream {
+	c.mu.Lock()
+	e, ok := c.entries[id]
+	c.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	return e.stream.Load()
+}
+
 // claim returns id's entry, reporting whether this caller is the one that must
 // download it. Touching the LRU stamp here (rather than on completion) keeps a
 // pack that many concurrent readers want from looking stale.
@@ -161,9 +193,14 @@ func (c *PackCache) forget(e *cacheEntry) {
 
 // fill runs the download for an entry this caller claimed, then releases every
 // waiter. A failed download un-registers the entry, so the failure is not
-// cached: the outer per-Storer once guard in packindex.go is what stops a
-// retry storm, and a genuinely transient error stays retryable by a later
+// cached: the per-Storer packAccess.start guard in packindex.go is what stops
+// a retry storm, and a genuinely transient error stays retryable by a later
 // request.
+//
+// While the copy runs, the bytes already on disk are readable through
+// e.stream, so readers of this pack never have to wait for the whole container
+// — see packindex.go's watermark tier. The stream is torn down before ready
+// closes, so nothing can be served out of a body that failed its checksum.
 func (c *PackCache) fill(e *cacheEntry, fetch func(io.Writer) error) {
 	defer close(e.ready)
 
@@ -179,7 +216,25 @@ func (c *PackCache) fill(e *cacheEntry, fetch func(io.Writer) error) {
 		return
 	}
 
-	size, err := verifiedCopy(tmp, e.id, fetch)
+	// A second, read-only descriptor on the same inode. It has to be its own
+	// descriptor because the write one is closed below, and it keeps working
+	// across the rename because a rename moves the name and not the file.
+	// Failing to open it costs the watermark tier, not the download.
+	var progress *atomic.Int64
+	if rd, oerr := os.Open(tmp.Name()); oerr == nil {
+		ps := &packStream{f: rd}
+		progress = &ps.n
+		e.stream.Store(ps)
+		// The descriptor outlives fill: a reader may still hold the stream when
+		// the download settles. Closing it is the cleanup's job, once nothing
+		// references the stream at all.
+		runtime.AddCleanup(ps, func(f *os.File) { f.Close() }, rd)
+	} else {
+		slog.Debug("cannot open the staging file for watermark reads", "pack", e.id, "err", oerr)
+	}
+
+	size, err := verifiedCopy(tmp, e.id, fetch, progress)
+	e.stream.Store(nil)
 	if cerr := tmp.Close(); err == nil && cerr != nil {
 		err = fmt.Errorf("tigris: stage pack %s: %w", e.id, cerr)
 	}
@@ -252,9 +307,12 @@ func (c *PackCache) evictLocked(keep string) {
 
 // verifiedCopy runs fetch into w, hashing as it goes, and rejects a body whose
 // SHA-256 disagrees with the pack id. It reports how many bytes landed.
-func verifiedCopy(w io.Writer, id string, fetch func(io.Writer) error) (int64, error) {
+//
+// progress, when non-nil, is the watermark a concurrent reader polls: it is
+// bumped after every write, so a byte counted there is already in w.
+func verifiedCopy(w io.Writer, id string, fetch func(io.Writer) error, progress *atomic.Int64) (int64, error) {
 	h := sha256.New()
-	cnt := &countingWriter{w: io.MultiWriter(w, h)}
+	cnt := &countingWriter{w: io.MultiWriter(w, h), progress: progress}
 	if err := fetch(cnt); err != nil {
 		return 0, err
 	}
@@ -265,12 +323,18 @@ func verifiedCopy(w io.Writer, id string, fetch func(io.Writer) error) (int64, e
 }
 
 type countingWriter struct {
-	w io.Writer
-	n int64
+	w        io.Writer
+	n        int64
+	progress *atomic.Int64
 }
 
+// Write publishes the running total only after the underlying writer returns,
+// so the watermark never admits a byte that is not yet on disk.
 func (c *countingWriter) Write(p []byte) (int, error) {
 	n, err := c.w.Write(p)
 	c.n += int64(n)
+	if c.progress != nil {
+		c.progress.Store(c.n)
+	}
 	return n, err
 }

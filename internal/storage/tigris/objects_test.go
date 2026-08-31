@@ -5,7 +5,6 @@ import (
 	"io"
 	"strconv"
 	"testing"
-	"time"
 
 	"github.com/aws/smithy-go"
 	"github.com/go-git/go-git/v6/plumbing"
@@ -200,14 +199,13 @@ func TestEncodedObjectSkipsHeadObject(t *testing.T) {
 	f := newFakeS3(t)
 	h := seed(t, f, formatcfg.DefaultObjectFormat, plumbing.BlobObject, "no head needed")
 
-	seen := map[string]int{}
-	s := newTestStorer(t, f, WithObserver(func(op string, _ time.Duration, _ error) {
-		seen[op]++
-	}))
+	obs, snapshot := countingObserver()
+	s := newTestStorer(t, f, obs)
 
 	if _, err := s.EncodedObject(plumbing.AnyObject, h); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	seen := snapshot()
 	if got := seen["HeadObject"]; got != 0 {
 		t.Errorf("EncodedObject issued %d HeadObject calls, want 0 (map: %v)", got, seen)
 	}
