@@ -95,11 +95,39 @@ var (
 	payloadOnce sync.Once
 )
 
+// encoderConcurrency caps how many EncodeAll calls the encoder() singleton
+// serves at once. zstd.NewWriter defaults WithEncoderConcurrency to GOMAXPROCS,
+// and every internal encoder state allocates its own match-history buffer (tens
+// of megabytes, never released), so the default puts a permanent floor under
+// retained heap that scales with core count and not with real demand. The value
+// that matters is "expected simultaneous pushes", not "core count"; 4 matches
+// deltaScanWorkers in spirit — a bound picked for resource reasons. Revisit it
+// alongside the push cap that actually bounds demand.
+//
+// A package-level variable with a setter, not a Storer option: the encoder is a
+// process-wide singleton, so SetEncoderConcurrency must be called from main
+// before the first encode. Reads are not synchronized because the setter runs
+// once at startup, before any EncodeAll.
+var encoderConcurrency = 4
+
+// SetEncoderConcurrency sets how many EncodeAll calls the encoder() singleton
+// serves at once. Call it once from main before the first encode; values below
+// 1 are clamped to 1.
+func SetEncoderConcurrency(n int) {
+	if n < 1 {
+		n = 1
+	}
+	encoderConcurrency = n
+}
+
 func encoder() *zstd.Encoder {
 	zstdEncOnce.Do(func() {
 		// Errors here are impossible with a nil writer and valid options; the
 		// option list is a compile-time constant.
-		zstdEnc, _ = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
+		zstdEnc, _ = zstd.NewWriter(nil,
+			zstd.WithEncoderLevel(zstd.SpeedDefault),
+			zstd.WithEncoderConcurrency(encoderConcurrency),
+		)
 	})
 	return zstdEnc
 }
@@ -114,7 +142,15 @@ func encoder() *zstd.Encoder {
 var streamEncPool = sync.Pool{
 	New: func() any {
 		// Same error-impossibility reasoning as encoder() above.
-		zw, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
+		//
+		// WithEncoderConcurrency(1) because a streaming copy owns its encoder for
+		// the duration of one object, as the comment above states: the extra
+		// states a default GOMAXPROCS encoder would allocate can never be used
+		// concurrently by a single owner, so they are pure retained-heap floor.
+		zw, _ := zstd.NewWriter(nil,
+			zstd.WithEncoderLevel(zstd.SpeedDefault),
+			zstd.WithEncoderConcurrency(1),
+		)
 		return zw
 	},
 }
