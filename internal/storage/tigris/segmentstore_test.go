@@ -262,8 +262,7 @@ func TestSegmentStoreMissFallsThroughToStorer(t *testing.T) {
 	// Nothing staged, so this can only be answered by the backing Storer. The
 	// object is not there either, so the fall-through must surface as a
 	// not-found rather than as a staging error.
-	var absent plumbing.Hash
-	absent = plumbing.NewHasher(ss.s.of, plumbing.BlobObject, 3).Sum()
+	absent := plumbing.NewHasher(ss.s.of, plumbing.BlobObject, 3).Sum()
 
 	_, err := ss.EncodedObject(plumbing.AnyObject, absent)
 	if err == nil {
