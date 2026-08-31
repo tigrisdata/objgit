@@ -53,6 +53,14 @@ type daemon struct {
 	// allowHooks gates running .objgit/hooks/receive-pack after a push.
 	allowHooks  bool
 	hookTimeout time.Duration
+
+	// pushes bounds how many pushes unpack a packfile at once, which is the
+	// only thing that bounds the daemon's resident set under concurrent pushes.
+	// A nil pushes is unlimited, which is what every test that does not care
+	// about the cap gets. Fetches are deliberately not gated: they allocate
+	// very differently, and one semaphore over both would let a burst of clones
+	// block pushes for reasons that have nothing to do with memory.
+	pushes *pushLimiter
 }
 
 // storerFor reports whether a repository already exists at st, returning st

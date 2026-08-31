@@ -1,3 +1,9 @@
+# [1.4.0](https://github.com/tigrisdata/objgit/compare/v1.3.0...v1.4.0) (2026-08-31)
+
+### Features
+
+- **objgitd:** bound the number of concurrent pushes ([#7](https://github.com/tigrisdata/objgit/issues/7)) ([877cd16](https://github.com/tigrisdata/objgit/commit/877cd16b39223de2d30f78156e34f0276204839a))
+
 # [1.3.0](https://github.com/tigrisdata/objgit/compare/v1.2.0...v1.3.0) (2026-08-31)
 
 ### Bug Fixes

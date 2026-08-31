@@ -50,6 +50,9 @@ var (
 	packedRefs      = flag.Bool("packed-refs", true, "write every ref into one packed-refs object under a compare-and-swap, instead of one object per ref; reading packed refs is always enabled, so this is safe to turn off for one release before a rollback")
 
 	encoderConcurrency = flag.Int("encoder-concurrency", 4, "how many concurrent zstd EncodeAll calls the process-wide pack encoder serves; each state retains a match-history buffer, so this caps encoder heap that would otherwise scale with GOMAXPROCS. Set with the concurrent push cap in mind")
+
+	maxConcurrentPushes = flag.Int("max-concurrent-pushes", 4, "pushes allowed to unpack a packfile at the same time; each one costs roughly 400 MiB of resident set for a large repository, so this is what bounds memory under concurrent pushes; 0 disables the limit")
+	pushQueueTimeout    = flag.Duration("push-queue-timeout", 2*time.Minute, "how long a push waits for a slot before it fails")
 )
 
 // tigrisBase adapts *tigris.Storer to repofs.Base: Storer.Scoped returns the
@@ -142,6 +145,7 @@ func main() {
 		authz:       auth.AllowAnonymous{AllowWrite: *allowPush},
 		allowHooks:  *allowHooks,
 		hookTimeout: *hookTimeout,
+		pushes:      newPushLimiter(*maxConcurrentPushes, *pushQueueTimeout),
 	}
 
 	slog.Info("objgitd listening",
@@ -153,6 +157,8 @@ func main() {
 		"allow_push", *allowPush,
 		"allow_hooks", *allowHooks,
 		"pack_cache_bytes", *packCacheBytes,
+		"max_concurrent_pushes", *maxConcurrentPushes,
+		"push_queue_timeout", *pushQueueTimeout,
 	)
 
 	g, gCtx := errgroup.WithContext(ctx)

@@ -17,14 +17,38 @@ repository names have unbounded cardinality. Git operations are keyed by
 
 The package exposes thin helpers, so no call site carries label plumbing:
 
-| Helper          | Use                                    |
-| --------------- | -------------------------------------- |
-| `ObserveS3`     | The s3fs observer.                     |
-| `ObserveGitOp`  | One git operation.                     |
-| `TrackInFlight` | Returns a deferred decrement.          |
-| `ObserveAuth`   | Maps the `auth` enums to labels.       |
-| `ObserveHook`   | One hook run.                          |
-| `ReposCreated`  | A new repository.                      |
+| Helper            | Use                              |
+| ----------------- | -------------------------------- |
+| `ObserveS3`       | The s3fs observer.               |
+| `ObserveGitOp`    | One git operation.               |
+| `TrackInFlight`   | Returns a deferred decrement.    |
+| `ObserveAuth`     | Maps the `auth` enums to labels. |
+| `ObserveHook`     | One hook run.                    |
+| `ReposCreated`    | A new repository.                |
+| `TrackPushWait`   | Returns a deferred decrement.    |
+| `TrackPushSlot`   | Returns a deferred decrement.    |
+| `ObservePushWait` | One wait for a push slot.        |
+
+## The push queue
+
+`-max-concurrent-pushes` changes the failure mode under load. The daemon no
+longer grows its heap without limit. It makes pushes queue instead. This is an
+improvement only when the queue is visible, so the cap comes with four series:
+
+| Series                             | Type      | Meaning                                  |
+| ---------------------------------- | --------- | ---------------------------------------- |
+| `objgit_push_slots_held`           | gauge     | Pushes that unpack a packfile right now. |
+| `objgit_push_queue_waiting`        | gauge     | Pushes that wait for a slot.             |
+| `objgit_push_queue_wait_seconds`   | histogram | Time one push spent in the queue.        |
+| `objgit_push_queue_outcomes_total` | counter   | Slot requests by outcome.                |
+
+`objgit_push_queue_waiting` is the one to alert on. A value that stays above
+zero means the cap is below the offered load. There is no other way to see
+that from outside the process.
+
+The outcome label separates the two ways a wait ends badly. `timeout` means the
+client waited out `-push-queue-timeout`, which is the signal that the cap is too
+low. `canceled` means the client hung up while queued, which is not.
 
 ## Three instrumentation seams
 
