@@ -66,6 +66,7 @@ Notes on the tests and on configuration:
 | `internal/mountfs`, `internal/treefs`, `internal/kefkash` | The hook sandbox filesystem and shell wiring. |
 | `internal/metrics`            | Every Prometheus vector, plus thin helpers.                            |
 | `internal/slog.go`            | JSON handler init.                                                     |
+| `cmd/membench/`               | Push memory benchmark harness. Not shipped; see `docs/usage/memory-benchmark.md`. |
 
 ## Architecture
 
@@ -85,7 +86,8 @@ Two more directories carry detail:
 
 - `docs/reference/` — the `.cue` binary layout, the failure modes, and the
   build order.
-- `docs/usage/` — how to use a feature, such as a hook script.
+- `docs/usage/` — how to use a feature, such as a hook script, or the push
+  memory benchmark.
 
 ## Conventions
 
