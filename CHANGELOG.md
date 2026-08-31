@@ -1,3 +1,9 @@
+# [1.5.0](https://github.com/tigrisdata/objgit/compare/v1.4.1...v1.5.0) (2026-08-31)
+
+### Features
+
+- push memory benchmark harness and container-writing storer ([#8](https://github.com/tigrisdata/objgit/issues/8)) ([f322c9f](https://github.com/tigrisdata/objgit/commit/f322c9f4e0b95d6ee38ec686c881aef40129d5e7)), closes [hi#water](https://github.com/hi/issues/water) [hi#water](https://github.com/hi/issues/water) [hi#memory](https://github.com/hi/issues/memory)
+
 ## [1.4.1](https://github.com/tigrisdata/objgit/compare/v1.4.0...v1.4.1) (2026-08-31)
 
 ### Performance Improvements
