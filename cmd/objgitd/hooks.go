@@ -85,9 +85,13 @@ func diffRefs(before, after map[plumbing.ReferenceName]plumbing.Hash) []refUpdat
 // used for ref snapshots and hook checkouts — all three transports now share the
 // same Scanner-bounded PackfileWriter path (see writePack), so no transport needs
 // a capability-hiding wrapper.
+//
+// This is also the one place every push funnels through — smart HTTP and SSH
+// both land here, and git:// never serves receive-pack at all — so it is where
+// the push concurrency cap is applied, via the d.pushes.admit seam.
 func (d *daemon) receivePack(ctx context.Context, st storage.Storer, repoPath string, r io.ReadCloser, w io.WriteCloser, req *transport.ReceivePackRequest) error {
 	if !d.allowHooks {
-		err := receivePackStreaming(ctx, st, r, w, req, nil)
+		err := receivePackStreaming(ctx, st, r, w, req, d.pushes.admit, nil)
 		d.healHEADAfterPush(err, st, repoPath)
 		return err
 	}
@@ -114,7 +118,7 @@ func (d *daemon) receivePack(ctx context.Context, st storage.Storer, repoPath st
 		d.runHooks(repoPath, "receive-pack", st, updates, progress)
 	}
 
-	err = receivePackStreaming(ctx, st, r, w, req, onUpdated)
+	err = receivePackStreaming(ctx, st, r, w, req, d.pushes.admit, onUpdated)
 	d.healHEADAfterPush(err, st, repoPath)
 	return err
 }

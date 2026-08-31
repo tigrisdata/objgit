@@ -115,6 +115,35 @@ var (
 		Buckets:   []float64{0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0},
 	})
 
+	pushSlotsHeld = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "push",
+		Name:      "slots_held",
+		Help:      "Pushes holding a concurrency slot, so unpacking a packfile right now.",
+	})
+
+	pushQueueWaiting = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace,
+		Subsystem: "push",
+		Name:      "queue_waiting",
+		Help:      "Pushes waiting for a concurrency slot. A value that stays above zero means -max-concurrent-pushes is below the offered load.",
+	})
+
+	pushQueueWait = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: "push",
+		Name:      "queue_wait_seconds",
+		Help:      "Time a push spent waiting for a concurrency slot.",
+		Buckets:   []float64{0.001, 0.01, 0.1, 1, 5, 15, 30, 60, 120, 300},
+	})
+
+	pushQueueOutcomes = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "push",
+		Name:      "queue_outcomes_total",
+		Help:      "Pushes that asked for a concurrency slot, by outcome (admitted, timeout, canceled).",
+	}, []string{"outcome"})
+
 	refCASRetries = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "ref",
@@ -139,6 +168,36 @@ func ObserveS3(operation string, dur time.Duration, err error) {
 func TrackInFlight(protocol string) func() {
 	gitInFlight.WithLabelValues(protocol).Inc()
 	return func() { gitInFlight.WithLabelValues(protocol).Dec() }
+}
+
+// Push-slot outcomes, as passed to ObservePushWait.
+const (
+	PushAdmitted = "admitted"
+	PushTimeout  = "timeout"
+	PushCanceled = "canceled"
+)
+
+// TrackPushWait increments the gauge of pushes waiting for a concurrency slot
+// and returns a closure that decrements it; call the result with defer.
+func TrackPushWait() func() {
+	pushQueueWaiting.Inc()
+	return func() { pushQueueWaiting.Dec() }
+}
+
+// TrackPushSlot increments the gauge of pushes holding a concurrency slot and
+// returns a closure that decrements it; call the result with defer.
+func TrackPushSlot() func() {
+	pushSlotsHeld.Inc()
+	return func() { pushSlotsHeld.Dec() }
+}
+
+// ObservePushWait records one wait for a concurrency slot. outcome is
+// PushAdmitted, PushTimeout, or PushCanceled, which keeps a push that gave up
+// waiting distinct from every other kind of push failure. start is when the
+// wait began.
+func ObservePushWait(outcome string, start time.Time) {
+	pushQueueOutcomes.WithLabelValues(outcome).Inc()
+	pushQueueWait.Observe(time.Since(start).Seconds())
 }
 
 // ObserveGitOp records a completed git operation: status is "ok", "error", or
