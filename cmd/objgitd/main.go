@@ -48,6 +48,8 @@ var (
 
 	packCompression = flag.Bool("pack-compression", true, "store zstd-compressed payloads in newly written pack containers; reading compressed containers is always enabled, so this is safe to turn off for one release before a rollback")
 	packedRefs      = flag.Bool("packed-refs", true, "write every ref into one packed-refs object under a compare-and-swap, instead of one object per ref; reading packed refs is always enabled, so this is safe to turn off for one release before a rollback")
+
+	encoderConcurrency = flag.Int("encoder-concurrency", 4, "how many concurrent zstd EncodeAll calls the process-wide pack encoder serves; each state retains a match-history buffer, so this caps encoder heap that would otherwise scale with GOMAXPROCS. Set with the concurrent push cap in mind")
 )
 
 // tigrisBase adapts *tigris.Storer to repofs.Base: Storer.Scoped returns the
@@ -83,6 +85,11 @@ func main() {
 
 	// Route s3fs S3 round-trips into Prometheus before any filesystem use.
 	s3fs.SetMetricsObserver(metrics.ObserveS3)
+
+	// Cap the process-wide pack encoder's concurrency before the first encode.
+	// Left at its GOMAXPROCS default, each internal state retains a
+	// match-history buffer and the retained floor scales with core count.
+	tigris.SetEncoderConcurrency(*encoderConcurrency)
 
 	rawClient, err := tstorage.New(ctx)
 	if err != nil {
