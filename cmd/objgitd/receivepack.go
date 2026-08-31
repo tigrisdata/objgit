@@ -22,22 +22,36 @@ import (
 )
 
 // receivePackStreaming is a fork of go-git's transport.ReceivePack (v6) that
-// adds one seam: onUpdated runs after refs are updated and report-status is
-// sent, but *before* the closing sideband flush-pkt. go-git keeps its sideband
-// Muxer internal and flushes it before returning, so there is no other way to
-// stream "remote:" progress to the client. The seam hands back a band-2
-// (sideband.ProgressMessage) writer when the client negotiated sideband, or nil
-// otherwise — callers stream hook output through it and fall back to logging
-// when it is nil.
+// adds two seams:
 //
-// Everything except the onUpdated seam mirrors transport.ReceivePack verbatim,
-// including the helper functions copied below.
+//   - admit gates the memory-heavy part of the push. It runs once the client's
+//     capabilities are known and before the packfile is read, and the slot it
+//     returns is held until this function returns, which covers unpacking, the
+//     ref update, and any hooks. A nil admit means unlimited.
+//   - onUpdated runs after refs are updated and report-status is sent, but
+//     *before* the closing sideband flush-pkt. go-git keeps its sideband Muxer
+//     internal and flushes it before returning, so there is no other way to
+//     stream "remote:" progress to the client. The seam hands back a band-2
+//     (sideband.ProgressMessage) writer when the client negotiated sideband, or
+//     nil otherwise — callers stream hook output through it and fall back to
+//     logging when it is nil.
+//
+// admit deliberately sits after the capability decode rather than at the top of
+// the call: that is the first point at which the response framing is known, so a
+// push that gives up waiting can be reported as a push failure the client
+// renders ("error: remote unpack failed: ...") instead of a dropped connection.
+//
+// Everything except those two seams mirrors transport.ReceivePack verbatim,
+// including the helper functions copied below. The sideband setup moved above
+// the packfile read so the admit failure can use it; nothing is written to w in
+// between, so the reorder is not observable on the wire.
 func receivePackStreaming(
 	ctx context.Context,
 	st storage.Storer,
 	r io.ReadCloser,
 	w io.WriteCloser,
 	opts *transport.ReceivePackRequest,
+	admit admitFunc,
 	onUpdated func(progress io.Writer),
 ) error {
 	if w == nil {
@@ -114,23 +128,6 @@ func receivePackStreaming(
 		}
 	}
 
-	// Receive the packfile
-	var unpackErr error
-	if needPackfile {
-		unpackErr = writePack(st, rd)
-	}
-
-	// Done with the request, now close the reader
-	// to indicate that we are done reading from it.
-	if err := r.Close(); err != nil {
-		return fmt.Errorf("closing reader: %w", err)
-	}
-
-	// Report status if the client supports it
-	if !updreq.Capabilities.Supports(capability.ReportStatus) {
-		return unpackErr
-	}
-
 	var (
 		useSideband bool
 		mux         *sideband.Muxer
@@ -147,8 +144,40 @@ func receivePackStreaming(
 			useSideband = true
 		}
 	}
-
 	writeCloser := ioutil.NewWriteCloser(writer, w)
+	reportStatus := caps.Supports(capability.ReportStatus)
+
+	// Claim a push slot before reading the pack, and hold it until this call
+	// returns: the unpack, the ref update, and the hooks all allocate.
+	if admit != nil {
+		release, err := admit(ctx)
+		if err != nil {
+			if reportStatus {
+				_ = sendReportStatus(writeCloser, err, nil)
+			}
+			_ = closeWriter(w)
+			return err
+		}
+		defer release()
+	}
+
+	// Receive the packfile
+	var unpackErr error
+	if needPackfile {
+		unpackErr = writePack(st, rd)
+	}
+
+	// Done with the request, now close the reader
+	// to indicate that we are done reading from it.
+	if err := r.Close(); err != nil {
+		return fmt.Errorf("closing reader: %w", err)
+	}
+
+	// Report status if the client supports it
+	if !reportStatus {
+		return unpackErr
+	}
+
 	if unpackErr != nil {
 		res := sendReportStatus(writeCloser, unpackErr, nil)
 		_ = closeWriter(w)

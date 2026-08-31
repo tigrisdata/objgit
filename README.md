@@ -71,6 +71,14 @@ GIT_BIND=:9418
 HTTP_BIND=:8080
 SSH_BIND=:2222
 
+# Pushes that unpack a packfile at the same time. This is what bounds
+# memory under concurrent pushes: each one costs roughly 400 MiB of
+# resident set for a large repository. 0 disables the limit.
+MAX_CONCURRENT_PUSHES=4
+# How long a push waits for a slot before it fails,
+# in go time.Duration format
+PUSH_QUEUE_TIMEOUT=2m
+
 # Prometheus metrics
 METRICS_BIND=:9090
 

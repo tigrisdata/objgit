@@ -4,11 +4,11 @@ objgitd speaks three git transports. All three answer the protocol natively
 with the same go-git `transport.*` functions. objgitd never runs the `git`
 binary, and it never writes a checkout to disk.
 
-| Transport   | Flag           | Default  | Credential                  |
-| ----------- | -------------- | -------- | --------------------------- |
-| Smart HTTP  | `-http-bind`   | `:8080`  | HTTP Basic, or anonymous.   |
-| git://      | `-git-bind`    | `:9418`  | Anonymous only.             |
-| SSH         | `-ssh-bind`    | off      | Public key, or anonymous.   |
+| Transport  | Flag         | Default | Credential                |
+| ---------- | ------------ | ------- | ------------------------- |
+| Smart HTTP | `-http-bind` | `:8080` | HTTP Basic, or anonymous. |
+| git://     | `-git-bind`  | `:9418` | Anonymous only.           |
+| SSH        | `-ssh-bind`  | off     | Public key, or anonymous. |
 
 All three route their decisions through [the auth seam](auth.md).
 
@@ -124,3 +124,32 @@ and it reports its own error.
 
 A storer with no `refUpdater` keeps the per-reference path, which is what
 `memory.Storage` uses in the tests.
+
+## The push concurrency cap
+
+Memory during a push scales with the number of pushes in flight, and nothing in
+the daemon bounds that number. A sweep of concurrent pushes of a 48 MiB pack
+measured a flat 429 MiB of resident set for each one, with no ceiling.
+`GOMEMLIMIT` halves the slope. It does not bound anything, because it makes the
+collector work harder as the heap grows instead of stopping the heap from
+growing.
+
+`pushlimit.go` holds a counting semaphore on `*daemon`. `-max-concurrent-pushes`
+sets the number of slots, and `0` disables the limit. A push that finds every
+slot taken waits, up to `-push-queue-timeout`, and then fails.
+
+`(*daemon).receivePack` is the one place to gate. Smart HTTP and SSH both reach
+it, and git:// never serves `receive-pack` at all. Fetches are deliberately not
+gated. They allocate very differently, and one semaphore over both would let a
+burst of clones block pushes for reasons that have nothing to do with memory.
+
+The gate itself sits a few lines further in, inside `receivePackStreaming`,
+right after the client's capabilities are decoded and before the packfile is
+read. That is the first point at which the response framing is known, so a push
+that gives up waiting is reported through `sendReportStatus` and the person
+pushing sees `error: remote unpack failed: objgitd: too many concurrent
+pushes...`. A gate at the top of `receivePack` could only drop the connection.
+
+The slot is released by one `defer` that covers the unpack, the reference
+update, and the hooks. Watch `objgit_push_queue_waiting`: see
+[metrics.md](metrics.md).
