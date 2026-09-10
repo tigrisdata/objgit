@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -280,9 +282,55 @@ func (s *Storer) PackRefs() error {
 
 // --- shallow marks ---
 
+// shallowCache is one Storer's memoized answer for the shallow key. It mirrors
+// refCache: built once per instance, and not sticky on error.
+//
+// It exists because go-git asks far more than once. revlist.ObjectsWithRef
+// walks one want at a time, and every walk builds a shallow set, so a clone
+// costs refs + 1 lookups. Almost every repository is not shallow, so almost
+// every one of those lookups is a 404 on a key that is not there. Measured on
+// a 1,077-ref repository, those 404s took 338 of the 412 seconds the clone
+// spent. The listing cache in internal/s3fs used to answer them for free, and
+// ebfe4e3 removed it when repository storage stopped going through s3fs.
+//
+// Absent is therefore the answer worth remembering, so built and hashes are
+// separate fields: a nil hashes with built set means "confirmed not shallow".
+type shallowCache struct {
+	mu     sync.Mutex
+	built  bool
+	hashes []plumbing.Hash
+}
+
+func newShallowCache() *shallowCache { return &shallowCache{} }
+
+// setShallowCache records a definitive answer. SetShallow calls it after a
+// write lands, so a read of its own write inside the same request never sees
+// the pre-write value.
+func (s *Storer) setShallowCache(hashes []plumbing.Hash) {
+	s.shallow.mu.Lock()
+	defer s.shallow.mu.Unlock()
+	s.shallow.hashes = slices.Clone(hashes)
+	s.shallow.built = true
+}
+
+// invalidateShallow drops the cache so the next read goes to the bucket. A
+// failed write is the reason: the request either landed or it did not, and
+// nothing here knows which.
+func (s *Storer) invalidateShallow() {
+	s.shallow.mu.Lock()
+	defer s.shallow.mu.Unlock()
+	s.shallow.built = false
+	s.shallow.hashes = nil
+}
+
 func (s *Storer) SetShallow(commits []plumbing.Hash) error {
 	if len(commits) == 0 {
-		return s.removeSimple(s.prefix + shallowKey)
+		if err := s.removeSimple(s.prefix + shallowKey); err != nil {
+			s.invalidateShallow()
+			return err
+		}
+		s.setShallowCache(nil)
+		return nil
 	}
 	var b strings.Builder
 	for _, c := range commits {
@@ -297,17 +345,36 @@ func (s *Storer) SetShallow(commits []plumbing.Hash) error {
 	})
 	s.observe("PutObject", start, err)
 	if err != nil {
+		s.invalidateShallow()
 		return fmt.Errorf("tigris: store shallow marks: %w", err)
 	}
+	s.setShallowCache(commits)
 	return nil
 }
 
+// Shallow reports the repository's shallow marks, reading the key at most once
+// per Storer. See shallowCache for why the memo matters.
+//
+// The lock spans the GET, as ensureRefsBuilt's does. Two first callers then
+// cost one round trip rather than two, which is the whole point here. An error
+// leaves the cache empty, so the next caller retries.
 func (s *Storer) Shallow() ([]plumbing.Hash, error) {
+	s.shallow.mu.Lock()
+	defer s.shallow.mu.Unlock()
+	if s.shallow.built {
+		// A copy. The caller must not be able to edit the cache.
+		return slices.Clone(s.shallow.hashes), nil
+	}
+
 	body, err := s.fetchSmall(s.prefix + shallowKey)
 	switch {
 	case err == nil:
 	case errors.Is(err, plumbing.ErrObjectNotFound):
-		return nil, nil // absent marker == not shallow, like dotgit
+		// Absent marker == not shallow, like dotgit. This is the common case
+		// and the one the memo is for.
+		s.shallow.hashes = nil
+		s.shallow.built = true
+		return nil, nil
 	default:
 		return nil, fmt.Errorf("tigris: load shallow marks: %w", err)
 	}
@@ -324,7 +391,10 @@ func (s *Storer) Shallow() ([]plumbing.Hash, error) {
 		}
 		out = append(out, h)
 	}
-	return out, nil
+
+	s.shallow.hashes = out
+	s.shallow.built = true
+	return slices.Clone(out), nil
 }
 
 // --- small-payload primitives shared by refs, shallow, index, config ---

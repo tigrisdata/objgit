@@ -2,6 +2,8 @@ package tigris
 
 import (
 	"errors"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/go-git/go-git/v6/plumbing"
@@ -334,5 +336,236 @@ func TestShallowMarks(t *testing.T) {
 	}
 	if left, err := s.Shallow(); err != nil || len(left) != 0 {
 		t.Errorf("cleared marks still readable: %v, %v", left, err)
+	}
+}
+
+// shallowBody renders marks the way SetShallow does, so a test can seed the
+// key without a write going through the cache first.
+func shallowBody(marks []plumbing.Hash) string {
+	var b strings.Builder
+	for _, h := range marks {
+		b.WriteString(h.String())
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// hexOf flattens marks for comparison. plumbing.Hash has unexported fields, so
+// hex strings are the honest way to diff two slices of them.
+func hexOf(marks []plumbing.Hash) []string {
+	out := make([]string, 0, len(marks))
+	for _, h := range marks {
+		out = append(out, h.String())
+	}
+	return out
+}
+
+// TestShallowLookupIsMemoized pins the per-request cache behind Shallow.
+//
+// go-git's revlist.ObjectsWithRef walks one want at a time, and each walk asks
+// the storer for the shallow set, so a clone used to pay one GetObject per
+// advertised ref. Absent is the common answer and it is the one that must be
+// remembered.
+func TestShallowLookupIsMemoized(t *testing.T) {
+	t.Parallel()
+
+	a, b := mustHash(headAB), mustHash(headCD)
+
+	tests := []struct {
+		name  string
+		seed  []plumbing.Hash // marks already in the bucket
+		want  []plumbing.Hash
+		calls int
+	}{
+		{name: "absent marker", seed: nil, want: nil, calls: 5},
+		{name: "present marker", seed: []plumbing.Hash{a, b}, want: []plumbing.Hash{a, b}, calls: 5},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newFakeS3(t)
+			if len(tt.seed) > 0 {
+				f.put(shallowKey, shallowBody(tt.seed), nil)
+			}
+			obs, snapshot := countingObserver()
+			s := newTestStorer(t, f, obs)
+
+			for i := range tt.calls {
+				got, err := s.Shallow()
+				if err != nil {
+					t.Fatalf("call %d: %v", i, err)
+				}
+				if !slices.Equal(hexOf(got), hexOf(tt.want)) {
+					t.Fatalf("call %d: want marks %v, got %v", i, hexOf(tt.want), hexOf(got))
+				}
+			}
+
+			if got := snapshot()["GetObject"]; got != 1 {
+				t.Errorf("%d Shallow calls cost %d GetObject calls, want 1", tt.calls, got)
+			}
+		})
+	}
+}
+
+// TestShallowCacheFollowsWrites pins that a write inside one request is
+// visible to the next read in that same request. A cache that only fills and
+// never updates would hand back the pre-write answer.
+func TestShallowCacheFollowsWrites(t *testing.T) {
+	t.Parallel()
+
+	a, b := mustHash(headAB), mustHash(headCD)
+
+	tests := []struct {
+		name  string
+		seed  []plumbing.Hash
+		write []plumbing.Hash
+		want  []plumbing.Hash
+	}{
+		{name: "set over absent", seed: nil, write: []plumbing.Hash{a}, want: []plumbing.Hash{a}},
+		{name: "set over present", seed: []plumbing.Hash{a}, write: []plumbing.Hash{a, b}, want: []plumbing.Hash{a, b}},
+		{name: "clear present", seed: []plumbing.Hash{a, b}, write: nil, want: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := newFakeS3(t)
+			if len(tt.seed) > 0 {
+				f.put(shallowKey, shallowBody(tt.seed), nil)
+			}
+			s := newTestStorer(t, f)
+
+			// Warm the cache first. Without this the write has nothing stale to
+			// leave behind and the test proves nothing.
+			if _, err := s.Shallow(); err != nil {
+				t.Fatalf("warm: %v", err)
+			}
+			if err := s.SetShallow(tt.write); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+
+			got, err := s.Shallow()
+			if err != nil {
+				t.Fatalf("read back: %v", err)
+			}
+			if !slices.Equal(hexOf(got), hexOf(tt.want)) {
+				t.Errorf("want marks %v, got %v", hexOf(tt.want), hexOf(got))
+			}
+		})
+	}
+}
+
+// TestShallowCacheIsPerScopedPrefix is the isolation guard. Scoped copies the
+// Storer value, so a cache held by pointer is shared unless Scoped replaces
+// it — and a shared one would give one repository another repository's marks.
+func TestShallowCacheIsPerScopedPrefix(t *testing.T) {
+	t.Parallel()
+
+	a, b := mustHash(headAB), mustHash(headCD)
+
+	f := newFakeS3(t)
+	f.put("acme/widgets/"+shallowKey, shallowBody([]plumbing.Hash{a}), nil)
+	f.put("acme/gadgets/"+shallowKey, shallowBody([]plumbing.Hash{b}), nil)
+
+	base := newTestStorer(t, f)
+
+	// Warm the root's cache with the unmarked answer before scoping. A child
+	// that inherited the parent's cache would report itself unmarked too.
+	if got, err := base.Shallow(); err != nil || len(got) != 0 {
+		t.Fatalf("root should read as unmarked, got %v, %v", got, err)
+	}
+
+	tests := []struct {
+		name   string
+		storer *Storer
+		want   []plumbing.Hash
+	}{
+		{name: "widgets", storer: base.Scoped("acme/widgets"), want: []plumbing.Hash{a}},
+		{name: "gadgets", storer: base.Scoped("acme/gadgets"), want: []plumbing.Hash{b}},
+		{name: "nested unmarked", storer: base.Scoped("acme").Scoped("sprockets"), want: nil},
+		{name: "nested marked", storer: base.Scoped("acme").Scoped("widgets"), want: []plumbing.Hash{a}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Read twice: the first fills that Storer's own cache, the second
+			// proves the cached answer is still this prefix's answer.
+			for i := range 2 {
+				got, err := tt.storer.Shallow()
+				if err != nil {
+					t.Fatalf("call %d: %v", i, err)
+				}
+				if !slices.Equal(hexOf(got), hexOf(tt.want)) {
+					t.Fatalf("call %d: want marks %v, got %v", i, hexOf(tt.want), hexOf(got))
+				}
+			}
+		})
+	}
+
+	// The root's own answer must survive its children reading theirs.
+	if got, err := base.Shallow(); err != nil || len(got) != 0 {
+		t.Errorf("root marks changed under it: %v, %v", got, err)
+	}
+}
+
+// TestShallowLookupDoesNotCacheErrors pins that only a definitive answer is
+// cacheable. A transient GetObject failure must not poison the rest of the
+// request.
+func TestShallowLookupDoesNotCacheErrors(t *testing.T) {
+	t.Parallel()
+
+	a := mustHash(headAB)
+	boom := errors.New("injected network failure")
+
+	f := newFakeS3(t)
+	f.put(shallowKey, shallowBody([]plumbing.Hash{a}), nil)
+	f.getErr = boom
+
+	obs, snapshot := countingObserver()
+	s := newTestStorer(t, f, obs)
+
+	if _, err := s.Shallow(); !errors.Is(err, boom) {
+		t.Fatalf("want the injected failure, got %v", err)
+	}
+
+	f.getErr = nil
+	got, err := s.Shallow()
+	if err != nil {
+		t.Fatalf("retry after a failure: %v", err)
+	}
+	if !slices.Equal(hexOf(got), hexOf([]plumbing.Hash{a})) {
+		t.Errorf("want marks %v, got %v", hexOf([]plumbing.Hash{a}), hexOf(got))
+	}
+	if n := snapshot()["GetObject"]; n != 2 {
+		t.Errorf("want 2 GetObject calls (one failed, one retried), got %d", n)
+	}
+}
+
+// TestShallowCachedSliceIsNotAliased keeps a caller from editing the cache
+// through the slice it was handed.
+func TestShallowCachedSliceIsNotAliased(t *testing.T) {
+	t.Parallel()
+
+	a, b := mustHash(headAB), mustHash(headCD)
+
+	f := newFakeS3(t)
+	f.put(shallowKey, shallowBody([]plumbing.Hash{a, b}), nil)
+	s := newTestStorer(t, f)
+
+	first, err := s.Shallow()
+	if err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	first[0] = plumbing.ZeroHash
+
+	second, err := s.Shallow()
+	if err != nil {
+		t.Fatalf("second read: %v", err)
+	}
+	if !slices.Equal(hexOf(second), hexOf([]plumbing.Hash{a, b})) {
+		t.Errorf("caller edited the cache: want %v, got %v", hexOf([]plumbing.Hash{a, b}), hexOf(second))
 	}
 }
