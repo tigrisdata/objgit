@@ -112,6 +112,10 @@ type Storer struct {
 	// refs is this Storer's memoized ref view; see refcache.go. Reads always
 	// consult it. Writes only go through it when packedRefs is set.
 	refs *refCache
+	// shallow is this Storer's memoized answer for the shallow key; see
+	// refs.go. go-git asks once per ref during a clone, and the answer is
+	// almost always "absent".
+	shallow *shallowCache
 	// packedRefs enables writing the packed-refs object. Defaults to true.
 	// Reading it is unconditional — see WithPackedRefs for why the two differ.
 	packedRefs bool
@@ -281,6 +285,7 @@ func New(ctx context.Context, bucket string, opts ...Option) (*Storer, error) {
 	s.up = newUploader(s)
 	s.packs = newPackIndex()
 	s.refs = newRefCache()
+	s.shallow = newShallowCache()
 	s.fetchSem = make(chan struct{}, maxLivePackFetches)
 	return s, nil
 }
@@ -295,10 +300,13 @@ var _ storer.PackfileWriter = (*Storer)(nil)
 // Storer value. Prefixes nest: scoping an already-scoped Storer extends its
 // existing prefix. Cheap: it copies the Storer value and dials nothing.
 //
-// The returned Storer gets its own uploader, pack index, and ref cache (see
-// upload.go, packindex.go, refcache.go), independent of s's: one repository's
-// push, pending/failed uploads, ref view, or pack read history can never block
-// or leak into another's.
+// The returned Storer gets its own uploader, pack index, ref cache, and
+// shallow cache (see upload.go, packindex.go, refcache.go, refs.go),
+// independent of s's: one repository's push, pending/failed uploads, ref view,
+// shallow marks, or pack read history can never block or leak into another's.
+//
+// Every one of those is a pointer field, so the struct copy above shares it
+// until it is replaced. Adding a cache to Storer means adding a line here.
 //
 // Two things are shared on purpose. The pack cache, because sharing downloaded
 // packs across requests is the whole point of it, and its keys are content
@@ -317,6 +325,7 @@ func (s *Storer) Scoped(prefix string) *Storer {
 	cp.up = newUploader(&cp)
 	cp.packs = newPackIndex()
 	cp.refs = newRefCache()
+	cp.shallow = newShallowCache()
 	return &cp
 }
 

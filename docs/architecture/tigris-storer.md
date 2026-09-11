@@ -34,7 +34,8 @@ call has run.
 | `refs/<name>`      | One legacy loose reference. Read-only.               |
 
 Shallow marks, the worktree index, and the repository configuration sit at
-root-level keys. They carry the same prefix as everything else.
+root-level keys. They carry the same prefix as everything else. The `shallow`
+key has a cache in front of it. See "Shallow marks".
 
 Each loose object stores its type and size in user metadata, as `git-type` and
 `git-size`. `EncodedObject` reads both off the `GetObject` response, so a
@@ -230,6 +231,46 @@ The flag is safe in both directions:
 
 CAUTION: Do not change the format and flip this flag in one release. A rollback
 then has no binary that can read what the window wrote.
+
+## Shallow marks (`refs.go`)
+
+The `shallow` key holds one commit hash per line. An absent key means the
+repository is not shallow. Almost no repository is shallow, so almost every
+read of this key is a 404.
+
+`shallowCache` memoizes that answer. It mirrors `refCache`. It builds once per
+instance, it is not sticky on error, and `Scoped` gives each child its own.
+
+This memo is not a rare path. go-git asks once per want.
+`revlist.ObjectsWithRef` starts one object walk for each advertised reference.
+Every walk builds a shallow set before it does anything else. A clone of N
+references therefore cost N+1 `GetObject` calls on a key that is not there.
+
+These numbers come from a live bucket, before the memo:
+
+| Repository  | References | Failed GETs | Time in GetObject | Clone     |
+| ----------- | ---------: | ----------: | ----------------: | --------- |
+| objgit      |         37 |          38 |            11.1 s | 11.8 s    |
+| tigris-blog |        506 |         507 |             144 s | 3 m 47 s  |
+| Xe/x        |      1,077 |       1,078 |             338 s | 6 m 11 s  |
+
+For `Xe/x` that is 338 of 412 seconds, or 73% of the clone.
+
+These calls were free before `ebfe4e3`. Repository storage went through
+[s3fs](s3fs.md) then, and the listing cache of that package answered a negative
+lookup from memory. `ebfe4e3` moved repository storage onto this package and
+removed that cache, so the 404s became real round trips.
+
+The lock spans the `GetObject`, as `ensureRefsBuilt` does. Two first callers
+then cost one round trip and not two.
+
+`SetShallow` records the value that it wrote. A read of its own write inside
+one request therefore never gets the old answer. A failed write drops the cache
+instead, because nothing here knows whether the request landed.
+
+CAUTION: `Scoped` copies the `Storer` value, and every cache is a pointer
+field. `Scoped` must build a new one, or one repository reads the marks of
+another repository. `TestShallowCacheIsPerScopedPrefix` pins this.
 
 ## Writes are asynchronous (`upload.go`)
 
