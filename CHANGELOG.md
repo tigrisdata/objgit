@@ -1,3 +1,9 @@
+## [1.5.1](https://github.com/tigrisdata/objgit/compare/v1.5.0...v1.5.1) (2026-09-11)
+
+### Performance Improvements
+
+- **storage/tigris:** cache the shallow lookup per request ([#9](https://github.com/tigrisdata/objgit/issues/9)) ([da8c0d4](https://github.com/tigrisdata/objgit/commit/da8c0d4a53b63f24f3f51691ed0d2544e44dda31))
+
 # [1.5.0](https://github.com/tigrisdata/objgit/compare/v1.4.1...v1.5.0) (2026-08-31)
 
 ### Features
