@@ -61,6 +61,11 @@ type daemon struct {
 	// very differently, and one semaphore over both would let a burst of clones
 	// block pushes for reasons that have nothing to do with memory.
 	pushes *pushLimiter
+
+	// lfs is the Git LFS subsystem, nil when -allow-lfs is unset. A nil lfs
+	// registers no LFS route, so the feature reads as a 404 from outside
+	// instead of as a broken endpoint.
+	lfs *lfsService
 }
 
 // storerFor reports whether a repository already exists at st, returning st

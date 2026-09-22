@@ -9,9 +9,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"net/url"
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +24,7 @@ import (
 	"github.com/tigrisdata/objgit"
 	"github.com/tigrisdata/objgit/internal"
 	"github.com/tigrisdata/objgit/internal/auth"
+	"github.com/tigrisdata/objgit/internal/lfs"
 	"github.com/tigrisdata/objgit/internal/metrics"
 	"github.com/tigrisdata/objgit/internal/repofs"
 	"github.com/tigrisdata/objgit/internal/s3fs"
@@ -53,6 +56,13 @@ var (
 
 	maxConcurrentPushes = flag.Int("max-concurrent-pushes", 4, "pushes allowed to unpack a packfile at the same time; each one costs roughly 400 MiB of resident set for a large repository, so this is what bounds memory under concurrent pushes; 0 disables the limit")
 	pushQueueTimeout    = flag.Duration("push-queue-timeout", 2*time.Minute, "how long a push waits for a slot before it fails")
+
+	allowLFS      = flag.Bool("allow-lfs", false, "serve the Git LFS API; object bytes move directly between the client and the bucket over presigned URLs, never through this daemon")
+	allowLFSLocks = flag.Bool("allow-lfs-locks", true, "serve the Git LFS file locking API; without a user store every anonymous caller is the same owner, so locking is advisory only")
+	externalURL   = flag.String("external-url", "", "public base URL of this server, such as https://git.example.com; required for Git LFS over ssh:// because git-lfs-authenticate has to name the HTTP API")
+	lfsURLTTL     = flag.Duration("lfs-url-ttl", 15*time.Minute, "how long a presigned Git LFS transfer URL stays valid")
+	lfsMaxSize    = flag.Int64("lfs-max-size", 5<<30, "largest Git LFS object accepted, in bytes; one presigned PUT caps at 5 GiB")
+	lfsMaxBatch   = flag.Int("lfs-max-batch", 500, "most objects accepted in one Git LFS batch request")
 )
 
 // tigrisBase adapts *tigris.Storer to repofs.Base: Storer.Scoped returns the
@@ -81,6 +91,23 @@ func main() {
 	if *httpBind == "" && *sshBind == "" {
 		slog.Error("at least one of -http-bind or -ssh-bind must be set")
 		os.Exit(1)
+	}
+
+	if *allowLFS {
+		if *httpBind == "" {
+			// Every LFS transfer is negotiated over HTTP, even for an ssh://
+			// remote: git-lfs-authenticate exists only to name that endpoint.
+			slog.Error("-allow-lfs needs -http-bind; the Git LFS API is HTTP even for ssh:// remotes")
+			os.Exit(1)
+		}
+		if err := checkExternalURL(*externalURL); err != nil {
+			slog.Error("-external-url is not usable", "err", err)
+			os.Exit(1)
+		}
+		if *externalURL == "" && *sshBind != "" {
+			slog.Error("-allow-lfs with -ssh-bind needs -external-url; git-lfs-authenticate has to name a public HTTP URL")
+			os.Exit(1)
+		}
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -148,6 +175,22 @@ func main() {
 		pushes:      newPushLimiter(*maxConcurrentPushes, *pushQueueTimeout),
 	}
 
+	if *allowLFS {
+		// Presign from the raw client, not the hardened one: s3.NewPresignClient
+		// needs the concrete *s3.Client, and hardening buys nothing here because
+		// presigning makes no network call.
+		ttl := lfsTTL(ctx, rawClient, *lfsURLTTL)
+		d.lfs = &lfsService{
+			store: lfs.NewStore(rawClient,
+				lfs.NewPresigner(rawClient.Client, *bucket), *bucket),
+			ttl:         ttl,
+			maxSize:     *lfsMaxSize,
+			maxBatch:    *lfsMaxBatch,
+			externalURL: strings.TrimSuffix(*externalURL, "/"),
+			allowLocks:  *allowLFSLocks,
+		}
+	}
+
 	slog.Info("objgitd listening",
 		"version", objgit.Version,
 		"http_bind", *httpBind,
@@ -156,6 +199,8 @@ func main() {
 		"bucket", *bucket,
 		"allow_push", *allowPush,
 		"allow_hooks", *allowHooks,
+		"allow_lfs", *allowLFS,
+		"external_url", *externalURL,
 		"pack_cache_bytes", *packCacheBytes,
 		"max_concurrent_pushes", *maxConcurrentPushes,
 		"push_queue_timeout", *pushQueueTimeout,
@@ -245,4 +290,61 @@ func main() {
 		slog.Error("server stopped", "err", err)
 		os.Exit(1)
 	}
+}
+
+// checkExternalURL rejects an -external-url that cannot be used to build an
+// absolute LFS endpoint. An empty value is allowed: the HTTP side then derives
+// the base from the request, and only SSH needs the flag.
+func checkExternalURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("parsing %q: %w", raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("%q needs an http or https scheme", raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("%q names no host", raw)
+	}
+	return nil
+}
+
+// lfsTTL clamps the presigned-URL lifetime to what the credentials can outlive.
+//
+// A presigned URL carries the session token of the credential that signed it,
+// so a temporary credential (SSO, IMDS, assume-role) invalidates every URL it
+// signed the moment it expires, whatever -lfs-url-ttl says. Static Tigris
+// keypairs do not expire and keep the configured value.
+func lfsTTL(ctx context.Context, client *tstorage.Client, want time.Duration) time.Duration {
+	creds, err := client.Options().Credentials.Retrieve(ctx)
+	if err != nil {
+		slog.Warn("cannot inspect credentials for lfs url lifetime; using the configured value",
+			"lfs_url_ttl", want, "err", err)
+		return want
+	}
+	if !creds.CanExpire {
+		return want
+	}
+
+	// Leave a margin so a URL minted just before the clamp still outlives the
+	// round trip that uses it.
+	const margin = time.Minute
+	// A floor keeps a short-lived credential from producing a zero or negative
+	// expiry, which would sign URLs that are dead on arrival. Credentials this
+	// close to expiry are refreshed by the SDK well before the floor runs out.
+	const floor = time.Minute
+
+	left := time.Until(creds.Expires) - margin
+	if left >= want {
+		return want
+	}
+	if left < floor {
+		left = floor
+	}
+	slog.Warn("credentials expire before the configured lfs url lifetime; clamping",
+		"lfs_url_ttl", want, "clamped_to", left, "credentials_expire", creds.Expires)
+	return left
 }

@@ -63,6 +63,31 @@ func TestParse(t *testing.T) {
 			input:   "acme/.git",
 			wantErr: ErrInvalidPath,
 		},
+		{
+			name:    "reserved org lfs",
+			input:   "lfs/blobs",
+			wantErr: ErrReservedPath,
+		},
+		{
+			name:    "reserved org lfs with .git",
+			input:   "lfs/objects.git",
+			wantErr: ErrReservedPath,
+		},
+		{
+			name:    "dot-prefixed org",
+			input:   ".objgit/widgets",
+			wantErr: ErrReservedPath,
+		},
+		{
+			name:    "dot-prefixed name",
+			input:   "acme/.hidden",
+			wantErr: ErrReservedPath,
+		},
+		{
+			name:  "lfs is fine as a repository name",
+			input: "acme/lfs",
+			want:  RepoRef{OrgID: "acme", Name: "lfs"},
+		},
 	}
 
 	for _, tt := range tests {

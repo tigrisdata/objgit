@@ -12,6 +12,7 @@ Price: Free as in mattress. If you use this, it's your problem.
 
 - ssh, http, and git protocol support.
 - [post-receive hooks](./docs/usage/hooks.md) powered by userspace sandboxed shells and [Kefka](https://xeiaso.net/blog/2026/dancing-mad-sandboxing/).
+- [Git LFS](./docs/usage/lfs.md) with presigned transfers, so large files move straight between the client and Tigris instead of through the daemon. Object bytes are deduplicated across every repository in the bucket.
 - basic prometheus metrics.
 - no authentication whatsoever, if this ends up being actually useful then authentication will be implemented.
 
