@@ -3,3 +3,6 @@
 manifest/secrets/
 
 node_modules
+
+# Claude Code local agent state: per-user settings and scratch worktrees.
+.claude/
