@@ -202,6 +202,42 @@ var (
 		Name:      "cas_retries_total",
 		Help:      "Packed-refs compare-and-swap attempts that lost a race and were retried.",
 	})
+
+	lfsBatchRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "lfs",
+		Name:      "batch_requests_total",
+		Help:      "Git LFS batch requests, by operation and outcome.",
+	}, []string{"operation", "status"})
+
+	lfsBatchDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: "lfs",
+		Name:      "batch_duration_seconds",
+		Help:      "Time to answer a Git LFS batch request.",
+		Buckets:   prometheus.DefBuckets,
+	}, []string{"operation"})
+
+	lfsObjects = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "lfs",
+		Name:      "objects_total",
+		Help:      "Objects named in a Git LFS batch, by operation and outcome (new, present, missing, error).",
+	}, []string{"operation", "result"})
+
+	lfsVerify = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "lfs",
+		Name:      "verify_total",
+		Help:      "Git LFS verify calls, by outcome (ok, missing, mismatch, invalid, error).",
+	}, []string{"status"})
+
+	lfsLockRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "lfs",
+		Name:      "lock_requests_total",
+		Help:      "Git LFS locking API calls, by action and outcome.",
+	}, []string{"action", "status"})
 )
 
 // ObserveS3 records one S3/Tigris API call. Its signature matches the observer
@@ -388,4 +424,54 @@ func (c *listingCacheCollector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(lcItems, prometheus.GaugeValue, float64(s.ListingItems), "listing")
 	ch <- prometheus.MustNewConstMetric(lcItems, prometheus.GaugeValue, float64(s.SubtreeItems), "subtree")
 	ch <- prometheus.MustNewConstMetric(lcItems, prometheus.GaugeValue, float64(s.HeadItems), "head")
+}
+
+// ObserveLFSBatch records a completed Git LFS batch request. operation is
+// "upload" or "download", and status is "ok", "denied", "invalid",
+// "too_many_objects", or "error". start is when the handler began.
+func ObserveLFSBatch(operation, status string, start time.Time) {
+	operation = lfsOperationLabel(operation)
+	lfsBatchRequests.WithLabelValues(operation, status).Inc()
+	lfsBatchDuration.WithLabelValues(operation).Observe(time.Since(start).Seconds())
+}
+
+// ObserveLFSObject records one object's outcome inside a batch.
+//
+// On an upload batch, the ratio of result="present" to result="new" is the
+// deduplication rate: "present" means the repository already held the object
+// and the client transferred nothing. Judge the feature by that ratio, not by
+// batch_requests_total.
+func ObserveLFSObject(operation, result string) {
+	lfsObjects.WithLabelValues(lfsOperationLabel(operation), result).Inc()
+}
+
+// lfsOperationLabel clamps a client-supplied operation to the two values the
+// protocol defines.
+//
+// The batch body is read before authorization, so an unauthenticated caller
+// chooses this string. Passing it through would let anyone mint a new label
+// value per request and grow the metric registry without bound.
+func lfsOperationLabel(operation string) string {
+	switch operation {
+	case "upload", "download":
+		return operation
+	default:
+		return "unknown"
+	}
+}
+
+// ObserveLFSVerify records a Git LFS verify call.
+//
+// status="mismatch" is the one to alert on. A presigned upload is not
+// size-checked by its signature, so verify is the only place wrong bytes are
+// caught, and a rising mismatch rate means clients are writing objects that do
+// not hash to the id they claim.
+func ObserveLFSVerify(status string) {
+	lfsVerify.WithLabelValues(status).Inc()
+}
+
+// ObserveLFSLock records a Git LFS locking API call. action is "create",
+// "list", "verify", or "unlock".
+func ObserveLFSLock(action, status string) {
+	lfsLockRequests.WithLabelValues(action, status).Inc()
 }

@@ -18,6 +18,10 @@ One backend answers three transports:
 All three funnel authorization through one pluggable
 `internal/auth.Authorizer`.
 
+Git LFS rides on the Smart HTTP listener, behind `-allow-lfs`. It is HTTP even
+for an `ssh://` remote: SSH only answers `git-lfs-authenticate`, which names the
+HTTP endpoint. See [docs/architecture/lfs.md](docs/architecture/lfs.md).
+
 A fourth listener serves Prometheus metrics at `/metrics` and a `/healthz`
 probe endpoint (`-metrics-bind`, default `:9090`). An empty value disables it.
 
@@ -60,7 +64,9 @@ Notes on the tests and on configuration:
 | `cmd/objgitd/receivepack.go`                              | The go-git fork that streams hook output, plus `writePack`.                       |
 | `cmd/objgitd/hooks.go`                                    | Ref diffing and the sandboxed hook run.                                           |
 | `cmd/objgitd/snapshots.go`                                | The erofs snapshot run after a push.                                              |
+| `cmd/objgitd/lfs.go`                                      | The Git LFS HTTP handlers and `git-lfs-authenticate` over SSH.                    |
 | `internal/auth`                                           | The one authorization interface.                                                  |
+| `internal/lfs`                                            | Git LFS: protocol types, the bucket store, and the presigner.                    |
 | `internal/repofs`                                         | Maps a repository path to a `storage.Storer`.                                     |
 | `internal/storage/tigris`                                 | Repository storage. A `storage.Storer` on the bucket.                             |
 | `internal/bundler`                                        | The async upload queue behind that storer.                                        |
@@ -85,6 +91,7 @@ describes the daemon and links to one page for each subsystem.
 | [snapshots.md](docs/architecture/snapshots.md)         | Snapshot images, the snapshot cache, or `runSnapshots`.                 |
 | [tigris-storer.md](docs/architecture/tigris-storer.md) | Object layout, refs, packs, the pack cache, or the upload path.         |
 | [s3fs.md](docs/architecture/s3fs.md)                   | The `billy.Filesystem` over the bucket.                                 |
+| [lfs.md](docs/architecture/lfs.md)                     | Git LFS: the batch API, presigned transfers, locks, or the blob layout. |
 
 Two more directories carry detail:
 

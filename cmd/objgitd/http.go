@@ -33,6 +33,7 @@ func (d *daemon) httpHandler() http.Handler {
 	mux.HandleFunc("POST /{orgID}/{repoName}/git-receive-pack", func(w http.ResponseWriter, r *http.Request) {
 		d.handleRPC(w, r, transport.ReceivePackService)
 	})
+	d.registerLFS(mux)
 	return mux
 }
 

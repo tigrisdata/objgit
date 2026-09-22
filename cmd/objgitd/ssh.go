@@ -145,6 +145,14 @@ func (d *daemon) handleSSH(s ssh.Session) {
 		return
 	}
 
+	// LFS is intercepted before gitServiceFor, which knows only the three git
+	// transport commands. The command arrives as three arguments:
+	// git-lfs-authenticate <path> <operation>.
+	if cmd[0] == lfsAuthenticateCommand {
+		d.handleLFSAuthenticate(s, cmd)
+		return
+	}
+
 	service, ok := gitServiceFor(cmd[0])
 	if !ok {
 		fmt.Fprintf(s.Stderr(), "objgitd: unsupported command %q\n", cmd[0])

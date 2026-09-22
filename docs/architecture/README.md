@@ -39,6 +39,7 @@ Three behaviors live on `*daemon`, so every transport acts the same way:
 | [snapshots.md](snapshots.md)         | erofs images of pushed trees, and the snapshot cache.                        |
 | [tigris-storer.md](tigris-storer.md) | Repository storage: a `storage.Storer` on one Tigris bucket.                 |
 | [s3fs.md](s3fs.md)                   | Daemon-level state: a `billy.Filesystem` on Tigris.                          |
+| [lfs.md](lfs.md)                     | Git LFS: presigned transfers, global blobs, per-repository markers.          |
 
 Related documents outside this directory:
 
@@ -46,4 +47,5 @@ Related documents outside this directory:
   binary layout, the failure modes, and the build order.
 - [../usage/hooks.md](../usage/hooks.md) — how to write a hook script.
 - [../usage/webhooks.md](../usage/webhooks.md) — how to configure and verify push webhooks.
+- [../usage/lfs.md](../usage/lfs.md) — how to use Git LFS against objgitd.
 - `../plans/` — plans for work that is not yet complete.
