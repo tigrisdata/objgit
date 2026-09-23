@@ -3,7 +3,7 @@ module github.com/tigrisdata/objgit
 go 1.26.3
 
 require (
-	github.com/Xe/erofs v0.6.1
+	github.com/Xe/erofs v0.8.0
 	github.com/aws/aws-sdk-go-v2 v1.41.7
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.102.0
 	github.com/aws/smithy-go v1.26.0

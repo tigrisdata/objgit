@@ -81,12 +81,17 @@ Two pushes of one tree can run `Ensure` at the same time. Both build, and both
 put identical bytes. This is correct, so `Ensure` takes no lock. The temp file
 name is random for the same reason.
 
-Two workarounds for `github.com/Xe/erofs` v0.6.1 are in `ensure.go`:
+`Ensure` streams file content into the builder. The walk reads only the
+size of each blob, through `EncodedObjectSize`. It gives the builder the size
+and an open function with `AddFileFunc`. During `Build`, the builder opens
+each blob one time, compresses it one pcluster at a time, and spools the
+compressed blocks to a temp file (`WithSpoolDir`, the same directory as the
+image). As a result, the memory for a build does not depend on the size of
+the tree. `TestEnsureMemory` builds 256 MiB of content with a live heap of
+less than 64 MiB.
 
-- `Ensure` sizes the temp file to one block before the build. `Build` reads
-  back the first block, and that read fails on a smaller file.
-- `Ensure` adds the root directory itself. The root that `Build` adds on its
-  own reads back wrong when the root holds more than one block of entries.
+This needs `github.com/Xe/erofs` v0.8.0 or later. The image bytes are the same
+as the bytes that v0.6.1 wrote for the same tree.
 
 ## `Open` and the snapshot cache
 
@@ -141,7 +146,8 @@ it in `objgit_snapshot_builds_total{result="error"}`. The failure line does
 not show the error text, because the text can contain bucket details.
 
 The push slot from `-max-concurrent-pushes` stays held while snapshots run.
-The push cap therefore also limits the count of concurrent builds.
+The push cap therefore also limits the count of concurrent builds, and so the
+temp disk that builds use at one time.
 
 The daemon gets the store with a type assertion, `st.(snapshot.Store)`. A
 storer without the methods skips snapshots.
@@ -157,11 +163,8 @@ storer without the methods skips snapshots.
 
 ## Known risks
 
-- **Memory.** `erofs.Builder` keeps the bytes of every file, and their
-  compressed blocks, until `Build` returns. A push of a 2 GiB tree can hold
-  up to 4 GiB more heap. The streaming builder spec,
-  [../superpowers/specs/2026-09-23-erofs-streaming-builder-design.md](../superpowers/specs/2026-09-23-erofs-streaming-builder-design.md),
-  removes this risk.
+- **Temp disk.** A build writes the image and a spool of compressed blocks
+  to the temp directory. Each one is at most the size of the image.
 - **Push latency.** The client waits for the build.
 - **The single PUT limit.** An image larger than 5 GiB fails, because
   `PutSnapshot` sends one `PutObject`.

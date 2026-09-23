@@ -7,7 +7,8 @@ updated ref. It stores the image in the bucket, under the prefix of the
 repository. A later web UI opens the image and reads directories and files
 from it, with no git object walk.
 
-The package is `github.com/Xe/erofs` (v0.6.1 at the time of writing).
+The package is `github.com/Xe/erofs`. The design started on v0.6.1. The code
+now needs v0.8.0, for the streaming builder.
 
 ## Decisions
 
@@ -20,7 +21,7 @@ These decisions come from the design discussion on 2026-09-23.
 | Size limit               | None. Every tree gets an image. We measure first, then decide on a limit. |
 | Compression              | Zstandard, at the default level of the builder.                            |
 | How a reader gets bytes  | `Open` downloads the whole image into a local cache directory, next to the pack cache. The cache evicts least-recently-used images when it passes its byte budget, and on a timer when an image is idle too long. |
-| Builder memory           | Accepted for v1. A separate spec moves the builder to streaming input. See [2026-09-23-erofs-streaming-builder-design.md](2026-09-23-erofs-streaming-builder-design.md). |
+| Builder memory           | Bounded. `Ensure` uses `AddFileFunc` from erofs v0.8.0, which implements [2026-09-23-erofs-streaming-builder-design.md](2026-09-23-erofs-streaming-builder-design.md). |
 
 ## Non-goals
 
@@ -170,8 +171,10 @@ The steps:
    - `WithEpoch(time.Unix(0, 0))`
    - `WithCompression(erofs.CompressionZstd)`
 4. Walk the tree with `object.GetTree` and the tree entries, depth first.
-   Add each entry through `AddDir`, `AddFile`, or `AddSymlink`, as the mapping
-   gives. Read blob contents with `object.GetBlob` and `blob.Reader`.
+   Add each entry through `AddDir`, `AddFileFunc`, or `AddSymlink`, as the
+   mapping gives. For a file, read only the size with `EncodedObjectSize`.
+   The open function loads the blob with `object.GetBlob` and returns
+   `blob.Reader()`, so the builder reads the content during `Build`.
 5. Call `Build`.
 6. Rewind the file and compute its SHA-256.
 7. Rewind the file again. Call `PutSnapshot` with the file, its size, and the
@@ -343,8 +346,7 @@ Snapshots run before hooks, so a hook can print a link to an image that
 already exists.
 
 The push slot from `-max-concurrent-pushes` stays held while `onUpdated`
-runs. The builder holds file data in memory, so the push cap also bounds the
-count of concurrent builds.
+runs. The push cap therefore also bounds the count of concurrent builds.
 
 ### Progress output
 
@@ -394,11 +396,9 @@ There is no `repo` label, per the rule in
 
 ## Known risks
 
-- **Memory.** `erofs.Builder` keeps the bytes of every file until `Build`
-  returns. With compression on, it also keeps the compressed blocks of every
-  file. A push of a 2 GiB tree can therefore hold up to approximately 4 GiB
-  more heap for the build. The push cap bounds the count of builds, but not
-  their size. The streaming builder spec removes this risk.
+- **Memory.** Resolved by erofs v0.8.0. Before it, `erofs.Builder` kept the
+  bytes and the compressed blocks of every file until `Build` returned, up to
+  approximately twice the size of the tree.
 - **Push latency.** The client waits for the build. For a large tree the build
   reads every blob once and compresses it. The pack prefetch makes the reads
   local after the first read of each container.

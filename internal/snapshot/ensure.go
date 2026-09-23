@@ -87,28 +87,17 @@ func Ensure(ctx context.Context, objs storer.EncodedObjectStorer, store Store, t
 		f.Close()
 		os.Remove(f.Name())
 	}()
-	// Build's checksum step reads back the whole first block through the
-	// same io.ReaderAt it wrote through. *os.File.ReadAt returns io.EOF for
-	// a read that runs past the current end of file, which any image
-	// smaller than one block does. Preallocating the block up front (as a
-	// sparse hole; the trailing zeros are exactly what an unwritten region
-	// of the image should read as) avoids that short read.
-	if err := f.Truncate(1 << blockSizeBits); err != nil {
-		return res, fmt.Errorf("snapshot: preallocate temp file: %w", err)
-	}
-
-	b := erofs.NewBuilder(f,
+	opts := []erofs.BuildOption{
 		erofs.WithBlockSize(blockSizeBits),
 		erofs.WithEpoch(epoch),
 		erofs.WithCompression(erofs.CompressionZstd),
-	)
-	// Add the root directory explicitly. Build() otherwise creates it
-	// itself, but that path mishandles a root whose entries spill past one
-	// block (the "large directory" case below), producing an image whose
-	// root inode reads back as a non-directory.
-	if err := b.AddDir("/", info{"/", fs.ModeDir | 0o755}); err != nil {
-		return res, fmt.Errorf("snapshot: add root: %w", err)
 	}
+	if tmpDir != "" {
+		// Build spools compressed blocks to a temp file of its own; keep it
+		// next to the image.
+		opts = append(opts, erofs.WithSpoolDir(tmpDir))
+	}
+	b := erofs.NewBuilder(f, opts...)
 	w := &walker{ctx: ctx, objs: objs, b: b}
 	if err := w.addTree("/", root); err != nil {
 		return res, err
@@ -190,25 +179,33 @@ func (w *walker) addTree(dir string, t *object.Tree) error {
 				return fmt.Errorf("snapshot: %s: %w", p, err)
 			}
 		case filemode.Regular, filemode.Deprecated, filemode.Executable:
-			data, err := w.blob(p, e.Hash)
+			// Only the size here. The builder opens the blob during Build,
+			// one file at a time, so no blob content stays in memory.
+			size, err := w.objs.EncodedObjectSize(e.Hash)
 			if err != nil {
-				return err
+				return fmt.Errorf("snapshot: %s: blob size: %w", p, err)
 			}
 			perm := fs.FileMode(0o644)
 			if e.Mode == filemode.Executable {
 				perm = 0o755
 			}
-			if err := w.b.AddFile(p, info{e.Name, perm}, data); err != nil {
+			if err := w.b.AddFileFunc(p, info{e.Name, perm}, size, w.opener(e.Hash)); err != nil {
 				return fmt.Errorf("snapshot: %s: %w", p, err)
 			}
 			w.files++
 		case filemode.Symlink:
+			// Check the size before the read, so a huge blob in symlink
+			// mode is refused without loading it.
+			size, err := w.objs.EncodedObjectSize(e.Hash)
+			if err != nil {
+				return fmt.Errorf("snapshot: %s: blob size: %w", p, err)
+			}
+			if size > maxSymlink {
+				return fmt.Errorf("snapshot: %s: symlink target is %d bytes, EROFS allows %d", p, size, maxSymlink)
+			}
 			data, err := w.blob(p, e.Hash)
 			if err != nil {
 				return err
-			}
-			if len(data) > maxSymlink {
-				return fmt.Errorf("snapshot: %s: symlink target is %d bytes, EROFS allows %d", p, len(data), maxSymlink)
 			}
 			if err := w.b.AddSymlink(p, string(data), info{e.Name, fs.ModeSymlink | 0o777}); err != nil {
 				return fmt.Errorf("snapshot: %s: %w", p, err)
@@ -220,6 +217,20 @@ func (w *walker) addTree(dir string, t *object.Tree) error {
 	return nil
 }
 
+// opener returns the source AddFileFunc calls during Build. It loads the blob
+// only then, so the object is garbage once its reader closes.
+func (w *walker) opener(h plumbing.Hash) func() (io.ReadCloser, error) {
+	return func() (io.ReadCloser, error) {
+		blob, err := object.GetBlob(w.objs, h)
+		if err != nil {
+			return nil, fmt.Errorf("load blob %s: %w", h, err)
+		}
+		return blob.Reader()
+	}
+}
+
+// blob reads a whole blob. Only symlink targets use it; they are at most
+// maxSymlink bytes.
 func (w *walker) blob(p string, h plumbing.Hash) ([]byte, error) {
 	blob, err := object.GetBlob(w.objs, h)
 	if err != nil {
