@@ -29,6 +29,8 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 	"tangled.org/xeiaso.net/kefka/command/registry"
 	"tangled.org/xeiaso.net/kefka/command/registry/coreutils"
+	"tangled.org/xeiaso.net/kefka/command/registry/uutils"
+	"tangled.org/xeiaso.net/kefka/command/registry/wasmprog"
 )
 
 // receivePackHook names the hook that a push runs, and so its script at
@@ -284,6 +286,8 @@ func newHookShell(tree *object.Tree, changes hookChanges, env []string, stdin io
 
 	reg := registry.New()
 	coreutils.Register(reg)
+	wasmprog.Register(reg)
+	uutils.Register(reg)
 	if err := reg.Chdir(fsys, "/src"); err != nil {
 		return nil, fmt.Errorf("chdir /src: %w", err)
 	}

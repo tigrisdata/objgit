@@ -81,6 +81,11 @@ func TestReceivePackHook(t *testing.T) {
 	// read-only error, so WROTE_SRC must never print.
 	hook := strings.Join([]string{
 		"cat README.md",
+		"cd sub && cat note.txt",
+		"printf hi | base32",
+		`printf '{"value":42}' | jq -r '.value'`,
+		"cp /src/README.md /tmp/copied && cat /tmp/copied",
+		"if cp /src/README.md /src/copied; then echo WROTE_SRC_CP; fi",
 		`echo "cwd=$PWD"`,
 		"echo built > /tmp/out",
 		"cat /tmp/out",
@@ -88,6 +93,7 @@ func TestReceivePackHook(t *testing.T) {
 		"echo WROTE_SRC",
 	}, "\n") + "\n"
 	writeFile(t, filepath.Join(work, "README.md"), "hello from repo\n")
+	writeFile(t, filepath.Join(work, "sub", "note.txt"), "from subdir\n")
 	writeFile(t, filepath.Join(work, ".objgit", "hooks", "receive-pack"), hook)
 	runGit(t, work, "add", ".")
 	runGit(t, work, "commit", "-m", "with hook")
@@ -102,7 +108,7 @@ func TestReceivePackHook(t *testing.T) {
 		t.Fatalf("hook did not run; logs:\n%s", logs)
 	}
 	// /src is readable and /tmp is writable; their output streamed to the client.
-	for _, want := range []string{"hello from repo", "cwd=/src", "built"} {
+	for _, want := range []string{"hello from repo", "from subdir", "NBUQ====", "42", "cwd=/src", "built"} {
 		if !strings.Contains(pushOut, want) {
 			t.Errorf("push output missing streamed hook output %q; output:\n%s", want, pushOut)
 		}

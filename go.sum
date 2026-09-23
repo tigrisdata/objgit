@@ -124,6 +124,8 @@ github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+
 github.com/stretchr/testify v1.4.0/go.mod h1:j7eGeouHqKxXV5pUuKE4zz7dFj8WfuZ+81PSLYec5m4=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
+github.com/tetratelabs/wazero v1.11.0 h1:+gKemEuKCTevU4d7ZTzlsvgd1uaToIDtlQlmNbwqYhA=
+github.com/tetratelabs/wazero v1.11.0/go.mod h1:eV28rsN8Q+xwjogd7f4/Pp4xFxO7uOGbLcD/LzB1wiU=
 github.com/tigrisdata/storage-go v0.6.0 h1:1Rxzxp/GAUqwFln8qMXYOQIa47IsT2aBNuxYc55o6D4=
 github.com/tigrisdata/storage-go v0.6.0/go.mod h1:l3u7N9LDIhv4lfpkEBJYzolWJ/SBb6WiBexgy/uq6iQ=
 go.uber.org/atomic v1.11.0 h1:ZvwS0R+56ePWxUNi+Atn9dWONBPp/AUETXlHW0DxSjE=
@@ -168,5 +170,5 @@ honnef.co/go/tools v0.7.0 h1:w6WUp1VbkqPEgLz4rkBzH/CSU6HkoqNLp6GstyTx3lU=
 honnef.co/go/tools v0.7.0/go.mod h1:pm29oPxeP3P82ISxZDgIYeOaf9ta6Pi0EWvCFoLG2vc=
 mvdan.cc/sh/v3 v3.13.1 h1:DP3TfgZhDkT7lerUdnp6PTGKyxxzz6T+cOlY/xEvfWk=
 mvdan.cc/sh/v3 v3.13.1/go.mod h1:lXJ8SexMvEVcHCoDvAGLZgFJ9Wsm2sulmoNEXGhYZD0=
-tangled.org/xeiaso.net/kefka v0.0.6-0.20260528192045-e0a84e40ceb8 h1:R008zBlWio3SXRZUaEDDDzzEf82X6e6KLvqhNddXprI=
-tangled.org/xeiaso.net/kefka v0.0.6-0.20260528192045-e0a84e40ceb8/go.mod h1:p474Le4nfwuwnuAWowRhXMsTYfkpOMscchuaFvDa2zM=
+tangled.org/xeiaso.net/kefka v0.0.8 h1:RbiOJn+b+zxa4gNVkW1mSIBj0Qjbcji2eo7wdBf5Gu8=
+tangled.org/xeiaso.net/kefka v0.0.8/go.mod h1:h2ZITASpfUqC6PzLUfYTTO9AKPAft45UvCyxe/LAN2k=

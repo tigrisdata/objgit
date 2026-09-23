@@ -8,8 +8,8 @@
 #
 # Execution environment (see docs/usage/hooks.md):
 #   * It runs in a kefka virtual shell, NOT a real OS shell. Only kefka's
-#     built-in commands are available (coreutils: cat, ls, echo, printf, head,
-#     tail, cut, sort, uniq, wc, sha256sum, grep, ...). There is no PATH to
+#     registered commands are available (cat, ls, printf, head, tail, cut,
+#     sort, uniq, wc, sha256sum, jo, jq, rg, ...). There is no PATH to
 #     system binaries, no network, and no `git`.
 #   * /src is a READ-ONLY checkout of the pushed commit. The working directory
 #     starts here.
