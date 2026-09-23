@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -128,8 +129,8 @@ func main() {
 	}
 	// Harden the client's HTTP path so stale keep-alive connections to Tigris
 	// fail fast and retry on a fresh connection instead of hanging the request
-	// forever (see internal/s3fs/resilient.go). Only sysFS (the SSH host key)
-	// uses this client; internal/storage/tigris dials its own.
+	// forever (see internal/s3fs/resilient.go). sysFS (the SSH host key) and the
+	// LFS store use this client; internal/storage/tigris dials its own.
 	client := s3fs.Harden(rawClient)
 
 	fsys, err := s3fs.NewS3FS(client, *bucket)
@@ -176,14 +177,14 @@ func main() {
 	}
 
 	if *allowLFS {
-		// Presign from the raw client, not the hardened one: s3.NewPresignClient
-		// needs the concrete *s3.Client, and hardening buys nothing here because
-		// presigning makes no network call.
-		ttl := lfsTTL(ctx, rawClient, *lfsURLTTL)
+		// The store talks to the bucket, so it gets the hardened client like
+		// every other request path. rawClient survives only for the presigner:
+		// s3.NewPresignClient needs the concrete *s3.Client, and hardening buys
+		// nothing there because presigning makes no network call.
 		d.lfs = &lfsService{
-			store: lfs.NewStore(rawClient,
+			store: lfs.NewStore(client,
 				lfs.NewPresigner(rawClient.Client, *bucket), *bucket),
-			ttl:         ttl,
+			ttl:         lfsURLTTLFunc(rawClient, *lfsURLTTL),
 			maxSize:     *lfsMaxSize,
 			maxBatch:    *lfsMaxBatch,
 			externalURL: strings.TrimSuffix(*externalURL, "/"),
@@ -312,21 +313,57 @@ func checkExternalURL(raw string) error {
 	return nil
 }
 
+// lfsURLTTLFunc builds the per-request presigned-URL lifetime.
+//
+// The answer is computed per request and never frozen at startup. A temporary
+// credential is refreshed by the SDK while the process runs, so a daemon that
+// happened to start two minutes before an expiry would otherwise clamp every
+// URL it ever signs to the floor below, long after the credential behind it was
+// replaced. Retrieve reads the SDK's credential cache and only reaches the
+// provider when the credential has actually expired, so this is cheap enough to
+// run on every LFS request.
+//
+// The returned function logs a clamp when it starts and when it stops, and not
+// on every request: git-lfs asks for a batch on every fetch and every push.
+func lfsURLTTLFunc(client *tstorage.Client, want time.Duration) func(context.Context) time.Duration {
+	var clamped, unreadable atomic.Bool
+	return func(ctx context.Context) time.Duration {
+		got, err := lfsTTL(ctx, client, want)
+		switch {
+		case err != nil && !unreadable.Swap(true):
+			slog.Warn("cannot inspect credentials for lfs url lifetime; using the configured value",
+				"lfs_url_ttl", want, "err", err)
+		case err == nil:
+			unreadable.Store(false)
+		}
+		switch {
+		case got < want && !clamped.Swap(true):
+			slog.Warn("credentials expire before the configured lfs url lifetime; clamping",
+				"lfs_url_ttl", want, "clamped_to", got)
+		case got >= want && clamped.Swap(false):
+			slog.Info("credentials now outlive the configured lfs url lifetime",
+				"lfs_url_ttl", want)
+		}
+		return got
+	}
+}
+
 // lfsTTL clamps the presigned-URL lifetime to what the credentials can outlive.
 //
 // A presigned URL carries the session token of the credential that signed it,
 // so a temporary credential (SSO, IMDS, assume-role) invalidates every URL it
 // signed the moment it expires, whatever -lfs-url-ttl says. Static Tigris
 // keypairs do not expire and keep the configured value.
-func lfsTTL(ctx context.Context, client *tstorage.Client, want time.Duration) time.Duration {
+//
+// An error is reported rather than logged, because the caller runs this on every
+// request and decides what is worth saying twice.
+func lfsTTL(ctx context.Context, client *tstorage.Client, want time.Duration) (time.Duration, error) {
 	creds, err := client.Options().Credentials.Retrieve(ctx)
 	if err != nil {
-		slog.Warn("cannot inspect credentials for lfs url lifetime; using the configured value",
-			"lfs_url_ttl", want, "err", err)
-		return want
+		return want, err
 	}
 	if !creds.CanExpire {
-		return want
+		return want, nil
 	}
 
 	// Leave a margin so a URL minted just before the clamp still outlives the
@@ -339,12 +376,10 @@ func lfsTTL(ctx context.Context, client *tstorage.Client, want time.Duration) ti
 
 	left := time.Until(creds.Expires) - margin
 	if left >= want {
-		return want
+		return want, nil
 	}
 	if left < floor {
 		left = floor
 	}
-	slog.Warn("credentials expire before the configured lfs url lifetime; clamping",
-		"lfs_url_ttl", want, "clamped_to", left, "credentials_expire", creds.Expires)
-	return left
+	return left, nil
 }

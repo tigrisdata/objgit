@@ -56,7 +56,7 @@ func runSSHCommand(t *testing.T, addr string, args ...string) (stdout, stderr st
 func withLFS(external string, allowLocks bool) func(*daemon) {
 	return func(d *daemon) {
 		d.lfs = &lfsService{
-			ttl:         15 * time.Minute,
+			ttl:         staticLFSTTL(15 * time.Minute),
 			maxSize:     1 << 30,
 			maxBatch:    100,
 			externalURL: external,
