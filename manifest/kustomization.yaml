@@ -50,6 +50,13 @@ configMapGenerator:
       # listener. An empty value therefore breaks every probe, because it
       # disables the listener.
       - METRICS_BIND=:9090
+      # The AWS SDK default chain reads these three values. They point every
+      # SDK client at Tigris, in region auto. The storage-go wrapper pins
+      # the S3 endpoint itself, so the IAM endpoint matters most for the
+      # credential chain of IRSA.
+      - AWS_ENDPOINT_URL_S3=https://t3.storage.dev
+      - AWS_ENDPOINT_URL_IAM=https://iam.storage.dev
+      - AWS_REGION=auto
       # The pack cache lives on the objgitd-pack-cache PVC. 14 GiB (15032385536
       # bytes) leaves headroom under the 16Gi claim.
       - PACK_CACHE_DIR=/var/cache/objgit

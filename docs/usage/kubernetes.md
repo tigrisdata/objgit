@@ -21,6 +21,9 @@ literals live in `manifest/kustomization.yaml`:
 
 - `BUCKET` in the `objgitd-config` configMapGenerator is **required**. The
   daemon does not start when this variable does not name a Tigris bucket.
+- The same configMapGenerator sets `AWS_ENDPOINT_URL_S3`,
+  `AWS_ENDPOINT_URL_IAM`, and `AWS_REGION`. These values point the AWS SDK
+  default chain at Tigris, in region `auto`.
 - The `objgitd-tigris` secretGenerator holds a static Tigris keypair under
   the standard AWS names (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`).
   Before you apply the configuration, replace both placeholder values. Add
