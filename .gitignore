@@ -1,4 +1,5 @@
 .env
 /objgitd
+manifest/secrets/
 
 node_modules

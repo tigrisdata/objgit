@@ -25,9 +25,21 @@ literals live in `manifest/kustomization.yaml`:
   `AWS_ENDPOINT_URL_IAM`, and `AWS_REGION`. These values point the AWS SDK
   default chain at Tigris, in region `auto`.
 - The `objgitd-tigris` secretGenerator holds a static Tigris keypair under
-  the standard AWS names (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`).
-  Before you apply the configuration, replace both placeholder values. Add
-  `AWS_SESSION_TOKEN` for temporary credentials.
+  the standard AWS names (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`). It
+  reads the values from files under `manifest/secrets/`, and `.gitignore`
+  excludes that directory, so the credentials never reach the repository.
+  Write each file with `printf`, because a trailing newline becomes part of
+  the credential:
+
+  ```text
+  printf '%s' '<access key>' > manifest/secrets/aws-access-key-id
+  printf '%s' '<secret key>' > manifest/secrets/aws-secret-access-key
+  ```
+
+  Kustomize refuses to build when the files are missing. For this reason, a
+  fresh clone cannot apply the manifest until it receives the files through
+  a secure side channel. For temporary credentials, add a third file line
+  for `AWS_SESSION_TOKEN`.
 
 To avoid a long-lived keypair, use IRSA or workload identity:
 

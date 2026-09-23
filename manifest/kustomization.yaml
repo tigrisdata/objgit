@@ -72,16 +72,19 @@ configMapGenerator:
       - SLOG_LEVEL=INFO
 
 secretGenerator:
-  # Static Tigris credentials under their standard AWS names. The AWS SDK
-  # default chain reads them from the environment. Replace the placeholder
-  # values before you apply. Add AWS_SESSION_TOKEN for temporary
-  # credentials.
+  # Static Tigris credentials under their standard AWS names, read from
+  # files under secrets/. That directory is in .gitignore, so the values
+  # never reach this repository. Write each file with printf '%s', because
+  # a trailing newline becomes part of the credential. Kustomize refuses to
+  # build when a file is missing, which prevents an accidental deploy with
+  # placeholder values. For temporary credentials, add a third file line
+  # for AWS_SESSION_TOKEN.
   #
   # To avoid a long-lived keypair: delete this generator and the secretRef in
   # deployment.yaml (it is optional). Then annotate the objgitd
   # ServiceAccount for IRSA or workload identity. The default chain finds
   # the role on its own.
   - name: objgitd-tigris
-    literals:
-      - AWS_ACCESS_KEY_ID=replace-me
-      - AWS_SECRET_ACCESS_KEY=replace-me
+    files:
+      - AWS_ACCESS_KEY_ID=secrets/aws-access-key-id
+      - AWS_SECRET_ACCESS_KEY=secrets/aws-secret-access-key
