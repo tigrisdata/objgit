@@ -1,8 +1,9 @@
 // Package lfs implements the Git LFS server protocol over a Tigris bucket.
 //
-// The daemon is a control plane here, not a data plane. It never carries object
-// bytes: the batch endpoint answers with a presigned URL, and the client
-// transfers to and from the bucket directly. See docs/architecture/lfs.md.
+// The batch endpoint answers with a presigned URL, and the client transfers
+// to and from the bucket directly. EROFS snapshot builds also read LFS blobs
+// from the bucket after checking repository membership. See
+// docs/architecture/lfs.md.
 //
 // # Layout in the bucket
 //

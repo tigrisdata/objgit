@@ -75,7 +75,13 @@ func (d *daemon) runSnapshots(repoPath string, st storage.Storer, updates []refU
 			continue
 		}
 
-		res, err := snapshot.Ensure(ctx, st, store, tree, d.snapshotTmpDir)
+		var openLFS snapshot.LFSOpener
+		if d.lfs != nil {
+			openLFS = func(ctx context.Context, oid string, size int64) (io.ReadCloser, error) {
+				return d.lfs.store.OpenVerified(ctx, repoPath, oid, size)
+			}
+		}
+		res, err := snapshot.EnsureWithLFS(ctx, st, store, tree, d.snapshotTmpDir, openLFS)
 		if err != nil {
 			log.Error("snapshot: build failed", "tree", tree.String(), "dur", res.Elapsed, "err", err)
 			metrics.ObserveSnapshot("error", res.Elapsed, 0)

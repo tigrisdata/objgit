@@ -1,8 +1,9 @@
 # Git LFS (`internal/lfs`)
 
-`objgitd` is a control plane for Git LFS, not a data plane. It answers the batch
-API with presigned Tigris URLs. The client then transfers to and from the bucket
-directly. No LFS object byte passes through the daemon.
+`objgitd` answers the Git LFS batch API with presigned Tigris URLs. The client
+transfers to and from the bucket directly. The daemon reads LFS object bytes
+only when it builds an EROFS snapshot of a tree with LFS pointers. That read
+streams into the image builder and checks repository membership first.
 
 This matters because a large blob is the worst case for the git storer.
 `EncodedObject` reads a whole body into memory, so one read of a large blob

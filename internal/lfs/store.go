@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -111,6 +112,34 @@ func (s *Store) Marker(ctx context.Context, repo, oid string) (int64, bool, erro
 		return 0, false, nil
 	}
 	return size, true, nil
+}
+
+// OpenVerified reads an LFS object only after checking that repo holds a
+// marker with the expected size. Snapshot builds use this to replace pointers
+// without making the shared blob key a cross-repository read oracle.
+func (s *Store) OpenVerified(ctx context.Context, repo, oid string, size int64) (io.ReadCloser, error) {
+	storedSize, held, err := s.Marker(ctx, repo, oid)
+	if err != nil {
+		return nil, err
+	}
+	if !held {
+		return nil, fmt.Errorf("lfs: repository %s does not hold object %s", repo, oid)
+	}
+	if storedSize != size {
+		return nil, fmt.Errorf("lfs: object %s marker size %d differs from pointer size %d", oid, storedSize, size)
+	}
+	out, err := s.api.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(BlobKey(oid)),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("lfs: get object %s: %w", oid, err)
+	}
+	if got := aws.ToInt64(out.ContentLength); got != size {
+		out.Body.Close()
+		return nil, fmt.Errorf("lfs: object %s has size %d, pointer says %d", oid, got, size)
+	}
+	return out.Body, nil
 }
 
 // Verify promotes a staged upload and records that repo holds it.

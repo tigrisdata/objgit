@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Xe/erofs"
@@ -56,6 +57,16 @@ type Result struct {
 // Ensure is idempotent. Two concurrent calls for one tree both build and put
 // identical bytes, which is correct, so it takes no lock.
 func Ensure(ctx context.Context, objs storer.EncodedObjectStorer, store Store, tree plumbing.Hash, tmpDir string) (Result, error) {
+	return EnsureWithLFS(ctx, objs, store, tree, tmpDir, nil)
+}
+
+// LFSOpener opens a verified LFS object belonging to the repository being
+// snapshotted. The returned reader must yield exactly size bytes.
+type LFSOpener func(ctx context.Context, oid string, size int64) (io.ReadCloser, error)
+
+// EnsureWithLFS builds a checkout view of tree, replacing Git LFS pointers
+// with their object bytes. A pointer without an opener fails the build.
+func EnsureWithLFS(ctx context.Context, objs storer.EncodedObjectStorer, store Store, tree plumbing.Hash, tmpDir string, openLFS LFSOpener) (Result, error) {
 	start := time.Now()
 	key := Key(tree)
 	res := Result{Key: key}
@@ -98,7 +109,7 @@ func Ensure(ctx context.Context, objs storer.EncodedObjectStorer, store Store, t
 		opts = append(opts, erofs.WithSpoolDir(tmpDir))
 	}
 	b := erofs.NewBuilder(f, opts...)
-	w := &walker{ctx: ctx, objs: objs, b: b}
+	w := &walker{ctx: ctx, objs: objs, b: b, openLFS: openLFS}
 	if err := w.addTree("/", root); err != nil {
 		return res, err
 	}
@@ -144,10 +155,11 @@ func hashFile(f *os.File) (string, int64, error) {
 }
 
 type walker struct {
-	ctx   context.Context
-	objs  storer.EncodedObjectStorer
-	b     *erofs.Builder
-	files int
+	ctx     context.Context
+	objs    storer.EncodedObjectStorer
+	b       *erofs.Builder
+	files   int
+	openLFS LFSOpener
 }
 
 // addTree adds every entry of t under dir, depth first. It walks tree
@@ -185,11 +197,29 @@ func (w *walker) addTree(dir string, t *object.Tree) error {
 			if err != nil {
 				return fmt.Errorf("snapshot: %s: blob size: %w", p, err)
 			}
+			open := w.opener(e.Hash)
+			if size > 0 && size < 1024 {
+				data, err := w.blob(p, e.Hash)
+				if err != nil {
+					return err
+				}
+				oid, objectSize, pointer, err := parseLFSPointer(data)
+				if err != nil {
+					return fmt.Errorf("snapshot: %s: %w", p, err)
+				}
+				if pointer {
+					if w.openLFS == nil {
+						return fmt.Errorf("snapshot: %s: LFS object %s has no object store", p, oid)
+					}
+					size = objectSize
+					open = func() (io.ReadCloser, error) { return w.openLFS(w.ctx, oid, objectSize) }
+				}
+			}
 			perm := fs.FileMode(0o644)
 			if e.Mode == filemode.Executable {
 				perm = 0o755
 			}
-			if err := w.b.AddFileFunc(p, info{e.Name, perm}, size, w.opener(e.Hash)); err != nil {
+			if err := w.b.AddFileFunc(p, info{e.Name, perm}, size, open); err != nil {
 				return fmt.Errorf("snapshot: %s: %w", p, err)
 			}
 			w.files++
@@ -215,6 +245,35 @@ func (w *walker) addTree(dir string, t *object.Tree) error {
 		}
 	}
 	return nil
+}
+
+// parseLFSPointer accepts the canonical v1 pointer without extensions.
+// Extensions require a client-side smudge filter, so building their raw
+// stored bytes would silently make an incorrect checkout image.
+func parseLFSPointer(data []byte) (oid string, size int64, pointer bool, err error) {
+	const version = "version https://git-lfs.github.com/spec/v1\n"
+	if !strings.HasPrefix(string(data), version) {
+		return "", 0, false, nil
+	}
+	lines := strings.Split(string(data), "\n")
+	if len(lines) != 4 || lines[3] != "" || !strings.HasPrefix(lines[1], "oid sha256:") || !strings.HasPrefix(lines[2], "size ") {
+		return "", 0, true, errors.New("unsupported or malformed LFS pointer")
+	}
+	oid = strings.TrimPrefix(lines[1], "oid sha256:")
+	if len(oid) != 64 {
+		return "", 0, true, errors.New("invalid LFS object id")
+	}
+	for _, c := range oid {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return "", 0, true, errors.New("invalid LFS object id")
+		}
+	}
+	rawSize := strings.TrimPrefix(lines[2], "size ")
+	size, err = strconv.ParseInt(rawSize, 10, 64)
+	if err != nil || size < 0 || strconv.FormatInt(size, 10) != rawSize {
+		return "", 0, true, errors.New("invalid LFS object size")
+	}
+	return oid, size, true, nil
 }
 
 // opener returns the source AddFileFunc calls during Build. It loads the blob

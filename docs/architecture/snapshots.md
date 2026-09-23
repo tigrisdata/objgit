@@ -14,9 +14,9 @@ The design is in
 
 ## Object layout
 
-| Key                               | Contents                                  |
-| --------------------------------- | ----------------------------------------- |
-| `snapshots/erofs/v1/<tree>.erofs` | One EROFS image of the git tree `<tree>`. |
+| Key                               | Contents                                                             |
+| --------------------------------- | -------------------------------------------------------------------- |
+| `snapshots/erofs/v2/<tree>.erofs` | One EROFS image of the git tree `<tree>`, with LFS pointers resolved. |
 
 The key uses the tree hash, not the commit hash. Many commits can point at one
 tree, such as a branch and a tag on one commit. These commits share one image.
@@ -24,8 +24,9 @@ tree, such as a branch and a tag on one commit. These commits share one image.
 The builder pins every mtime to the Unix epoch. As a result, two builds of one
 tree give identical bytes, and a second build is never necessary.
 
-`v1` names the mapping from git to EROFS, and the build options. A change to
-either one uses `v2`. A `v2` build never overwrites a `v1` image.
+`v2` names the mapping from git to EROFS, including LFS pointer resolution.
+The earlier `v1` images may contain pointer text. A `v2` build never reuses or
+overwrites a `v1` image.
 
 The key does not start with `objects/`, `packs/`, or `refs/`. The pack index,
 the loose object reads, and the loose ref listing therefore never see it.
@@ -34,7 +35,7 @@ Each image carries user metadata:
 
 | Metadata key   | Value                                                                              |
 | -------------- | ---------------------------------------------------------------------------------- |
-| `erofs-format` | `1`                                                                                |
+| `erofs-format` | `2`                                                                                |
 | `erofs-sha256` | The hex SHA-256 of the image. The cache rejects a download that does not match it. |
 | `git-tree`     | The hex tree hash.                                                                 |
 | `erofs-files`  | The count of regular files.                                                        |
@@ -49,6 +50,17 @@ Each image carries user metadata:
 | `100755` blob    | Regular file, mode `0755`.               |
 | `120000` symlink | Symlink. The target is the blob content. |
 | `160000` gitlink | Empty directory, mode `0755`.            |
+
+A canonical Git LFS v1 pointer in a regular blob becomes the referenced LFS
+object's bytes. The builder uses the pointer's declared size and checks the
+repository membership marker before it opens the shared blob. A missing
+marker, size mismatch, missing blob, malformed pointer, or pointer with an
+extension fails the build. Extensions need a client-side smudge filter to
+reconstruct checkout bytes. A failed image build does not fail the push.
+
+Pointer resolution needs `-allow-lfs` so the daemon has an LFS store. If LFS
+is disabled and a tree has a pointer, the image build fails instead of storing
+pointer text. Non-LFS files build normally.
 
 The gitlink rule gives the same result as `git checkout` of a submodule that
 is not initialized.
@@ -81,10 +93,11 @@ Two pushes of one tree can run `Ensure` at the same time. Both build, and both
 put identical bytes. This is correct, so `Ensure` takes no lock. The temp file
 name is random for the same reason.
 
-`Ensure` streams file content into the builder. The walk reads only the
-size of each blob, through `EncodedObjectSize`. It gives the builder the size
-and an open function with `AddFileFunc`. During `Build`, the builder opens
-each blob one time, compresses it one pcluster at a time, and spools the
+`Ensure` streams file content into the builder. The walk reads the size of
+each blob through `EncodedObjectSize` and inspects blobs smaller than 1024
+bytes for LFS pointers. It gives the builder the file size and an open
+function with `AddFileFunc`. During `Build`, the builder opens each Git blob
+or LFS object one time, compresses it one pcluster at a time, and spools the
 compressed blocks to a temp file (`WithSpoolDir`, the same directory as the
 image). As a result, the memory for a build does not depend on the size of
 the tree. `TestEnsureMemory` builds 256 MiB of content with a live heap of
@@ -116,7 +129,7 @@ A snapshot id is a tree hash, not the digest of the bytes. The cache therefore
 uses `GetChecked`, whose fetch returns the digest from the `erofs-sha256`
 metadata. A body that does not match is refused.
 
-The cache id is `erofs-v1-<tree>`, with no repository prefix. Two repositories
+The cache id is `erofs-v2-<tree>`, with no repository prefix. Two repositories
 that hold one tree share one local file. This is deduplication and not
 leakage. A caller gets to the id only through a tree that its own repository
 holds.

@@ -63,7 +63,7 @@ var (
 	maxConcurrentPushes = flag.Int("max-concurrent-pushes", 4, "pushes allowed to unpack a packfile at the same time; each one costs roughly 400 MiB of resident set for a large repository, so this is what bounds memory under concurrent pushes; 0 disables the limit")
 	pushQueueTimeout    = flag.Duration("push-queue-timeout", 2*time.Minute, "how long a push waits for a slot before it fails")
 
-	allowLFS      = flag.Bool("allow-lfs", false, "serve the Git LFS API; object bytes move directly between the client and the bucket over presigned URLs, never through this daemon")
+	allowLFS      = flag.Bool("allow-lfs", false, "serve the Git LFS API; client transfers use presigned bucket URLs, and erofs snapshots can read verified LFS objects")
 	allowLFSLocks = flag.Bool("allow-lfs-locks", true, "serve the Git LFS file locking API; without a user store every anonymous caller is the same owner, so locking is advisory only")
 	externalURL   = flag.String("external-url", "", "public base URL of this server, such as https://git.example.com; required for Git LFS over ssh:// because git-lfs-authenticate has to name the HTTP API")
 	lfsURLTTL     = flag.Duration("lfs-url-ttl", 15*time.Minute, "how long a presigned Git LFS transfer URL stays valid")
