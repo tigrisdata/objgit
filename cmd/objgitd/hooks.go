@@ -34,9 +34,10 @@ type refUpdate struct {
 	New  plumbing.Hash
 }
 
-// snapshotRefs returns the current hash of every branch ref in st. go-git's
-// transport.ReceivePack does not report which refs it changed, so we diff a
-// snapshot taken before the push against one taken after.
+// snapshotRefs returns the current hash of every branch and tag ref in st.
+// go-git's transport.ReceivePack does not report which refs it changed, so we
+// diff a snapshot taken before the push against one taken after. Hooks use
+// the branches only (see runHooks); erofs snapshots use both.
 func snapshotRefs(st storage.Storer) (map[plumbing.ReferenceName]plumbing.Hash, error) {
 	it, err := st.IterReferences()
 	if err != nil {
@@ -46,7 +47,7 @@ func snapshotRefs(st storage.Storer) (map[plumbing.ReferenceName]plumbing.Hash, 
 
 	out := map[plumbing.ReferenceName]plumbing.Hash{}
 	err = it.ForEach(func(r *plumbing.Reference) error {
-		if r.Type() == plumbing.HashReference && r.Name().IsBranch() {
+		if r.Type() == plumbing.HashReference && (r.Name().IsBranch() || r.Name().IsTag()) {
 			out[r.Name()] = r.Hash()
 		}
 		return nil
@@ -57,7 +58,7 @@ func snapshotRefs(st storage.Storer) (map[plumbing.ReferenceName]plumbing.Hash, 
 	return out, nil
 }
 
-// diffRefs computes the branch ref changes between two snapshots.
+// diffRefs computes the ref changes between two snapshots.
 func diffRefs(before, after map[plumbing.ReferenceName]plumbing.Hash) []refUpdate {
 	var updates []refUpdate
 	for name, newHash := range after {
@@ -77,11 +78,12 @@ func diffRefs(before, after map[plumbing.ReferenceName]plumbing.Hash) []refUpdat
 	return updates
 }
 
-// receivePack runs the receive-pack service and, when hooks are enabled, fires
-// the repository's receive-pack hook for each updated branch once the push
-// succeeds — synchronously, streaming hook output to the client over the
-// sideband progress channel (rendered as "remote: " lines) before the response
-// stream is closed. st is both what the service writes through and the storer
+// receivePack runs the receive-pack service. Once the push succeeds, it builds
+// an erofs snapshot of each updated ref tip when snapshots are enabled (see
+// runSnapshots), then fires the repository's receive-pack hook for each
+// updated branch when hooks are enabled. Both run synchronously, streaming
+// their output to the client over the sideband progress channel (rendered as
+// "remote: " lines) before the response stream is closed. st is both what the service writes through and the storer
 // used for ref snapshots and hook checkouts — all three transports now share the
 // same Scanner-bounded PackfileWriter path (see writePack), so no transport needs
 // a capability-hiding wrapper.
@@ -90,7 +92,7 @@ func diffRefs(before, after map[plumbing.ReferenceName]plumbing.Hash) []refUpdat
 // both land here, and git:// never serves receive-pack at all — so it is where
 // the push concurrency cap is applied, via the d.pushes.admit seam.
 func (d *daemon) receivePack(ctx context.Context, st storage.Storer, repoPath string, r io.ReadCloser, w io.WriteCloser, req *transport.ReceivePackRequest) error {
-	if !d.allowHooks {
+	if !d.allowHooks && !d.snapshots {
 		err := receivePackStreaming(ctx, st, r, w, req, d.pushes.admit, nil)
 		d.healHEADAfterPush(err, st, repoPath)
 		return err
@@ -98,24 +100,30 @@ func (d *daemon) receivePack(ctx context.Context, st storage.Storer, repoPath st
 
 	before, err := snapshotRefs(st)
 	if err != nil {
-		slog.Warn("hook: ref snapshot before push failed", "path", repoPath, "err", err)
+		slog.Warn("push: ref snapshot before push failed", "path", repoPath, "err", err)
 	}
 
 	// onUpdated runs after refs are updated and report-status is sent, but
-	// before the response stream closes, so hook output reaches the client live.
+	// before the response stream closes, so snapshot and hook output reaches
+	// the client live.
 	// progress is the sideband band-2 writer, or nil when the client did not
 	// negotiate sideband (hooks then fall back to logging only).
 	onUpdated := func(progress io.Writer) {
 		after, err := snapshotRefs(st)
 		if err != nil {
-			slog.Error("hook: ref snapshot after push failed", "path", repoPath, "err", err)
+			slog.Error("push: ref snapshot after push failed", "path", repoPath, "err", err)
 			return
 		}
 		updates := diffRefs(before, after)
 		if len(updates) == 0 {
 			return
 		}
-		d.runHooks(repoPath, "receive-pack", st, updates, progress)
+		if d.snapshots {
+			d.runSnapshots(repoPath, st, updates, progress)
+		}
+		if d.allowHooks {
+			d.runHooks(repoPath, "receive-pack", st, updates, progress)
+		}
 	}
 
 	err = receivePackStreaming(ctx, st, r, w, req, d.pushes.admit, onUpdated)
@@ -141,8 +149,8 @@ func (d *daemon) healHEADAfterPush(recvErr error, st storage.Storer, repoPath st
 // streaming each hook's output to progress (nil = log only).
 func (d *daemon) runHooks(repoPath, service string, st storage.Storer, updates []refUpdate, progress io.Writer) {
 	for _, u := range updates {
-		if u.New.IsZero() {
-			continue // branch deletion: nothing to check out
+		if u.New.IsZero() || !u.Name.IsBranch() {
+			continue // a deletion, or a tag: hooks run for branches only
 		}
 		d.runHook(repoPath, service, st, u, progress)
 	}
