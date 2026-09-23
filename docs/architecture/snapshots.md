@@ -32,12 +32,12 @@ the loose object reads, and the loose ref listing therefore never see it.
 
 Each image carries user metadata:
 
-| Metadata key   | Value                                                     |
-| -------------- | --------------------------------------------------------- |
-| `erofs-format` | `1`                                                       |
+| Metadata key   | Value                                                                              |
+| -------------- | ---------------------------------------------------------------------------------- |
+| `erofs-format` | `1`                                                                                |
 | `erofs-sha256` | The hex SHA-256 of the image. The cache rejects a download that does not match it. |
-| `git-tree`     | The hex tree hash.                                        |
-| `erofs-files`  | The count of regular files.                               |
+| `git-tree`     | The hex tree hash.                                                                 |
+| `erofs-files`  | The count of regular files.                                                        |
 
 ## The mapping from git to EROFS
 
@@ -55,9 +55,9 @@ is not initialized.
 
 Two EROFS limits are stricter than git:
 
-| Limit               | EROFS      | Checked by                                          |
-| ------------------- | ---------- | --------------------------------------------------- |
-| Entry name length   | 255 bytes  | `Ensure`. The builder does not check it.            |
+| Limit               | EROFS      | Checked by                                                    |
+| ------------------- | ---------- | ------------------------------------------------------------- |
+| Entry name length   | 255 bytes  | `Ensure`. The builder does not check it.                      |
 | Symlink target size | 1020 bytes | `Ensure`. The builder writes more, but the reader refuses it. |
 
 If an entry is over a limit, the build fails with an error that names the
@@ -154,11 +154,11 @@ storer without the methods skips snapshots.
 
 ## Flags
 
-| Flag                       | Default | Meaning                                                  |
-| -------------------------- | ------- | -------------------------------------------------------- |
-| `-erofs-snapshots`         | `true`  | Build an image for each updated ref tip after a push.    |
-| `-snapshot-timeout`        | `2m`    | Wall-clock limit for the snapshots of one push.          |
-| `-snapshot-cache-bytes`    | `2 GiB` | Disk budget for the snapshot cache. `0` disables the cache. |
+| Flag                       | Default | Meaning                                                                              |
+| -------------------------- | ------- | ------------------------------------------------------------------------------------ |
+| `-erofs-snapshots`         | `true`  | Build an image for each updated ref tip after a push.                                |
+| `-snapshot-timeout`        | `2m`    | Wall-clock limit for the snapshots of one push.                                      |
+| `-snapshot-cache-bytes`    | `2 GiB` | Disk budget for the snapshot cache. `0` disables the cache.                          |
 | `-snapshot-cache-max-idle` | `1h`    | The cache deletes an image that nobody opened for this long. `0` disables the sweep. |
 
 ## Known risks

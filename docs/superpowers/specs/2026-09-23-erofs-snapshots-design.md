@@ -14,14 +14,14 @@ now needs v0.8.0, for the streaming builder.
 
 These decisions come from the design discussion on 2026-09-23.
 
-| Question                 | Decision                                                                  |
-| ------------------------ | ------------------------------------------------------------------------- |
-| Which commits get images | The new tip of each updated branch and tag, on push. Other commits get an image on demand, through the same `Ensure` function, when a later feature asks for one. |
-| When the build runs      | Synchronously, inside the push, after report-status. A message queue replaces this later. |
-| Size limit               | None. Every tree gets an image. We measure first, then decide on a limit. |
-| Compression              | Zstandard, at the default level of the builder.                            |
+| Question                 | Decision                                                                                                                                                                                                          |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Which commits get images | The new tip of each updated branch and tag, on push. Other commits get an image on demand, through the same `Ensure` function, when a later feature asks for one.                                                 |
+| When the build runs      | Synchronously, inside the push, after report-status. A message queue replaces this later.                                                                                                                         |
+| Size limit               | None. Every tree gets an image. We measure first, then decide on a limit.                                                                                                                                         |
+| Compression              | Zstandard, at the default level of the builder.                                                                                                                                                                   |
 | How a reader gets bytes  | `Open` downloads the whole image into a local cache directory, next to the pack cache. The cache evicts least-recently-used images when it passes its byte budget, and on a timer when an image is idle too long. |
-| Builder memory           | Bounded. `Ensure` uses `AddFileFunc` from erofs v0.8.0, which implements [2026-09-23-erofs-streaming-builder-design.md](2026-09-23-erofs-streaming-builder-design.md). |
+| Builder memory           | Bounded. `Ensure` uses `AddFileFunc` from erofs v0.8.0, which implements [2026-09-23-erofs-streaming-builder-design.md](2026-09-23-erofs-streaming-builder-design.md).                                            |
 
 ## Non-goals
 
@@ -38,8 +38,8 @@ These decisions come from the design discussion on 2026-09-23.
 One new key family goes into the layout table in
 [../../architecture/tigris-storer.md](../../architecture/tigris-storer.md):
 
-| Key                               | Contents                               |
-| --------------------------------- | -------------------------------------- |
+| Key                               | Contents                                  |
+| --------------------------------- | ----------------------------------------- |
 | `snapshots/erofs/v1/<tree>.erofs` | One EROFS image of the git tree `<tree>`. |
 
 The key uses the **tree** hash, not the commit hash. Many commits can point at
@@ -62,25 +62,25 @@ see it.
 
 Each image carries user metadata:
 
-| Metadata key   | Value                                   |
-| -------------- | --------------------------------------- |
-| `erofs-format` | `1`                                     |
+| Metadata key   | Value                                                                                 |
+| -------------- | ------------------------------------------------------------------------------------- |
+| `erofs-format` | `1`                                                                                   |
 | `erofs-sha256` | The hex SHA-256 of the image bytes. The local cache uses it to reject a bad download. |
-| `git-tree`     | The hex tree hash.                      |
-| `erofs-files`  | The count of regular files.             |
+| `git-tree`     | The hex tree hash.                                                                    |
+| `erofs-files`  | The count of regular files.                                                           |
 
 The web UI finds an image in two steps. It resolves the commit to its tree
 through the git storer. Then it opens the key for that tree.
 
 ## The mapping from git to EROFS
 
-| Git entry mode    | EROFS entry                                    |
-| ----------------- | ---------------------------------------------- |
-| `040000` tree     | Directory, mode `0755`.                        |
-| `100644` blob     | Regular file, mode `0644`.                     |
-| `100755` blob     | Regular file, mode `0755`.                     |
-| `120000` symlink  | Symlink. The target is the blob content.       |
-| `160000` gitlink  | Empty directory, mode `0755`.                  |
+| Git entry mode   | EROFS entry                              |
+| ---------------- | ---------------------------------------- |
+| `040000` tree    | Directory, mode `0755`.                  |
+| `100644` blob    | Regular file, mode `0644`.               |
+| `100755` blob    | Regular file, mode `0755`.               |
+| `120000` symlink | Symlink. The target is the blob content. |
+| `160000` gitlink | Empty directory, mode `0755`.            |
 
 The gitlink rule is the same result that `git checkout` gives for a submodule
 that is not initialized. The image does not record the submodule commit. A
@@ -91,10 +91,10 @@ The owner and the group of every entry are 0. The root directory has mode
 
 Two EROFS limits are stricter than git:
 
-| Limit                | EROFS                   | Git             | Where the limit is |
-| -------------------- | ----------------------- | --------------- | ------------------ |
-| Entry name length    | 255 bytes               | No fixed limit  | `ondisk.NameLen`. The builder does not check it. `Validate` does. |
-| Symlink target size  | 1020 bytes (`NameLen*4`) | No fixed limit | `readSymlink` in `inode.go`. The builder writes a longer target, but the reader refuses it. |
+| Limit               | EROFS                    | Git            | Where the limit is                                                                          |
+| ------------------- | ------------------------ | -------------- | ------------------------------------------------------------------------------------------- |
+| Entry name length   | 255 bytes                | No fixed limit | `ondisk.NameLen`. The builder does not check it. `Validate` does.                           |
+| Symlink target size | 1020 bytes (`NameLen*4`) | No fixed limit | `readSymlink` in `inode.go`. The builder writes a longer target, but the reader refuses it. |
 
 `Ensure` checks both limits before it adds the entry. If an entry is over a
 limit, the build fails with an error that names the path. It does not skip the
@@ -274,12 +274,12 @@ functions, so its behavior does not change.
    a parameter, and `NewPackCache` leaves it nil. The cache calls it with one
    of these events:
 
-   | Event          | When                                                 |
-   | -------------- | ---------------------------------------------------- |
-   | `hit`          | `GetChecked` returns a file with no download.         |
-   | `miss`         | `GetChecked` starts a download.                       |
-   | `evict_budget` | `evictLocked` unlinks an entry to meet the budget.    |
-   | `evict_idle`   | `EvictIdle` unlinks an entry.                         |
+   | Event          | When                                               |
+   | -------------- | -------------------------------------------------- |
+   | `hit`          | `GetChecked` returns a file with no download.      |
+   | `miss`         | `GetChecked` starts a download.                    |
+   | `evict_budget` | `evictLocked` unlinks an entry to meet the budget. |
+   | `evict_idle`   | `EvictIdle` unlinks an entry.                      |
 
    The callback runs outside the cache lock. `main.go` wires it to
    `metrics.ObserveSnapshotCache`.
@@ -300,8 +300,7 @@ If the storer has no snapshot cache, `OpenSnapshot` downloads the image to a
 private temp file and unlinks it at once. The returned descriptor is the only
 reference. This is the same fallback that `fetchWholePack` uses.
 
-`main.go` makes the snapshot cache when `-snapshot-cache-bytes` is more than
-0. It starts one goroutine in the errgroup. The goroutine calls
+`main.go` makes the snapshot cache when `-snapshot-cache-bytes` is more than 0. It starts one goroutine in the errgroup. The goroutine calls
 `EvictIdle(*snapshotCacheMaxIdle)` every `*snapshotCacheMaxIdle / 4`, and
 stops when the context is done. At shutdown, `main.go` calls `Cleanup` on the
 snapshot cache, next to the call for the pack cache.
@@ -310,11 +309,11 @@ snapshot cache, next to the call for the pack cache.
 
 ### Flags
 
-| Flag                       | Default | Environment               | Meaning                          |
-| -------------------------- | ------- | ------------------------- | -------------------------------- |
-| `-erofs-snapshots`         | `true`  | `EROFS_SNAPSHOTS`         | Build an image for each updated ref tip after a push. |
-| `-snapshot-timeout`        | `2m`    | `SNAPSHOT_TIMEOUT`        | Wall-clock limit for the snapshots of one push. |
-| `-snapshot-cache-bytes`    | `2 GiB` | `SNAPSHOT_CACHE_BYTES`    | Disk budget for the local snapshot cache. `0` disables the cache. |
+| Flag                       | Default | Environment               | Meaning                                                                                   |
+| -------------------------- | ------- | ------------------------- | ----------------------------------------------------------------------------------------- |
+| `-erofs-snapshots`         | `true`  | `EROFS_SNAPSHOTS`         | Build an image for each updated ref tip after a push.                                     |
+| `-snapshot-timeout`        | `2m`    | `SNAPSHOT_TIMEOUT`        | Wall-clock limit for the snapshots of one push.                                           |
+| `-snapshot-cache-bytes`    | `2 GiB` | `SNAPSHOT_CACHE_BYTES`    | Disk budget for the local snapshot cache. `0` disables the cache.                         |
 | `-snapshot-cache-max-idle` | `1h`    | `SNAPSHOT_CACHE_MAX_IDLE` | The cache deletes an image that nobody opened for this long. `0` disables the idle sweep. |
 
 `*daemon` gets two fields, `snapshots bool` and `snapshotTimeout
@@ -379,13 +378,13 @@ New series go in `internal/metrics`, with two helpers,
 `ObserveSnapshotCache(event string)`. The second helper maps each cache event
 to one of the two cache counters:
 
-| Series                                   | Type      | Labels   | Meaning                  |
-| ---------------------------------------- | --------- | -------- | ------------------------ |
-| `objgit_snapshot_builds_total`           | counter   | `result` | `built`, `exists`, or `error`. |
-| `objgit_snapshot_build_duration_seconds` | histogram | none     | Time for one `Ensure` that built an image. |
+| Series                                   | Type      | Labels   | Meaning                                     |
+| ---------------------------------------- | --------- | -------- | ------------------------------------------- |
+| `objgit_snapshot_builds_total`           | counter   | `result` | `built`, `exists`, or `error`.              |
+| `objgit_snapshot_build_duration_seconds` | histogram | none     | Time for one `Ensure` that built an image.  |
 | `objgit_snapshot_image_bytes`            | histogram | none     | Size of one built image, after compression. |
-| `objgit_snapshot_cache_opens_total`      | counter   | `result` | `hit` or `miss` for each `OpenSnapshot`. |
-| `objgit_snapshot_cache_evictions_total`  | counter   | `reason` | `budget` or `idle`.      |
+| `objgit_snapshot_cache_opens_total`      | counter   | `result` | `hit` or `miss` for each `OpenSnapshot`.    |
+| `objgit_snapshot_cache_evictions_total`  | counter   | `reason` | `budget` or `idle`.                         |
 
 The size histogram is the data for the later decision about a size limit. Use
 exponential buckets from 64 KiB to 16 GiB. The cache counters are the data for
@@ -418,31 +417,31 @@ All tests are table-driven with `tt`.
 `internal/snapshot` unit tests use `memory.NewStorage()` for git objects and a
 map-backed `Store`:
 
-| Test                     | What it proves                                           |
-| ------------------------ | -------------------------------------------------------- |
-| `TestEnsureMapsModes`    | Every row of the mapping table. It opens the image with `Open` and compares the mode, the content, and the symlink target of each entry. |
-| `TestEnsureValidates`    | `erofs.Validate` returns no errors for each fixture tree. |
-| `TestEnsureCompresses`   | A tree with one large text file gives an image smaller than the file. The file reads back unchanged. |
-| `TestEnsureDeterministic`| Two builds of one tree give identical bytes and the same `erofs-sha256`. |
-| `TestEnsureExists`       | A second `Ensure` returns `exists` and calls `PutSnapshot` zero times. |
-| `TestEnsureLimits`       | A 256-byte name, and a 1021-byte symlink target, each give an error that names the path, and no `PutSnapshot` call. |
-| `TestEnsureEmptyTree`    | The empty tree gives a valid image with a root directory only. |
-| `TestOpenMissing`        | `Open` of a tree with no image returns `fs.ErrNotExist`. |
+| Test                      | What it proves                                                                                                                           |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `TestEnsureMapsModes`     | Every row of the mapping table. It opens the image with `Open` and compares the mode, the content, and the symlink target of each entry. |
+| `TestEnsureValidates`     | `erofs.Validate` returns no errors for each fixture tree.                                                                                |
+| `TestEnsureCompresses`    | A tree with one large text file gives an image smaller than the file. The file reads back unchanged.                                     |
+| `TestEnsureDeterministic` | Two builds of one tree give identical bytes and the same `erofs-sha256`.                                                                 |
+| `TestEnsureExists`        | A second `Ensure` returns `exists` and calls `PutSnapshot` zero times.                                                                   |
+| `TestEnsureLimits`        | A 256-byte name, and a 1021-byte symlink target, each give an error that names the path, and no `PutSnapshot` call.                      |
+| `TestEnsureEmptyTree`     | The empty tree gives a valid image with a root directory only.                                                                           |
+| `TestOpenMissing`         | `Open` of a tree with no image returns `fs.ErrNotExist`.                                                                                 |
 
 `internal/storage/tigris` tests use the existing `fakeS3`:
 
-| Test                                  | What it proves                                    |
-| ------------------------------------- | ------------------------------------------------- |
-| `TestPutSnapshotKeyAndMetadata`       | The key is under the scoped prefix, and the metadata is present. |
-| `TestStatSnapshotNotFound`            | A 404 becomes `fs.ErrNotExist`.                    |
-| `TestOpenSnapshotCachesDownload`      | Two `OpenSnapshot` calls send one `GetObject`. Two scoped storers with the same tree also send one. |
-| `TestOpenSnapshotRejectsBadDigest`    | A body that does not match `erofs-sha256` gives an error, and the cache keeps nothing. |
-| `TestOpenSnapshotMissingDigest`       | An object with no `erofs-sha256` gives an error.   |
-| `TestOpenSnapshotNoCache`             | With no snapshot cache, `OpenSnapshot` still returns a readable file. |
-| `TestPackCacheEvictIdle`              | `EvictIdle` removes only settled entries older than the limit. An open descriptor stays readable after its entry is evicted. |
-| `TestPackCacheGetUnchanged`           | `Get` still refuses bytes whose SHA-256 is not `id`. |
-| `TestPackCacheObserver`               | The observer gets `miss`, then `hit`, then `evict_budget` and `evict_idle`, each in the correct case. |
-| `TestSnapshotKeysInvisible`           | A snapshot key does not appear in the pack index or in `IterReferences`. |
+| Test                               | What it proves                                                                                                               |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `TestPutSnapshotKeyAndMetadata`    | The key is under the scoped prefix, and the metadata is present.                                                             |
+| `TestStatSnapshotNotFound`         | A 404 becomes `fs.ErrNotExist`.                                                                                              |
+| `TestOpenSnapshotCachesDownload`   | Two `OpenSnapshot` calls send one `GetObject`. Two scoped storers with the same tree also send one.                          |
+| `TestOpenSnapshotRejectsBadDigest` | A body that does not match `erofs-sha256` gives an error, and the cache keeps nothing.                                       |
+| `TestOpenSnapshotMissingDigest`    | An object with no `erofs-sha256` gives an error.                                                                             |
+| `TestOpenSnapshotNoCache`          | With no snapshot cache, `OpenSnapshot` still returns a readable file.                                                        |
+| `TestPackCacheEvictIdle`           | `EvictIdle` removes only settled entries older than the limit. An open descriptor stays readable after its entry is evicted. |
+| `TestPackCacheGetUnchanged`        | `Get` still refuses bytes whose SHA-256 is not `id`.                                                                         |
+| `TestPackCacheObserver`            | The observer gets `miss`, then `hit`, then `evict_budget` and `evict_idle`, each in the correct case.                        |
+| `TestSnapshotKeysInvisible`        | A snapshot key does not appear in the pack index or in `IterReferences`.                                                     |
 
 `cmd/objgitd` protocol tests shell out to `git`, gated with
 `exec.LookPath("git")`:
@@ -450,7 +449,7 @@ map-backed `Store`:
 - `TestSmartHTTPPushSnapshots`: push a branch and an annotated tag on one
   commit, with `-erofs-snapshots` on. Exactly one image exists. A file reads
   back through `snapshot.Open`. The client output contains the `remote:
-  objgit: snapshot` lines.
+objgit: snapshot` lines.
 - `TestPushSnapshotsOff`: no image exists after a push with the flag off.
 - `TestHooksIgnoreTags`: a pushed tag does not run the hook, now that
   `snapshotRefs` returns tags.

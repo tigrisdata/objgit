@@ -60,17 +60,17 @@ repository it created, and cleanup is yours to run.
 
 Each run gets its own timestamped directory under `-out`:
 
-| File                     | What it holds                                                        |
-| ------------------------ | -------------------------------------------------------------------- |
-| `report.md`              | The tables. Start here.                                              |
-| `samples.csv`            | One row per sample, tagged with phase and repository. Plot-ready.    |
-| `heap-baseline.pb.gz`    | Settled heap before any push.                                        |
-| `heap-peak-*.pb.gz`      | Heap at each new resident-set high-water mark.                       |
-| `heap-final.pb.gz`       | Settled heap after every push.                                       |
-| `allocs-final.pb.gz`     | Total allocation over the run.                                       |
-| `daemon.log`             | The daemon's own JSON log.                                           |
-| `repos.txt`              | Every repository created, for cleanup.                               |
-| `source.git`, `objgitd`  | The mirror and the binary under test.                                |
+| File                    | What it holds                                                     |
+| ----------------------- | ----------------------------------------------------------------- |
+| `report.md`             | The tables. Start here.                                           |
+| `samples.csv`           | One row per sample, tagged with phase and repository. Plot-ready. |
+| `heap-baseline.pb.gz`   | Settled heap before any push.                                     |
+| `heap-peak-*.pb.gz`     | Heap at each new resident-set high-water mark.                    |
+| `heap-final.pb.gz`      | Settled heap after every push.                                    |
+| `allocs-final.pb.gz`    | Total allocation over the run.                                    |
+| `daemon.log`            | The daemon's own JSON log.                                        |
+| `repos.txt`             | Every repository created, for cleanup.                            |
+| `source.git`, `objgitd` | The mirror and the binary under test.                             |
 
 The two commands that get the most out of a run:
 
@@ -99,20 +99,20 @@ go tool pprof -http=: <run>/heap-peak-<largest>.pb.gz
 
 ## Flags worth knowing
 
-| Flag                    | Default              | Meaning                                                                  |
-| ----------------------- | -------------------- | ------------------------------------------------------------------------ |
-| `-repo`                 | `$HOME/Code/Xe/x`    | Repository to push. Mirror-cloned once, never written to.                |
-| `-org`                  | `benchtest`          | Org segment every benchmark repository is created under.                 |
-| `-seq-pushes`           | `5`                  | Sequential pushes, each to a fresh repository.                           |
-| `-conc-steps`           | `1,2,4,8`            | Concurrency levels to sweep. Empty skips the sweep.                      |
-| `-sample-interval`      | `250ms`              | How often `/proc` and `/metrics` are read.                               |
-| `-idle-gap`             | `5s`                 | Idle time between pushes, so memory can settle.                          |
-| `-window-slack`         | `0` (uses idle gap)  | How far outside a push's wall clock memory is still attributed to it.    |
-| `-peak-growth`          | `0.05`               | Fractional rise in resident set that triggers a heap capture.            |
-| `-peak-cooldown`        | `2s`                 | Minimum time between two peak captures.                                  |
-| `-daemon-binary`        | build it             | Prebuilt `objgitd` to test instead of building `./cmd/objgitd`.          |
-| `-daemon-allow-hooks`   | `false`              | Off so hook cost is not mistaken for push cost.                          |
-| `-daemon-erofs-snapshots` | `false`            | Off so snapshot cost is not mistaken for push cost.                      |
+| Flag                      | Default             | Meaning                                                               |
+| ------------------------- | ------------------- | --------------------------------------------------------------------- |
+| `-repo`                   | `$HOME/Code/Xe/x`   | Repository to push. Mirror-cloned once, never written to.             |
+| `-org`                    | `benchtest`         | Org segment every benchmark repository is created under.              |
+| `-seq-pushes`             | `5`                 | Sequential pushes, each to a fresh repository.                        |
+| `-conc-steps`             | `1,2,4,8`           | Concurrency levels to sweep. Empty skips the sweep.                   |
+| `-sample-interval`        | `250ms`             | How often `/proc` and `/metrics` are read.                            |
+| `-idle-gap`               | `5s`                | Idle time between pushes, so memory can settle.                       |
+| `-window-slack`           | `0` (uses idle gap) | How far outside a push's wall clock memory is still attributed to it. |
+| `-peak-growth`            | `0.05`              | Fractional rise in resident set that triggers a heap capture.         |
+| `-peak-cooldown`          | `2s`                | Minimum time between two peak captures.                               |
+| `-daemon-binary`          | build it            | Prebuilt `objgitd` to test instead of building `./cmd/objgitd`.       |
+| `-daemon-allow-hooks`     | `false`             | Off so hook cost is not mistaken for push cost.                       |
+| `-daemon-erofs-snapshots` | `false`             | Off so snapshot cost is not mistaken for push cost.                   |
 
 All flags take an environment fallback through `flagenv`, in UPPER_SNAKE. The
 daemon-facing flags are prefixed `-daemon-` so they do not collide with

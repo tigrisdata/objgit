@@ -38,22 +38,22 @@
 
 ## File Structure
 
-| Path | Task | Responsibility |
-| ---- | ---- | -------------- |
-| `internal/snapshot/snapshot.go` | 0 | Package doc, `Store`, `File`, `Key`, `CacheID`, metadata constants. |
-| `internal/snapshot/ensure.go` | 1 | `Ensure`, `Result`, the tree walk. |
-| `internal/snapshot/open.go` | 1 | `Snapshot`, `Open`. |
-| `internal/snapshot/memstore.go` | 1 | `MemStore`, a map-backed `Store` for tests in any package. |
-| `internal/snapshot/ensure_test.go`, `open_test.go`, `fixture_test.go` | 1 | Tests and the git fixture helper. |
-| `internal/storage/tigris/packcache.go` (+ `_test.go`) | 2 | `GetChecked`, `EvictIdle`, observer, suffix, `NewSnapshotCache`. |
-| `internal/metrics/metrics.go` | 3 | Five series, two helpers. |
-| `docs/architecture/metrics.md` | 3 | The new series. |
-| `internal/storage/tigris/snapshot.go` (+ `_test.go`) | 4 | `*Storer` implements `snapshot.Store`. |
-| `internal/storage/tigris/tigris.go` | 4 | `snapCache` field and `WithSnapshotCache`. |
-| `cmd/objgitd/snapshots.go` (+ `_test.go`) | 5 | `runSnapshots`, `peelToTree`, progress formatting. |
-| `cmd/objgitd/hooks.go`, `git_protocol.go`, `hooks_test.go` | 5 | Gate, tags in `snapshotRefs`, branch filter in `runHooks`, daemon fields. |
-| `cmd/objgitd/main.go` | 6 | Flags, cache, sweep goroutine, cleanup. |
-| `docs/architecture/snapshots.md`, `tigris-storer.md`, `README.md`, `AGENTS.md` | 7 | Documentation. |
+| Path                                                                           | Task | Responsibility                                                            |
+| ------------------------------------------------------------------------------ | ---- | ------------------------------------------------------------------------- |
+| `internal/snapshot/snapshot.go`                                                | 0    | Package doc, `Store`, `File`, `Key`, `CacheID`, metadata constants.       |
+| `internal/snapshot/ensure.go`                                                  | 1    | `Ensure`, `Result`, the tree walk.                                        |
+| `internal/snapshot/open.go`                                                    | 1    | `Snapshot`, `Open`.                                                       |
+| `internal/snapshot/memstore.go`                                                | 1    | `MemStore`, a map-backed `Store` for tests in any package.                |
+| `internal/snapshot/ensure_test.go`, `open_test.go`, `fixture_test.go`          | 1    | Tests and the git fixture helper.                                         |
+| `internal/storage/tigris/packcache.go` (+ `_test.go`)                          | 2    | `GetChecked`, `EvictIdle`, observer, suffix, `NewSnapshotCache`.          |
+| `internal/metrics/metrics.go`                                                  | 3    | Five series, two helpers.                                                 |
+| `docs/architecture/metrics.md`                                                 | 3    | The new series.                                                           |
+| `internal/storage/tigris/snapshot.go` (+ `_test.go`)                           | 4    | `*Storer` implements `snapshot.Store`.                                    |
+| `internal/storage/tigris/tigris.go`                                            | 4    | `snapCache` field and `WithSnapshotCache`.                                |
+| `cmd/objgitd/snapshots.go` (+ `_test.go`)                                      | 5    | `runSnapshots`, `peelToTree`, progress formatting.                        |
+| `cmd/objgitd/hooks.go`, `git_protocol.go`, `hooks_test.go`                     | 5    | Gate, tags in `snapshotRefs`, branch filter in `runHooks`, daemon fields. |
+| `cmd/objgitd/main.go`                                                          | 6    | Flags, cache, sweep goroutine, cleanup.                                   |
+| `docs/architecture/snapshots.md`, `tigris-storer.md`, `README.md`, `AGENTS.md` | 7    | Documentation.                                                            |
 
 Dependency order: Task 0 → (Tasks 1, 2, 3 in parallel) → (Task 4 after 2; Task 5 after 1 and 3) → (Tasks 6 and 7 after 4 and 5).
 
@@ -62,10 +62,12 @@ Dependency order: Task 0 → (Tasks 1, 2, 3 in parallel) → (Task 4 after 2; Ta
 ### Task 0: Scaffold (the controller does this before any fan-out)
 
 **Files:**
+
 - Modify: `go.mod`, `go.sum`
 - Create: `internal/snapshot/snapshot.go`
 
 **Interfaces:**
+
 - Produces: `snapshot.Store`, `snapshot.File`, `snapshot.Key(plumbing.Hash) string`, `snapshot.CacheID(key string) string`, `snapshot.FormatVersion`, `snapshot.MetaFormat`, `snapshot.MetaSHA256`, `snapshot.MetaTree`, `snapshot.MetaFiles`.
 
 - [ ] **Step 1: Add the dependency**
@@ -160,10 +162,12 @@ git commit -m "feat(snapshot): add the Store interface and key layout" -m "Signe
 ### Task 1: `Ensure`, `Open`, and `MemStore`
 
 **Files:**
+
 - Create: `internal/snapshot/ensure.go`, `internal/snapshot/open.go`, `internal/snapshot/memstore.go`
 - Test: `internal/snapshot/fixture_test.go`, `internal/snapshot/ensure_test.go`, `internal/snapshot/open_test.go`
 
 **Interfaces:**
+
 - Consumes: everything from Task 0.
 - Produces:
   - `type Result struct { Key string; Status string; Files int; Bytes int64; Elapsed time.Duration }`
@@ -1054,10 +1058,12 @@ git commit -m "feat(snapshot): build and open erofs images of git trees" -m "Sig
 ### Task 2: `PackCache` additions
 
 **Files:**
+
 - Modify: `internal/storage/tigris/packcache.go`, `internal/storage/tigris/packindex.go` (only the `verifiedCopy` call in `openWholePack`)
 - Test: `internal/storage/tigris/packcache_test.go`
 
 **Interfaces:**
+
 - Produces:
   - `func NewSnapshotCache(parent string, maxBytes int64, observe func(event string)) (*PackCache, error)`
   - `func (c *PackCache) GetChecked(id string, fetch func(io.Writer) (wantSHA256 string, err error)) (*os.File, error)`
@@ -1349,10 +1355,12 @@ git commit -m "feat(storage/tigris): let the pack cache serve snapshot images" -
 ### Task 3: Metrics
 
 **Files:**
+
 - Modify: `internal/metrics/metrics.go`, `docs/architecture/metrics.md`
 - Test: `internal/metrics/metrics_test.go` (create it if it does not exist)
 
 **Interfaces:**
+
 - Produces:
   - `func ObserveSnapshot(result string, dur time.Duration, bytes int64)`: `result` is `"built"`, `"exists"`, or `"error"`. The two histograms observe only for `"built"`.
   - `func ObserveSnapshotCache(event string)`: `"hit"` and `"miss"` go to `objgit_snapshot_cache_opens_total{result}`. `"evict_budget"` and `"evict_idle"` go to `objgit_snapshot_cache_evictions_total{reason}` with `budget` and `idle`. Other events are ignored.
@@ -1504,6 +1512,7 @@ Expected: PASS.
 - [ ] **Step 5: Document**
 
 Invoke the `simple-english` skill. In `docs/architecture/metrics.md`:
+
 - Add `ObserveSnapshot` and `ObserveSnapshotCache` to the helper table.
 - Add a section `## Snapshots` with a table of the five series (type, labels, meaning), copied from the spec's Metrics table.
 - Add one sentence: the size histogram is the data for a later decision about a size limit.
@@ -1520,10 +1529,12 @@ git commit -m "feat(metrics): add erofs snapshot series" -m "Signed-off-by: Xe I
 ### Task 4: `*tigris.Storer` implements `snapshot.Store`
 
 **Files:**
+
 - Create: `internal/storage/tigris/snapshot.go`, `internal/storage/tigris/snapshot_test.go`
 - Modify: `internal/storage/tigris/tigris.go` (one field, one option, one line in the `Scoped` doc comment)
 
 **Interfaces:**
+
 - Consumes: `snapshot.Store`, `snapshot.File`, `snapshot.CacheID`, `snapshot.MetaSHA256` (Task 0); `(*PackCache).GetChecked`, `NewSnapshotCache` (Task 2).
 - Produces: `func WithSnapshotCache(c *PackCache) Option`; `*Storer` satisfies `snapshot.Store`.
 
@@ -1902,10 +1913,12 @@ git commit -m "feat(storage/tigris): store erofs snapshots next to the repositor
 ### Task 5: The push path
 
 **Files:**
+
 - Create: `cmd/objgitd/snapshots.go`, `cmd/objgitd/snapshots_test.go`
 - Modify: `cmd/objgitd/hooks.go` (`snapshotRefs`, `receivePack`, `runHooks`), `cmd/objgitd/git_protocol.go` (daemon fields), `cmd/objgitd/hooks_test.go` (one new test)
 
 **Interfaces:**
+
 - Consumes: `snapshot.Ensure`, `snapshot.Open`, `snapshot.Store`, `snapshot.NewMemStore`, `snapshot.Key`, `snapshot.StatusBuilt`, `snapshot.StatusExists` (Task 1); `metrics.ObserveSnapshot` (Task 3).
 - Produces: daemon fields `snapshots bool`, `snapshotTimeout time.Duration`, `snapshotTmpDir string`; `func (d *daemon) runSnapshots(repoPath string, st storage.Storer, updates []refUpdate, progress io.Writer)`; `func peelToTree(st storer.EncodedObjectStorer, h plumbing.Hash) (plumbing.Hash, bool, error)`.
 
@@ -2162,6 +2175,7 @@ func writeTag(t *testing.T, st *memory.Storage, name string, target plumbing.Has
 Use the real `filemode.Regular` constant in `writeCommit` instead of `0o100644` if the literal does not compile. If `runGit` does not return the output, use `exec.Command("git", "-C", work, "rev-parse", "HEAD^{tree}").Output()`.
 
 Add `TestHooksIgnoreTags` to `hooks_test.go`, next to the existing HTTP hook test. Copy its setup (the log capture, the daemon with `allowHooks: true`, and the hook script). Then:
+
 1. Push `main` and make sure that the logs contain `hook: running` once.
 2. Run `git tag -a v1 -m v1`, and push `v1` only.
 3. Make sure that the count of `hook: running` in the logs is still 1.
@@ -2394,9 +2408,11 @@ git commit -m "feat(objgitd): build erofs snapshots of pushed ref tips" -m "Sign
 ### Task 6: `main.go` wiring
 
 **Files:**
+
 - Modify: `cmd/objgitd/main.go`
 
 **Interfaces:**
+
 - Consumes: `tigris.NewSnapshotCache`, `tigris.WithSnapshotCache`, `(*PackCache).EvictIdle`, `(*PackCache).Cleanup` (Tasks 2, 4); `metrics.ObserveSnapshotCache` (Task 3); daemon fields (Task 5).
 
 - [ ] **Step 1: Add the flags**, after `packCacheBytes`:
@@ -2485,6 +2501,7 @@ git commit -m "feat(objgitd): wire erofs snapshot flags and cache" -m "Signed-of
 ### Task 7: Documentation
 
 **Files:**
+
 - Create: `docs/architecture/snapshots.md`
 - Modify: `docs/architecture/tigris-storer.md`, `docs/architecture/README.md`, `AGENTS.md`
 
@@ -2493,6 +2510,7 @@ Invoke the `simple-english` skill before you write. Copy facts from the spec. Do
 - [ ] **Step 1: Write `docs/architecture/snapshots.md`**
 
 Sections, in this order. Each one is descriptive text, with tables where the spec has tables:
+
 1. `# erofs snapshots (internal/snapshot)`: what the feature does, in three sentences. Name the flag `-erofs-snapshots`, which is off by default.
 2. `## Object layout`: the key, why it is the tree hash, the `v1` rule, and the metadata table.
 3. `## The mapping from git to EROFS`: the mode table, the gitlink rule, and the two limits table.

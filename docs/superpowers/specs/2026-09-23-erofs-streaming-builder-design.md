@@ -76,14 +76,14 @@ Zstandard. Every test below compares the bytes of the two builds.
 
 `Build` (`builder.go:251`) runs these steps in this order:
 
-| Step | Function                         | Needs the file bytes? |
-| ---- | -------------------------------- | --------------------- |
-| 3    | `computeLayouts` (`builder.go:550`) | No. It uses only the length. |
-| 3b   | `tryCompressInodes` (`builder.go:533`) | Yes. It compresses each file to decide if it stays flat. |
-| 4    | `assignNIDs`                     | No. It uses the metadata sizes from steps 3 and 3b. |
-| 5    | `layoutDataBlocks` (`builder.go:688`) | No. It uses the length, or the count of compressed blocks. |
-| 6    | `writeMetadata` (`builder.go:747`) | Yes, for the inline tail of a flat file. |
-| 7    | `writeDataBlocks` (`builder.go:849`) | Yes. |
+| Step | Function                               | Needs the file bytes?                                      |
+| ---- | -------------------------------------- | ---------------------------------------------------------- |
+| 3    | `computeLayouts` (`builder.go:550`)    | No. It uses only the length.                               |
+| 3b   | `tryCompressInodes` (`builder.go:533`) | Yes. It compresses each file to decide if it stays flat.   |
+| 4    | `assignNIDs`                           | No. It uses the metadata sizes from steps 3 and 3b.        |
+| 5    | `layoutDataBlocks` (`builder.go:688`)  | No. It uses the length, or the count of compressed blocks. |
+| 6    | `writeMetadata` (`builder.go:747`)     | Yes, for the inline tail of a flat file.                   |
+| 7    | `writeDataBlocks` (`builder.go:849`)   | Yes.                                                       |
 
 Two facts make streaming possible:
 
@@ -104,10 +104,10 @@ There are two kinds of lazy file. The builder decides the kind from the size
 and the path alone, with the same test that `tryCompressFile` uses at its
 start:
 
-| Kind             | Test                                                         | When the builder opens it |
-| ---------------- | ------------------------------------------------------------ | ------------------------- |
-| Flat-only        | Compression is off, or the algorithm is not LZ4 or Zstandard, or `size <= blockSize`, or `isIncompressible(path, size)`. | At step 7. |
-| Candidate        | All other files.                                             | At step 3b.               |
+| Kind      | Test                                                                                                                     | When the builder opens it |
+| --------- | ------------------------------------------------------------------------------------------------------------------------ | ------------------------- |
+| Flat-only | Compression is off, or the algorithm is not LZ4 or Zstandard, or `size <= blockSize`, or `isIncompressible(path, size)`. | At step 7.                |
+| Candidate | All other files.                                                                                                         | At step 3b.               |
 
 ### Flat-only files
 
@@ -186,36 +186,36 @@ and once with `AddFileFunc`, and compares the bytes. It also runs `Validate`
 on the result and reads each file back through `Open`. Use a block size of
 4096, and use these files:
 
-| Case             | Content                         | Size          | What it covers                        |
-| ---------------- | ------------------------------- | ------------- | ------------------------------------- |
-| empty            | none                            | 0             | `open` is not called.                  |
-| tiny             | text                            | 1             | Flat inline, tail only.                |
-| max inline       | text                            | 4096 − 64     | The largest tail that fits in the inode block. |
-| over inline      | text                            | 4096 − 63     | The tail does not fit. Flat plain.     |
-| one block        | text                            | 4096          | Flat plain, no tail. Not a candidate.  |
-| block plus one   | text                            | 4097          | The smallest candidate.                |
-| multi block      | text                            | 3 × 4096 + 17 | Many groups and a tail.                |
-| random           | random bytes, `.bin` name       | 1 MiB + 5     | A candidate that falls back to flat from the spool. |
-| mixed groups     | 64 KiB text, then 64 KiB random | 128 KiB + 9   | Compressed and PLAIN groups in one file. |
-| known extension  | text, `.png` name               | 64 KiB        | Flat-only because of `isIncompressible`. |
-| large            | text                            | 10 MiB + 5    | The copy loops over many buffers.      |
-| mixed tree       | All of the above, in nested directories, with symlinks | — | The inode order and the offsets between files. |
+| Case            | Content                                                | Size          | What it covers                                      |
+| --------------- | ------------------------------------------------------ | ------------- | --------------------------------------------------- |
+| empty           | none                                                   | 0             | `open` is not called.                               |
+| tiny            | text                                                   | 1             | Flat inline, tail only.                             |
+| max inline      | text                                                   | 4096 − 64     | The largest tail that fits in the inode block.      |
+| over inline     | text                                                   | 4096 − 63     | The tail does not fit. Flat plain.                  |
+| one block       | text                                                   | 4096          | Flat plain, no tail. Not a candidate.               |
+| block plus one  | text                                                   | 4097          | The smallest candidate.                             |
+| multi block     | text                                                   | 3 × 4096 + 17 | Many groups and a tail.                             |
+| random          | random bytes, `.bin` name                              | 1 MiB + 5     | A candidate that falls back to flat from the spool. |
+| mixed groups    | 64 KiB text, then 64 KiB random                        | 128 KiB + 9   | Compressed and PLAIN groups in one file.            |
+| known extension | text, `.png` name                                      | 64 KiB        | Flat-only because of `isIncompressible`.            |
+| large           | text                                                   | 10 MiB + 5    | The copy loops over many buffers.                   |
+| mixed tree      | All of the above, in nested directories, with symlinks | —             | The inode order and the offsets between files.      |
 
 Run the table three times: with no compression, with
 `CompressionAutoLZ4`, and with `CompressionZstd`.
 
 Other tests:
 
-| Test                           | What it proves                                         |
-| ------------------------------ | ------------------------------------------------------ |
+| Test                           | What it proves                                                                                                              |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
 | `TestAddFileFuncShortRead`     | A reader that returns `size − 1` bytes gives an error that names the path. Run it for a flat-only file and for a candidate. |
-| `TestAddFileFuncLongRead`      | A reader that returns `size + 1` bytes gives the same error. Run it for both kinds. |
-| `TestAddFileFuncOpenError`     | An error from `open` comes out of `Build`, wrapped with the path. |
-| `TestAddFileFuncOpensOnce`     | Each `open` runs exactly once, for both kinds and for the flat fallback. Zero-size files do not call `open`. |
-| `TestAddFileFuncOneReaderOpen` | No more than one reader is open at a time.            |
-| `TestSpoolRemoved`             | The spool directory is empty after `Build`, on success and after a read error. |
-| `TestAddFileFuncMemory`        | See below.                                             |
-| `TestAddFromFSLazy`            | `AddFromFS` over an `fstest.MapFS` gives the same bytes as v0.6.1 gave for the same tree. Keep a golden file from v0.6.1. |
+| `TestAddFileFuncLongRead`      | A reader that returns `size + 1` bytes gives the same error. Run it for both kinds.                                         |
+| `TestAddFileFuncOpenError`     | An error from `open` comes out of `Build`, wrapped with the path.                                                           |
+| `TestAddFileFuncOpensOnce`     | Each `open` runs exactly once, for both kinds and for the flat fallback. Zero-size files do not call `open`.                |
+| `TestAddFileFuncOneReaderOpen` | No more than one reader is open at a time.                                                                                  |
+| `TestSpoolRemoved`             | The spool directory is empty after `Build`, on success and after a read error.                                              |
+| `TestAddFileFuncMemory`        | See below.                                                                                                                  |
+| `TestAddFromFSLazy`            | `AddFromFS` over an `fstest.MapFS` gives the same bytes as v0.6.1 gave for the same tree. Keep a golden file from v0.6.1.   |
 
 `TestAddFileFuncMemory` is the acceptance test for this spec. It builds 1 GiB
 of content, in 1024 files of 1 MiB each, from a reader that generates

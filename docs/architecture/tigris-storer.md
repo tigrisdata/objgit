@@ -25,13 +25,13 @@ call has run.
 
 ## Layout
 
-| Key                | Contents                                            |
-| ------------------ | --------------------------------------------------- |
-| `objects/<hex>`    | One loose git object.                               |
-| `packs/<id>.bin`   | One flat container of full objects.                 |
-| `packs/<id>.cue`   | The record index for one container.                 |
-| `packed-refs`      | Every reference in one object. See "References".     |
-| `refs/<name>`      | One legacy loose reference. Read-only.               |
+| Key                               | Contents                                                     |
+| --------------------------------- | ------------------------------------------------------------ |
+| `objects/<hex>`                   | One loose git object.                                        |
+| `packs/<id>.bin`                  | One flat container of full objects.                          |
+| `packs/<id>.cue`                  | The record index for one container.                          |
+| `packed-refs`                     | Every reference in one object. See "References".             |
+| `refs/<name>`                     | One legacy loose reference. Read-only.                       |
 | `snapshots/erofs/v1/<tree>.erofs` | One erofs image of a tree. See [snapshots.md](snapshots.md). |
 
 Shallow marks, the worktree index, and the repository configuration sit at
@@ -63,10 +63,10 @@ listing gave only key names.
 
 Two keys hold reference state:
 
-| Key            | Role                                                      |
-| -------------- | --------------------------------------------------------- |
-| `packed-refs`  | Every reference. Its ETag is the compare-and-swap token.   |
-| `refs/<name>`  | One legacy loose reference. Read-only. The fold deletes it. |
+| Key           | Role                                                        |
+| ------------- | ----------------------------------------------------------- |
+| `packed-refs` | Every reference. Its ETag is the compare-and-swap token.    |
+| `refs/<name>` | One legacy loose reference. Read-only. The fold deletes it. |
 
 `packed-refs` does not start with `refs/`, so the loose listing cannot return
 it.
@@ -249,11 +249,11 @@ references therefore cost N+1 `GetObject` calls on a key that is not there.
 
 These numbers come from a live bucket, before the memo:
 
-| Repository  | References | Failed GETs | Time in GetObject | Clone     |
-| ----------- | ---------: | ----------: | ----------------: | --------- |
-| objgit      |         37 |          38 |            11.1 s | 11.8 s    |
-| tigris-blog |        506 |         507 |             144 s | 3 m 47 s  |
-| Xe/x        |      1,077 |       1,078 |             338 s | 6 m 11 s  |
+| Repository  | References | Failed GETs | Time in GetObject | Clone    |
+| ----------- | ---------: | ----------: | ----------------: | -------- |
+| objgit      |         37 |          38 |            11.1 s | 11.8 s   |
+| tigris-blog |        506 |         507 |             144 s | 3 m 47 s |
+| Xe/x        |      1,077 |       1,078 |             338 s | 6 m 11 s |
 
 For `Xe/x` that is 338 of 412 seconds, or 73% of the clone.
 
@@ -309,7 +309,7 @@ of it, which leaves the pack walk no room to run ahead.
 against `BufferedByteLimit`. `sizeHint` clamps the size to that limit.
 
 CAUTION: The clamp is not a nicety. The bundler takes the size from a semaphore
-whose capacity *is* `BufferedByteLimit`, and `x/sync/semaphore` parks a size
+whose capacity _is_ `BufferedByteLimit`, and `x/sync/semaphore` parks a size
 larger than the whole capacity until the context is done. An unclamped
 oversized job therefore hangs its push. The byte cap keeps every ordinary
 container far under the limit, but a lone object above the cap can still make a
@@ -320,7 +320,7 @@ the same `Storer`. The delta-base resolution of go-git reads back objects that
 the same push wrote moments earlier, long before any flush. Without the
 pending overlay
 in `objects.go`, a real push fails with `apply delta patch: object not found`.
-This is why `registerPending` runs *before* `enqueue`, and why
+This is why `registerPending` runs _before_ `enqueue`, and why
 `EncodedObject` falls through to S3 only on `os.ErrNotExist`.
 
 CAUTION: Local staging paths must never come from content hashes. Two
@@ -383,7 +383,7 @@ make a few kilobytes. A thousand large blobs make tens of gigabytes. Container
 size is what sets the size of one PUT, of one prefetched `.bin` download, and of
 one pack cache eviction, so the byte cap bounds all three.
 
-The walk checks the cap *before* it adds an object. A container at 127 MiB must
+The walk checks the cap _before_ it adds an object. A container at 127 MiB must
 not swallow a 500 MiB blob and land at 627 MiB.
 
 CAUTION: One container can exceed the cap. An object larger than the whole cap
@@ -467,7 +467,7 @@ concurrent use. `metrics.ObserveS3` already is.
 `WithPackCache` decides where the downloaded copy lands.
 
 Without the option, each `Storer` gets a private temp file that is unlinked
-but still open. The file dies with the `Storer`, so the *next* clone downloads
+but still open. The file dies with the `Storer`, so the _next_ clone downloads
 the pack again.
 
 With the option, one process-wide `*PackCache` keeps whole `.bin` files in a

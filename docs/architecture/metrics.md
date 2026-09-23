@@ -56,13 +56,13 @@ low. `canceled` means the client hung up while queued, which is not.
 
 Snapshot Ensure calls and cache events have five series:
 
-| Series                                  | Type      | Labels        | Meaning                              |
-| --------------------------------------- | --------- | ------------- | ------------------------------------ |
-| `objgit_snapshot_builds_total`          | counter   | result        | Ensure calls by result.              |
-| `objgit_snapshot_build_duration_seconds`| histogram | (none)        | Time for builds.                     |
-| `objgit_snapshot_image_bytes`           | histogram | (none)        | Built image size after compression.  |
-| `objgit_snapshot_cache_opens_total`     | counter   | result        | Cache lookups by result (hit, miss). |
-| `objgit_snapshot_cache_evictions_total` | counter   | reason        | Evictions by reason (budget, idle).  |
+| Series                                   | Type      | Labels | Meaning                              |
+| ---------------------------------------- | --------- | ------ | ------------------------------------ |
+| `objgit_snapshot_builds_total`           | counter   | result | Ensure calls by result.              |
+| `objgit_snapshot_build_duration_seconds` | histogram | (none) | Time for builds.                     |
+| `objgit_snapshot_image_bytes`            | histogram | (none) | Built image size after compression.  |
+| `objgit_snapshot_cache_opens_total`      | counter   | result | Cache lookups by result (hit, miss). |
+| `objgit_snapshot_cache_evictions_total`  | counter   | reason | Evictions by reason (budget, idle).  |
 
 The size histogram is data for a later decision about a size limit.
 
