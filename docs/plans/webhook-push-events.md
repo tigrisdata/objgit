@@ -34,6 +34,10 @@ explicit `false` and empty arrays as in the example.
 3. Resolve operator-owned webhook destinations and secrets. Serialize the
    event with ProtoJSON, sign the exact request bytes, and send with bounded
    timeout and retries. Keep a delivery ID stable across attempts.
+   Each repository now reads its settings from
+   `.objgit/webhooks/<org>/<repo>/settings.json` in daemon bucket state.
+   Raw settings queries on HTTP and SSH use the shared `Authorizer` seam with
+   the `Admin` operation. The permissive default denies this operation.
 4. Large events are currently sent whole. Event construction has a 30-second
    deadline per ref. A push too large to build within that limit logs a delivery
    failure; it does not silently truncate the commit or path lists. A future

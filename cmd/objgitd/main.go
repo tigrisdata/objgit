@@ -26,7 +26,6 @@ import (
 	"github.com/tigrisdata/objgit/internal/repofs"
 	"github.com/tigrisdata/objgit/internal/s3fs"
 	"github.com/tigrisdata/objgit/internal/storage/tigris"
-	"github.com/tigrisdata/objgit/internal/webhook"
 	tstorage "github.com/tigrisdata/storage-go"
 	"golang.org/x/sync/errgroup"
 
@@ -41,9 +40,8 @@ var (
 	allowPush   = flag.Bool("allow-push", false, "allow unauthenticated git-receive-pack (push) requests")
 	slogLevel   = flag.String("slog-level", "INFO", "log level (DEBUG, INFO, WARN, ERROR)")
 
-	allowHooks    = flag.Bool("allow-hooks", false, "run .objgit/hooks/receive-pack in a sandbox after a successful push")
-	hookTimeout   = flag.Duration("hook-timeout", 60*time.Second, "wall-clock limit for a single hook run")
-	webhookConfig = flag.String("webhook-config", "", "path to JSON per-repository webhook endpoints and signing secrets; empty disables webhooks")
+	allowHooks  = flag.Bool("allow-hooks", false, "run .objgit/hooks/receive-pack in a sandbox after a successful push")
+	hookTimeout = flag.Duration("hook-timeout", 60*time.Second, "wall-clock limit for a single hook run")
 
 	packCacheDir   = flag.String("pack-cache-dir", "", "parent directory for the local pack cache; empty uses the OS temp directory")
 	packCacheBytes = flag.Int64("pack-cache-bytes", 2<<30, "disk budget for the local pack cache, least-recently-used eviction; 0 disables caching")
@@ -84,11 +82,6 @@ func main() {
 		slog.Error("at least one of -http-bind or -ssh-bind must be set")
 		os.Exit(1)
 	}
-	webhooks, err := webhook.Load(*webhookConfig)
-	if err != nil {
-		slog.Error("can't load webhook configuration", "path", *webhookConfig, "err", err)
-		os.Exit(1)
-	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -108,8 +101,8 @@ func main() {
 	}
 	// Harden the client's HTTP path so stale keep-alive connections to Tigris
 	// fail fast and retry on a fresh connection instead of hanging the request
-	// forever (see internal/s3fs/resilient.go). Only sysFS (the SSH host key)
-	// uses this client; internal/storage/tigris dials its own.
+	// forever (see internal/s3fs/resilient.go). Only sysFS (the SSH host key
+	// and webhook settings) uses this client; internal/storage/tigris dials its own.
 	client := s3fs.Harden(rawClient)
 
 	fsys, err := s3fs.NewS3FS(client, *bucket)
@@ -152,7 +145,6 @@ func main() {
 		authz:       auth.AllowAnonymous{AllowWrite: *allowPush},
 		allowHooks:  *allowHooks,
 		hookTimeout: *hookTimeout,
-		webhooks:    webhooks,
 		pushes:      newPushLimiter(*maxConcurrentPushes, *pushQueueTimeout),
 	}
 
@@ -164,7 +156,6 @@ func main() {
 		"bucket", *bucket,
 		"allow_push", *allowPush,
 		"allow_hooks", *allowHooks,
-		"webhook_configured", *webhookConfig != "",
 		"pack_cache_bytes", *packCacheBytes,
 		"max_concurrent_pushes", *maxConcurrentPushes,
 		"push_queue_timeout", *pushQueueTimeout,

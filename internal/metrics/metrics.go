@@ -230,10 +230,7 @@ func ObserveAuth(transport string, op auth.Operation, d auth.Decision, start tim
 }
 
 func operationLabel(op auth.Operation) string {
-	if op == auth.Write {
-		return "write"
-	}
-	return "read"
+	return op.String()
 }
 
 func decisionLabel(d auth.Decision) string {

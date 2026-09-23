@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package tigrisdata.objgit.webhooks.v1;
+
+// Settings configures delivery for one repository. Its repository identity
+// comes from the bucket key .objgit/webhooks/<org>/<repo>/settings.json.
+message Settings {
+  // HTTPS destination URL. HTTP is accepted only for loopback destinations.
+  string url = 1;
+
+  // Shared secret used as the HMAC-SHA256 key for every delivery to this URL.
+  // Generate at least 32 random bytes, for example with openssl rand -hex 32.
+  string secret = 2;
+}

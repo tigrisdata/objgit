@@ -21,6 +21,7 @@ import (
 	"github.com/tigrisdata/objgit/internal/mountfs"
 	"github.com/tigrisdata/objgit/internal/pushevents"
 	"github.com/tigrisdata/objgit/internal/treefs"
+	"github.com/tigrisdata/objgit/internal/webhook"
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
 	"mvdan.cc/sh/v3/syntax"
@@ -88,7 +89,11 @@ func diffRefs(before, after map[plumbing.ReferenceName]plumbing.Hash) []refUpdat
 // both land here, and git:// never serves receive-pack at all — so it is where
 // the push concurrency cap is applied, via the d.pushes.admit seam.
 func (d *daemon) receivePack(ctx context.Context, st storage.Storer, repoPath string, r io.ReadCloser, w io.WriteCloser, req *transport.ReceivePackRequest) error {
-	if !d.allowHooks && (d.webhooks == nil || !d.webhooks.Enabled(repoPath)) {
+	webhooks, settingsErr := webhook.Load(d.sysFS, repoPath)
+	if settingsErr != nil {
+		slog.Error("webhook: load repository settings", "repo", repoPath, "err", settingsErr)
+	}
+	if !d.allowHooks && (webhooks == nil || !webhooks.Enabled(repoPath)) {
 		err := receivePackStreaming(ctx, st, r, w, req, d.pushes.admit, nil)
 		d.healHEADAfterPush(err, st, repoPath)
 		return err
@@ -107,7 +112,7 @@ func (d *daemon) receivePack(ctx context.Context, st storage.Storer, repoPath st
 			}
 			d.runHooks(repoPath, "receive-pack", st, branches, progress)
 		}
-		d.emitPushWebhooks(ctx, st, repoPath, updates, acceptedAt)
+		d.emitPushWebhooks(ctx, st, repoPath, webhooks, updates, acceptedAt)
 	}
 
 	err := receivePackStreaming(ctx, st, r, w, req, d.pushes.admit, onUpdated)

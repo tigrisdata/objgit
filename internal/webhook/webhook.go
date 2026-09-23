@@ -1,4 +1,5 @@
-// Package webhook delivers signed push events to operator-configured HTTP endpoints.
+// Package webhook delivers signed push events using per-repository settings
+// stored alongside daemon state in the bucket.
 package webhook
 
 import (
@@ -7,7 +8,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,10 +16,13 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path"
 	"strings"
 	"time"
 
+	"github.com/go-git/go-billy/v6"
 	pushv1 "github.com/tigrisdata/objgit/gen/tigrisdata/objgit/events/push/v1"
+	settingsv1 "github.com/tigrisdata/objgit/gen/tigrisdata/objgit/webhooks/v1"
 	"github.com/tigrisdata/objgit/internal/repofs"
 	"google.golang.org/protobuf/encoding/protojson"
 )
@@ -43,77 +46,82 @@ type destination struct {
 	client *http.Client
 }
 
-type config struct {
-	Repositories map[string]repositoryConfig `json:"repositories"`
-}
-
-type repositoryConfig struct {
-	URL    string `json:"url"`
-	Secret string `json:"secret"`
-}
-
-// Load reads a JSON configuration file with a repositories object mapping
-// canonical "org/name" paths to URL and secret pairs. An empty path disables
-// webhook delivery.
-func Load(path string) (*Client, error) {
-	c := &Client{repositories: make(map[string]destination)}
-	if path == "" {
-		return c, nil
+// SettingsPath returns the daemon-state key for a canonical repository path.
+// The repository components must not escape the webhooks directory.
+func SettingsPath(repo string) (string, error) {
+	ref, err := repofs.Parse(repo)
+	if err != nil || ref.Path() != repo || ref.OrgID == "." || ref.OrgID == ".." || ref.Name == "." || ref.Name == ".." {
+		return "", fmt.Errorf("invalid repository %q", repo)
 	}
+	return path.Join(".objgit", "webhooks", ref.OrgID, ref.Name, "settings.json"), nil
+}
 
-	f, err := os.Open(path)
+// Load reads one repository's ProtoJSON settings from the daemon's bucket
+// filesystem. A missing file disables delivery for that repository. Callers
+// load once per push so the destination and secret stay fixed for its events.
+func Load(fs billy.Filesystem, repo string) (*Client, error) {
+	c := &Client{repositories: make(map[string]destination)}
+	settings, err := ReadSettings(fs, repo)
+	if err != nil || settings == nil {
+		return c, err
+	}
+	settingsPath, _ := SettingsPath(repo)
+	if settings.GetSecret() == "" {
+		return nil, fmt.Errorf("webhook settings %s have no secret", settingsPath)
+	}
+	u, loopback, err := validateURL(settings.GetUrl())
 	if err != nil {
-		return nil, fmt.Errorf("open webhook configuration: %w", err)
+		return nil, fmt.Errorf("webhook settings %s: %w", settingsPath, err)
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = safeDialContext(u.Hostname(), loopback)
+	transport.MaxIdleConnsPerHost = 2
+	c.repositories[repo] = destination{
+		url:    u.String(),
+		secret: []byte(settings.GetSecret()),
+		client: &http.Client{
+			Timeout:   attemptTimeout,
+			Transport: transport,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+	}
+	return c, nil
+}
+
+// ReadSettings returns the raw settings for an admin query. A missing file
+// returns nil. Callers must authorize before calling it or serializing it.
+func ReadSettings(fs billy.Filesystem, repo string) (*settingsv1.Settings, error) {
+	settingsPath, err := SettingsPath(repo)
+	if err != nil {
+		return nil, err
+	}
+	if fs == nil {
+		return nil, nil
+	}
+	f, err := fs.Open(settingsPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("open webhook settings %s: %w", settingsPath, err)
 	}
 	defer f.Close()
 
 	data, err := io.ReadAll(io.LimitReader(f, maxConfigBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("read webhook configuration: %w", err)
+		return nil, fmt.Errorf("read webhook settings %s: %w", settingsPath, err)
 	}
 	if len(data) > maxConfigBytes {
-		return nil, errors.New("webhook configuration exceeds 1 MiB")
+		return nil, fmt.Errorf("webhook settings %s exceed 1 MiB", settingsPath)
 	}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	var cfg config
-	if err := dec.Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("decode webhook configuration: %w", err)
+	var settings settingsv1.Settings
+	if err := protojson.Unmarshal(data, &settings); err != nil {
+		return nil, fmt.Errorf("decode webhook settings %s: %w", settingsPath, err)
 	}
-	var trailing any
-	if err := dec.Decode(&trailing); err != io.EOF {
-		return nil, errors.New("webhook configuration contains trailing data")
-	}
-
-	for repo, entry := range cfg.Repositories {
-		ref, err := repofs.Parse(repo)
-		if err != nil || ref.Path() != repo {
-			return nil, fmt.Errorf("webhook configuration has invalid repository %q", repo)
-		}
-		if entry.Secret == "" {
-			return nil, fmt.Errorf("webhook configuration for %q has no secret", repo)
-		}
-		u, loopback, err := validateURL(entry.URL)
-		if err != nil {
-			return nil, fmt.Errorf("webhook configuration for %q: %w", repo, err)
-		}
-		transport := http.DefaultTransport.(*http.Transport).Clone()
-		transport.Proxy = nil
-		transport.DialContext = safeDialContext(u.Hostname(), loopback)
-		transport.MaxIdleConnsPerHost = 2
-		c.repositories[repo] = destination{
-			url:    u.String(),
-			secret: []byte(entry.Secret),
-			client: &http.Client{
-				Timeout:   attemptTimeout,
-				Transport: transport,
-				CheckRedirect: func(*http.Request, []*http.Request) error {
-					return http.ErrUseLastResponse
-				},
-			},
-		}
-	}
-	return c, nil
+	return &settings, nil
 }
 
 // Enabled reports whether repo has a configured webhook destination.

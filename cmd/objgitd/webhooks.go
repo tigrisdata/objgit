@@ -10,14 +10,15 @@ import (
 	"github.com/go-git/go-git/v6/storage"
 	"github.com/tigrisdata/objgit/internal/metrics"
 	"github.com/tigrisdata/objgit/internal/pushevents"
+	"github.com/tigrisdata/objgit/internal/webhook"
 )
 
 // emitPushWebhooks builds one event for each ref changed by this receive-pack.
 // Delivery runs after the ref update and cannot reject or undo it. A detached,
 // bounded context lets an event finish even if the Git client disconnects
 // after the server has committed the refs.
-func (d *daemon) emitPushWebhooks(ctx context.Context, st storage.Storer, repo string, updates []refUpdate, acceptedAt time.Time) {
-	if d.webhooks == nil || !d.webhooks.Enabled(repo) || len(updates) == 0 {
+func (d *daemon) emitPushWebhooks(ctx context.Context, st storage.Storer, repo string, webhooks *webhook.Client, updates []refUpdate, acceptedAt time.Time) {
+	if webhooks == nil || !webhooks.Enabled(repo) || len(updates) == 0 {
 		return
 	}
 
@@ -42,7 +43,7 @@ func (d *daemon) emitPushWebhooks(ctx context.Context, st storage.Storer, repo s
 			New:  u.New,
 		}, pushID, eventID, acceptedAt)
 		if err == nil {
-			err = d.webhooks.Deliver(eventCtx, repo, event)
+			err = webhooks.Deliver(eventCtx, repo, event)
 		}
 		cancel()
 

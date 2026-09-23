@@ -11,32 +11,44 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 
+	"github.com/go-git/go-billy/v6"
+	"github.com/go-git/go-billy/v6/memfs"
 	pushv1 "github.com/tigrisdata/objgit/gen/tigrisdata/objgit/events/push/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
 
-func writeConfig(t *testing.T, content string) string {
+func writeConfig(t *testing.T, content string) billy.Filesystem {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "webhooks.json")
-	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+	fs := memfs.New()
+	settingsPath, err := SettingsPath("acme/widgets")
+	if err != nil {
 		t.Fatal(err)
 	}
-	return path
+	if err := fs.MkdirAll(".objgit/webhooks/acme/widgets", 0700); err != nil {
+		t.Fatal(err)
+	}
+	f, err := fs.Create(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(f, content); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return fs
 }
 
-func configFor(t *testing.T, endpoint string) string {
+func configFor(t *testing.T, endpoint string) billy.Filesystem {
 	t.Helper()
-	data, err := json.Marshal(config{Repositories: map[string]repositoryConfig{
-		"acme/widgets": {URL: endpoint, Secret: "test-secret"},
-	}})
+	data, err := json.Marshal(map[string]string{"url": endpoint, "secret": "test-secret"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,24 +58,29 @@ func configFor(t *testing.T, endpoint string) string {
 func TestLoad(t *testing.T) {
 	tests := []struct {
 		name        string
+		repo        string
 		config      string
 		wantEnabled bool
 		wantError   string
 	}{
-		{name: "valid loopback", config: `{"repositories":{"acme/widgets":{"url":"http://127.0.0.1:1234/hook","secret":"key"}}}`, wantEnabled: true},
-		{name: "valid public HTTPS", config: `{"repositories":{"acme/widgets":{"url":"https://example.com/hook","secret":"key"}}}`, wantEnabled: true},
-		{name: "bad repository", config: `{"repositories":{"acme/widgets.git":{"url":"https://example.com/hook","secret":"key"}}}`, wantError: "invalid repository"},
-		{name: "missing secret", config: `{"repositories":{"acme/widgets":{"url":"https://example.com/hook"}}}`, wantError: "no secret"},
-		{name: "plain HTTP", config: `{"repositories":{"acme/widgets":{"url":"http://example.com/hook","secret":"key"}}}`, wantError: "must use HTTPS"},
-		{name: "metadata IP", config: `{"repositories":{"acme/widgets":{"url":"https://169.254.169.254/latest","secret":"key"}}}`, wantError: "nonpublic IP"},
-		{name: "private IP", config: `{"repositories":{"acme/widgets":{"url":"https://10.0.0.1/hook","secret":"key"}}}`, wantError: "nonpublic IP"},
-		{name: "URL user info", config: `{"repositories":{"acme/widgets":{"url":"https://user:pass@example.com/hook","secret":"key"}}}`, wantError: "no user info"},
-		{name: "unknown config field", config: `{"repositories":{},"extra":true}`, wantError: "unknown field"},
-		{name: "trailing data", config: `{"repositories":{}} {}`, wantError: "trailing data"},
+		{name: "valid loopback", config: `{"url":"http://127.0.0.1:1234/hook","secret":"key"}`, wantEnabled: true},
+		{name: "valid public HTTPS", config: `{"url":"https://example.com/hook","secret":"key"}`, wantEnabled: true},
+		{name: "bad repository", repo: "../widgets", config: `{"url":"https://example.com/hook","secret":"key"}`, wantError: "invalid repository"},
+		{name: "missing secret", config: `{"url":"https://example.com/hook"}`, wantError: "no secret"},
+		{name: "plain HTTP", config: `{"url":"http://example.com/hook","secret":"key"}`, wantError: "must use HTTPS"},
+		{name: "metadata IP", config: `{"url":"https://169.254.169.254/latest","secret":"key"}`, wantError: "nonpublic IP"},
+		{name: "private IP", config: `{"url":"https://10.0.0.1/hook","secret":"key"}`, wantError: "nonpublic IP"},
+		{name: "URL user info", config: `{"url":"https://user:pass@example.com/hook","secret":"key"}`, wantError: "no user info"},
+		{name: "unknown config field", config: `{"extra":true}`, wantError: "unknown field"},
+		{name: "trailing data", config: `{"url":"https://example.com","secret":"key"} {}`, wantError: "unexpected"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c, err := Load(writeConfig(t, tt.config))
+			repo := tt.repo
+			if repo == "" {
+				repo = "acme/widgets"
+			}
+			c, err := Load(writeConfig(t, tt.config), repo)
 			if tt.wantError != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
 					t.Fatalf("error = %v, want substring %q", err, tt.wantError)
@@ -80,8 +97,8 @@ func TestLoad(t *testing.T) {
 	}
 }
 
-func TestLoadEmptyPath(t *testing.T) {
-	c, err := Load("")
+func TestLoadMissingSettings(t *testing.T) {
+	c, err := Load(memfs.New(), "acme/widgets")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +142,7 @@ func TestDeliver(t *testing.T) {
 	}))
 	defer server.Close()
 
-	c, err := Load(configFor(t, server.URL+"/hook"))
+	c, err := Load(configFor(t, server.URL+"/hook"), "acme/widgets")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +194,7 @@ func TestDeliverNoRedirect(t *testing.T) {
 		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
 	}))
 	defer source.Close()
-	c, err := Load(configFor(t, source.URL))
+	c, err := Load(configFor(t, source.URL), "acme/widgets")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +214,7 @@ func TestDeliverPermanentFailure(t *testing.T) {
 		w.WriteHeader(http.StatusBadRequest)
 	}))
 	defer server.Close()
-	c, err := Load(configFor(t, server.URL))
+	c, err := Load(configFor(t, server.URL), "acme/widgets")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +228,7 @@ func TestDeliverPermanentFailure(t *testing.T) {
 }
 
 func TestDeliverBadEvent(t *testing.T) {
-	c, err := Load(configFor(t, "http://127.0.0.1:1234"))
+	c, err := Load(configFor(t, "http://127.0.0.1:1234"), "acme/widgets")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +277,7 @@ func TestPublicIP(t *testing.T) {
 }
 
 func TestDeliverDoesNotExposeURLQuery(t *testing.T) {
-	c, err := Load(configFor(t, "http://127.0.0.1:1/hook?token=hidden-token"))
+	c, err := Load(configFor(t, "http://127.0.0.1:1/hook?token=hidden-token"), "acme/widgets")
 	if err != nil {
 		t.Fatal(err)
 	}

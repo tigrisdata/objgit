@@ -17,6 +17,10 @@ buf generate
 ```
 
 `buf generate` writes Go types under `gen/`, following the Xe/x Buf layout.
+Per-repository webhook settings are defined in
+[`tigrisdata/objgit/webhooks/v1/settings.proto`](tigrisdata/objgit/webhooks/v1/settings.proto),
+with an adjacent raw
+[`settings.example.json`](tigrisdata/objgit/webhooks/v1/settings.example.json).
 The schema does not yet carry gnostic OpenAPI annotations. Its versioned
 package, comments, and example are the starting point for adding those
 annotations and generated docs later.

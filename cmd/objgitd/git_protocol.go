@@ -15,7 +15,6 @@ import (
 	"github.com/tigrisdata/objgit/internal/auth"
 	"github.com/tigrisdata/objgit/internal/metrics"
 	"github.com/tigrisdata/objgit/internal/repofs"
-	"github.com/tigrisdata/objgit/internal/webhook"
 )
 
 // handshakeTimeout bounds how long a client has to send its git-proto-request.
@@ -46,7 +45,7 @@ func (d *daemon) authorize(ctx context.Context, req auth.Request) auth.Decision 
 // repo.
 type daemon struct {
 	// sysFS holds daemon-level state that is not scoped to a repository (the SSH
-	// host key); repository storage is resolved per request via resolver.
+	// host key and webhook settings); repository storage is resolved per request.
 	sysFS    billy.Filesystem
 	resolver repofs.Resolver
 	authz    auth.Authorizer
@@ -54,7 +53,6 @@ type daemon struct {
 	// allowHooks gates running .objgit/hooks/receive-pack after a push.
 	allowHooks  bool
 	hookTimeout time.Duration
-	webhooks    *webhook.Client
 
 	// pushes bounds how many pushes unpack a packfile at once, which is the
 	// only thing that bounds the daemon's resident set under concurrent pushes.

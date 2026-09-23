@@ -2,11 +2,11 @@
 
 This package is vendored from the s3fs of Austin Poor. It is adapted to
 **billy v6** and to the Tigris `storage-go` client. It treats an S3 bucket as
-a filesystem, so go-git's `filesystem.NewStorage` can store loose objects and
-packs against it.
+a filesystem.
 
-In `cmd/objgitd` this package now backs only `sysFS`, which is daemon-level
-state and holds the SSH host key. Repository git storage is
+In `cmd/objgitd` this package backs `sysFS`, which is daemon-level state and
+holds the SSH host key and per-repository webhook settings at
+`.objgit/webhooks/<org>/<repo>/settings.json`. Repository git storage is
 [`internal/storage/tigris`](tigris-storer.md), and not this package.
 
 ## The temp filesystem (`tempfs.go`)

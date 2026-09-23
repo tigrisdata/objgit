@@ -1,25 +1,52 @@
 # Push webhooks
 
-Set `-webhook-config` to a JSON file owned by the daemon operator. The flag
-also accepts `WEBHOOK_CONFIG` through the usual environment flag mapping.
-An empty value disables delivery. The daemon reads the file at startup, and
-rejects invalid entries before it starts serving Git requests.
+Store one `settings.json` object for each repository in the daemon's Tigris
+bucket. For `acme/widgets`, the key is
+`.objgit/webhooks/acme/widgets/settings.json`. This is daemon state, alongside
+`.objgit/ssh_host_ed25519_key`. It is not a file in the Git repository's tree.
+The object contains one ProtoJSON settings message:
 
 ```json
 {
-  "repositories": {
-    "acme/widgets": {
-      "url": "https://events.example.com/objgit",
-      "secret": "replace-with-a-long-random-secret"
-    }
-  }
+  "url": "https://events.example.com/objgit",
+  "secret": "replace-with-a-long-random-secret"
 }
 ```
 
-Each repository has one destination. The repository key is its canonical
-`org/name` path. Configure HTTPS endpoints; HTTP is accepted only for loopback
-addresses. Store the config with restricted permissions because it contains
-signing secrets. Restart the daemon after changing the file.
+Each repository has one destination. Configure HTTPS endpoints; HTTP is
+accepted only for loopback addresses. Generate a distinct secret for each
+repository with `openssl rand -hex 32`. Restrict bucket access to these
+objects because they contain signing secrets. The daemon reads settings for
+each push, so the next push uses an updated object without a restart. A
+missing object disables webhooks for that repository; invalid settings are
+logged and the push continues without webhook delivery.
+
+## Query settings
+
+The Git HTTP and SSH listeners expose admin-only queries for the raw settings,
+including the signing secret:
+
+```sh
+curl --user 'operator:<admin-password>' \
+  https://git.example.com/_objgit/webhooks/acme/widgets/settings
+ssh git@git.example.com objgit-webhook-settings acme/widgets
+```
+
+The HTTP response uses ProtoJSON and has `Cache-Control: no-store`. The SSH
+command prints the same JSON. The HTTP endpoint returns 404 when settings are
+absent; the SSH command exits with an error. Use HTTPS for the HTTP query
+because it carries a credential and a raw secret.
+
+Both queries ask the configured `internal/auth.Authorizer` for the `Admin`
+operation on that repository. The default `AllowAnonymous` authorizer denies
+`Admin`, even when `-allow-push` is set. Deploy an authorizer that checks your
+admin ACL and grants `Admin` only to eligible HTTP or SSH credentials before
+using these queries. Ordinary repository read or write permission does not
+grant access to the secret.
+
+The settings schema is
+[settings.proto](../../proto/tigrisdata/objgit/webhooks/v1/settings.proto),
+with a [raw JSON example](../../proto/tigrisdata/objgit/webhooks/v1/settings.example.json).
 
 ## Event body
 
@@ -51,10 +78,10 @@ for invalid UTF-8 bytes so the JSON body remains valid.
 Each request is an HTTP `POST` with `Content-Type: application/json` and these
 headers:
 
-| Header | Value |
-| ------ | ----- |
-| `X-Objgit-Event` | `push` |
-| `X-Objgit-Delivery` | The event's `eventId`, unchanged on retries. |
+| Header                   | Value                                                                                                                 |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| `X-Objgit-Event`         | `push`                                                                                                                |
+| `X-Objgit-Delivery`      | The event's `eventId`, unchanged on retries.                                                                          |
 | `X-Objgit-Signature-256` | `sha256=` followed by the lowercase hex HMAC-SHA256 of the **exact request body bytes**, using the configured secret. |
 
 Verify the HMAC with a constant-time comparison before processing the body.

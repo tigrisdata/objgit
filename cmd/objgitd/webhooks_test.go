@@ -1,25 +1,52 @@
 package main
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/memfs"
 	pushv1 "github.com/tigrisdata/objgit/gen/tigrisdata/objgit/events/push/v1"
+	settingsv1 "github.com/tigrisdata/objgit/gen/tigrisdata/objgit/webhooks/v1"
 	"github.com/tigrisdata/objgit/internal/auth"
 	"github.com/tigrisdata/objgit/internal/repofs"
 	"github.com/tigrisdata/objgit/internal/webhook"
 	"google.golang.org/protobuf/encoding/protojson"
 )
+
+func writeWebhookSettings(t *testing.T, fs billy.Filesystem, repo, endpoint string) {
+	t.Helper()
+	settingsPath, err := webhook.SettingsPath(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.MkdirAll(path.Dir(settingsPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	body, err := protojson.Marshal(&settingsv1.Settings{Url: endpoint, Secret: "test-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := fs.Create(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestSmartHTTPPushWebhook(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
@@ -60,25 +87,12 @@ func TestSmartHTTPPushWebhook(t *testing.T) {
 	}))
 	t.Cleanup(destination.Close)
 
-	config, err := json.Marshal(map[string]any{"repositories": map[string]any{
-		"acme/webhook": map[string]string{"url": destination.URL, "secret": "test-secret"},
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	configPath := filepath.Join(t.TempDir(), "webhooks.json")
-	if err := os.WriteFile(configPath, config, 0600); err != nil {
-		t.Fatal(err)
-	}
-	client, err := webhook.Load(configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	sysFS := memfs.New()
+	writeWebhookSettings(t, sysFS, "acme/webhook", destination.URL)
 	d := &daemon{
-		sysFS:    memfs.New(),
+		sysFS:    sysFS,
 		resolver: repofs.BucketResolver{Base: newMemBase()},
 		authz:    auth.AllowAnonymous{AllowWrite: true},
-		webhooks: client,
 	}
 	server := httptest.NewServer(d.httpHandler())
 	t.Cleanup(server.Close)
@@ -201,23 +215,11 @@ func TestPushWebhookAcceptanceTimePrecedesHook(t *testing.T) {
 	}))
 	t.Cleanup(destination.Close)
 
-	config, err := json.Marshal(map[string]any{"repositories": map[string]any{
-		"acme/timed": map[string]string{"url": destination.URL, "secret": "test-secret"},
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	configPath := filepath.Join(t.TempDir(), "webhooks.json")
-	if err := os.WriteFile(configPath, config, 0600); err != nil {
-		t.Fatal(err)
-	}
-	client, err := webhook.Load(configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	sysFS := memfs.New()
+	writeWebhookSettings(t, sysFS, "acme/timed", destination.URL)
 	server := httptest.NewServer((&daemon{
-		sysFS: memfs.New(), resolver: repofs.BucketResolver{Base: newMemBase()},
-		authz: auth.AllowAnonymous{AllowWrite: true}, webhooks: client,
+		sysFS: sysFS, resolver: repofs.BucketResolver{Base: newMemBase()},
+		authz:      auth.AllowAnonymous{AllowWrite: true},
 		allowHooks: true, hookTimeout: 5 * time.Second,
 	}).httpHandler())
 	t.Cleanup(server.Close)
