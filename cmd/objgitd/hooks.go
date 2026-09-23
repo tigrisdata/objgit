@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -25,6 +26,11 @@ import (
 	"tangled.org/xeiaso.net/kefka/command/registry"
 	"tangled.org/xeiaso.net/kefka/command/registry/coreutils"
 )
+
+// receivePackHook names the hook that a push runs, and so its script at
+// .objgit/hooks/receive-pack and its OBJGIT_SERVICE. It is not the transport
+// service name, which is "git-receive-pack".
+const receivePackHook = "receive-pack"
 
 // refUpdate records a single branch ref change observed across a receive-pack.
 // A zero Old means the branch was created; a zero New means it was deleted.
@@ -115,7 +121,7 @@ func (d *daemon) receivePack(ctx context.Context, st storage.Storer, repoPath st
 		if len(updates) == 0 {
 			return
 		}
-		d.runHooks(repoPath, "receive-pack", st, updates, progress)
+		d.runHooks(repoPath, receivePackHook, st, updates, progress)
 	}
 
 	err = receivePackStreaming(ctx, st, r, w, req, d.pushes.admit, onUpdated)
@@ -178,11 +184,6 @@ func (d *daemon) runHook(repoPath, service string, st storage.Storer, u refUpdat
 		return
 	}
 
-	fsys := mountfs.New(map[string]billy.Filesystem{
-		"src": treefs.New(tree),
-		"tmp": memfs.New(),
-	})
-
 	ctx, cancel := context.WithTimeout(context.Background(), d.hookTimeout)
 	defer cancel()
 
@@ -196,45 +197,8 @@ func (d *daemon) runHook(repoPath, service string, st storage.Storer, u refUpdat
 		stdout, stderr = progress, progress
 	}
 
-	reg := registry.New()
-	coreutils.Register(reg)
-	if err := reg.Chdir(fsys, "/src"); err != nil {
-		log.Error("hook: chdir /src", "err", err)
-		return
-	}
-
-	env := expand.ListEnviron(
-		"HOME=/tmp",
-		"PWD=/src",
-		"TMPDIR=/tmp",
-		"IFS= \t\n",
-		"PATH=/usr/bin:/bin",
-		"KEFKA=1",
-		"OBJGIT_REPO="+repoPath,
-		"OBJGIT_SERVICE="+service,
-		"OBJGIT_REF="+u.Name.String(),
-		"OBJGIT_BRANCH="+u.Name.Short(),
-		"OBJGIT_OLD_SHA="+u.Old.String(),
-		"OBJGIT_NEW_SHA="+u.New.String(),
-	)
-	// Mirror git's post-receive stdin: "<old> <new> <ref>\n".
-	stdin := strings.NewReader(u.Old.String() + " " + u.New.String() + " " + u.Name.String() + "\n")
-
-	var sh *interp.Runner
-	middleware := func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
-		return func(ctx context.Context, args []string) error {
-			return reg.Exec(ctx, fsys, sh, args)
-		}
-	}
-	sh, err = interp.New(
-		interp.Env(env),
-		interp.StdIO(stdin, stdout, stderr),
-		interp.ExecHandlers(middleware),
-		interp.CallHandler(kefkash.CallHandler(reg, fsys, stdout, stderr)),
-		interp.StatHandler(kefkash.FsysStatHandler(reg, fsys)),
-		interp.OpenHandler(kefkash.FsysOpenHandler(reg, fsys)),
-		interp.ReadDirHandler2(kefkash.FsysReadDirHandler(reg, fsys)),
-	)
+	stdin := strings.NewReader(hookStdin(u))
+	sh, err := newHookShell(tree, hookEnv(repoPath, service, u), stdin, stdout, stderr)
 	if err != nil {
 		log.Error("hook: build shell", "err", err)
 		return
@@ -266,6 +230,71 @@ func (d *daemon) runHook(repoPath, service string, st storage.Storer, u refUpdat
 		return
 	}
 	log.Info("hook: finished", attrs...)
+}
+
+// hookEnv returns the environment a hook sees for update u, as KEY=value
+// pairs.
+func hookEnv(repoPath, service string, u refUpdate) []string {
+	return []string{
+		"HOME=/tmp",
+		"PWD=/src",
+		"TMPDIR=/tmp",
+		"IFS= \t\n",
+		"PATH=/usr/bin:/bin",
+		"KEFKA=1",
+		"OBJGIT_REPO=" + repoPath,
+		"OBJGIT_SERVICE=" + service,
+		"OBJGIT_REF=" + u.Name.String(),
+		"OBJGIT_BRANCH=" + u.Name.Short(),
+		"OBJGIT_OLD_SHA=" + u.Old.String(),
+		"OBJGIT_NEW_SHA=" + u.New.String(),
+	}
+}
+
+// hookStdin mirrors git's post-receive stdin for update u: "<old> <new> <ref>\n".
+func hookStdin(u refUpdate) string {
+	return u.Old.String() + " " + u.New.String() + " " + u.Name.String() + "\n"
+}
+
+// newHookShell builds the kefka sandbox a hook runs in: /src is a lazy
+// read-only view of tree, /tmp is writable scratch, and the shell starts in
+// /src with env. Both push hooks and the SSH sh command use it, so the two
+// environments cannot drift apart.
+func newHookShell(tree *object.Tree, env []string, stdin io.Reader, stdout, stderr io.Writer) (*interp.Runner, error) {
+	fsys := mountfs.New(map[string]billy.Filesystem{
+		"src": treefs.New(tree),
+		"tmp": memfs.New(),
+	})
+
+	reg := registry.New()
+	coreutils.Register(reg)
+	if err := reg.Chdir(fsys, "/src"); err != nil {
+		return nil, fmt.Errorf("chdir /src: %w", err)
+	}
+
+	var sh *interp.Runner
+	middleware := func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+		return func(ctx context.Context, args []string) error {
+			return reg.Exec(ctx, fsys, sh, args)
+		}
+	}
+	sh, err := interp.New(
+		interp.Env(expand.ListEnviron(env...)),
+		interp.StdIO(stdin, stdout, stderr),
+		interp.ExecHandlers(middleware),
+		interp.CallHandler(kefkash.CallHandler(reg, fsys, stdout, stderr)),
+		interp.StatHandler(kefkash.FsysStatHandler(reg, fsys)),
+		interp.OpenHandler(kefkash.FsysOpenHandler(reg, fsys)),
+		interp.ReadDirHandler2(kefkash.FsysReadDirHandler(reg, fsys)),
+	)
+	if err != nil {
+		return nil, err
+	}
+	// interp seeds $PWD from Dir, which defaults to the daemon's host working
+	// directory. interp.Dir would stat the host, so set the field directly. The
+	// handlers above resolve paths through reg, so nothing else reads Dir.
+	sh.Dir = "/src"
+	return sh, nil
 }
 
 // hookStatus classifies a hook run for metrics: "timeout" when the hook's

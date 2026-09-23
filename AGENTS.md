@@ -50,36 +50,37 @@ Notes on the tests and on configuration:
 
 ## Where the code lives
 
-| Path                          | Purpose                                                                |
-| ----------------------------- | ---------------------------------------------------------------------- |
-| `cmd/objgitd/main.go`         | Builds the one `*daemon` and starts every listener.                    |
-| `cmd/objgitd/git_protocol.go` | The git:// server. Also holds `operationFor` and `(*daemon).authorize`. |
-| `cmd/objgitd/http.go`         | Smart HTTP. `*daemon` is the `http.Handler` itself.                    |
-| `cmd/objgitd/ssh.go`          | The SSH server and its per-session dispatch.                           |
-| `cmd/objgitd/receivepack.go`  | The go-git fork that streams hook output, plus `writePack`.            |
-| `cmd/objgitd/hooks.go`        | Ref diffing and the sandboxed hook run.                                |
-| `internal/auth`               | The one authorization interface.                                       |
-| `internal/repofs`             | Maps a repository path to a `storage.Storer`.                          |
-| `internal/storage/tigris`     | Repository storage. A `storage.Storer` on the bucket.                  |
-| `internal/bundler`            | The async upload queue behind that storer.                             |
-| `internal/s3fs`               | Daemon-level state only, which is the SSH host key.                    |
-| `internal/mountfs`, `internal/treefs`, `internal/kefkash` | The hook sandbox filesystem and shell wiring. |
-| `internal/metrics`            | Every Prometheus vector, plus thin helpers.                            |
-| `internal/slog.go`            | JSON handler init.                                                     |
-| `cmd/membench/`               | Push memory benchmark harness. Not shipped; see `docs/usage/memory-benchmark.md`. |
+| Path                                                      | Purpose                                                                           |
+| --------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `cmd/objgitd/main.go`                                     | Builds the one `*daemon` and starts every listener.                               |
+| `cmd/objgitd/git_protocol.go`                             | The git:// server. Also holds `operationFor` and `(*daemon).authorize`.           |
+| `cmd/objgitd/http.go`                                     | Smart HTTP. `*daemon` is the `http.Handler` itself.                               |
+| `cmd/objgitd/ssh.go`                                      | The SSH server and its per-session dispatch.                                      |
+| `cmd/objgitd/shell.go`                                    | The SSH `sh` command: an interactive shell in the hook sandbox.                   |
+| `cmd/objgitd/receivepack.go`                              | The go-git fork that streams hook output, plus `writePack`.                       |
+| `cmd/objgitd/hooks.go`                                    | Ref diffing and the sandboxed hook run.                                           |
+| `internal/auth`                                           | The one authorization interface.                                                  |
+| `internal/repofs`                                         | Maps a repository path to a `storage.Storer`.                                     |
+| `internal/storage/tigris`                                 | Repository storage. A `storage.Storer` on the bucket.                             |
+| `internal/bundler`                                        | The async upload queue behind that storer.                                        |
+| `internal/s3fs`                                           | Daemon-level state only, which is the SSH host key.                               |
+| `internal/mountfs`, `internal/treefs`, `internal/kefkash` | The hook sandbox filesystem and shell wiring.                                     |
+| `internal/metrics`                                        | Every Prometheus vector, plus thin helpers.                                       |
+| `internal/slog.go`                                        | JSON handler init.                                                                |
+| `cmd/membench/`                                           | Push memory benchmark harness. Not shipped; see `docs/usage/memory-benchmark.md`. |
 
 ## Architecture
 
 Read [docs/architecture/README.md](docs/architecture/README.md) first. It
 describes the daemon and links to one page for each subsystem.
 
-| Page                                                   | Read it before you change...                                           |
-| ------------------------------------------------------ | ---------------------------------------------------------------------- |
+| Page                                                   | Read it before you change...                                            |
+| ------------------------------------------------------ | ----------------------------------------------------------------------- |
 | [transports.md](docs/architecture/transports.md)       | Any transport. It holds two protocol points that are easy to get wrong. |
 | [auth.md](docs/architecture/auth.md)                   | Credentials, decisions, or a new `Authorizer`.                          |
 | [hooks.md](docs/architecture/hooks.md)                 | Push hooks, output streaming, or the sandbox.                           |
 | [metrics.md](docs/architecture/metrics.md)             | Any metric or instrumentation seam.                                     |
-| [tigris-storer.md](docs/architecture/tigris-storer.md) | Object layout, refs, packs, the pack cache, or the upload path.               |
+| [tigris-storer.md](docs/architecture/tigris-storer.md) | Object layout, refs, packs, the pack cache, or the upload path.         |
 | [s3fs.md](docs/architecture/s3fs.md)                   | The `billy.Filesystem` over the bucket.                                 |
 
 Two more directories carry detail:

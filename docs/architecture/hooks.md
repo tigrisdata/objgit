@@ -56,13 +56,39 @@ of commands, which here is coreutils only.
 
 The sandbox filesystem is an `internal/mountfs` composite of two mounts:
 
-| Mount  | Contents                                                                 |
-| ------ | ------------------------------------------------------------------------ |
+| Mount  | Contents                                                                                                         |
+| ------ | ---------------------------------------------------------------------------------------------------------------- |
 | `/src` | A lazy read-only `internal/treefs` view of the commit tree. Blobs are fetched on open, with no checkout to disk. |
-| `/tmp` | A writable `memfs` for scratch. `HOME` and `TMPDIR` point here.           |
+| `/tmp` | A writable `memfs` for scratch. `HOME` and `TMPDIR` point here.                                                  |
 
 A write outside `/tmp` fails, and a redirect into `/src` aborts the script.
 
 `internal/kefkash` vendors the unexported `billysh` handler wiring from kefka.
 Its `OpenHandler` is adapted to permit writes, so `/tmp` redirections work.
 The filesystem is what enforces the read-only `/src`.
+
+`newHookShell` builds this sandbox, and `hookEnv` builds its environment. It
+also sets the interpreter's `Dir` to `/src`. Without this setting, interp
+copies the host working directory of the daemon into `$PWD`.
+
+## The interactive shell (`shell.go`)
+
+The SSH command `sh <repo> [branch]` opens the same sandbox as an interactive
+shell. It uses `newHookShell` and `hookEnv`, so the two environments cannot
+drift apart. `shellTarget` fills the environment from the tip of the branch.
+`OBJGIT_OLD_SHA` is the first parent of that commit, as if the commit was
+just pushed.
+
+`golang.org/x/term` gives line editing and history over the session.
+`syntax.Parser.InteractiveSeq` reads statements from it. Each statement gets a
+new copy of the hook stdin line and its own `-hook-timeout`.
+
+Two points are easy to get wrong:
+
+- x/term returns `io.EOF` for Ctrl-C, the same as for Ctrl-D. It also drops
+  the partial line and the rest of the read. `shellInput` therefore changes
+  each Ctrl-C byte to `^C` and Enter before x/term reads it. `shellLines` then
+  discards that line.
+- A fatal error, such as a write into `/src`, sets `Runner.Exited`. A hook
+  script stops at this error. The interactive shell prints the error and
+  continues. It stops only for `exit`, Ctrl-D, or a closed session.

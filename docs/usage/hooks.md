@@ -127,6 +127,54 @@ A copy of this example lives at
 [`.objgit/hooks/receive-pack`](../../.objgit/hooks/receive-pack) in this
 repository.
 
+## Exploring the sandbox
+
+You can open the hook sandbox as an interactive shell over SSH. Use it to try
+commands before you put them in a hook.
+
+1. Start `objgitd` with `-ssh-bind` and `-allow-hooks`.
+2. Push the branch that you want to examine.
+3. Connect with a terminal:
+
+   ```text
+   ssh -t -p 2222 git@host sh myproject.git
+   ```
+
+4. To examine a branch other than the one that `HEAD` points to, give its name:
+
+   ```text
+   ssh -t -p 2222 git@host sh myproject.git feature
+   ```
+
+The shell is the same as the one that a hook gets:
+
+- `/src` is the tip commit of the branch, read-only, and the shell starts there.
+- `/tmp` is scratch space, and it is empty at the start of each session.
+- The `OBJGIT_*` variables describe the tip commit as if you pushed it.
+  `OBJGIT_OLD_SHA` is its first parent, or all zeros for a root commit.
+- Each command gets the hook stdin line, so `read old new ref` works.
+
+The shell is different from a hook in these ways:
+
+- A write into `/src` shows an error, but the session continues.
+- `-hook-timeout` applies to each command, and not to the session.
+- Ctrl-C clears the line at the prompt. It does not stop a command that runs.
+  The timeout stops that command.
+
+To leave the shell, type `exit` or press Ctrl-D.
+
+To open the shell, you need write access to the repository. If the server
+refuses the session, it shows one of these errors:
+
+| Error                                                          | Cause                                       |
+| -------------------------------------------------------------- | ------------------------------------------- |
+| `sh is disabled; start objgitd with -allow-hooks to enable it` | The server runs without `-allow-hooks`.     |
+| `sh needs a terminal; use ssh -t`                              | The client did not request a PTY.           |
+| `access denied`                                                | You do not have write access.               |
+| `repository "…" not found`                                     | The repository does not exist.              |
+| `branch "…" not found`                                         | The branch does not exist.                  |
+| `HEAD is detached; name a branch: …`                           | `HEAD` is not a branch. Give a branch name. |
+
 ## Observing hooks
 
 All hook activity is logged through the server's structured (`slog`) logger:
