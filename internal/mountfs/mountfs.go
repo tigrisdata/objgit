@@ -13,6 +13,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/go-git/go-billy/v6"
@@ -69,10 +70,49 @@ func (f *FS) OpenFile(filename string, flag int, perm fs.FileMode) (billy.File, 
 		return nil, pathErr("open", filename, err)
 	}
 	if isRoot || isMount {
-		return nil, pathErr("open", filename, billy.ErrNotSupported)
+		return f.openDir(filename, flag)
 	}
-	return sub.OpenFile(rel, flag, perm)
+	file, err := sub.OpenFile(rel, flag, perm)
+	if err == nil || flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_APPEND|os.O_TRUNC) != 0 {
+		return file, err
+	}
+	// Some mounted filesystems cannot open directories. WASI needs directory
+	// handles to resolve paths beneath the preopened root.
+	if info, statErr := sub.Stat(rel); statErr == nil && info.IsDir() {
+		return f.openDir(filename, flag)
+	}
+	return nil, err
 }
+
+func (f *FS) openDir(filename string, flag int) (billy.File, error) {
+	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_APPEND|os.O_TRUNC) != 0 {
+		return nil, pathErr("open", filename, billy.ErrReadOnly)
+	}
+	return &dirFile{fsys: f, name: path.Clean("/" + filename)}, nil
+}
+
+// dirFile is a read-only handle for a virtual or mounted directory. The WASI
+// adapter uses its name to stat and list entries through the composite FS.
+type dirFile struct {
+	fsys *FS
+	name string
+}
+
+func (d *dirFile) Name() string               { return d.name }
+func (d *dirFile) Stat() (fs.FileInfo, error) { return d.fsys.Stat(d.name) }
+func (d *dirFile) Close() error               { return nil }
+func (d *dirFile) Read([]byte) (int, error)   { return 0, syscall.EISDIR }
+func (d *dirFile) ReadAt([]byte, int64) (int, error) {
+	return 0, syscall.EISDIR
+}
+func (d *dirFile) Write([]byte) (int, error) { return 0, billy.ErrReadOnly }
+func (d *dirFile) WriteAt([]byte, int64) (int, error) {
+	return 0, billy.ErrReadOnly
+}
+func (d *dirFile) Seek(int64, int) (int64, error) { return 0, syscall.EISDIR }
+func (d *dirFile) Truncate(int64) error           { return billy.ErrReadOnly }
+
+var _ billy.File = (*dirFile)(nil)
 
 func (f *FS) Stat(filename string) (fs.FileInfo, error) {
 	sub, rel, isRoot, isMount, err := f.route(filename)

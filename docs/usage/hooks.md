@@ -47,11 +47,12 @@ Hooks run in [kefka](https://xeiaso.net/blog/2026/dancing-mad-sandboxing/), a
 virtual `bash` interpreter. **This is not a container, VM, or OS sandbox.** It is
 safe because of what it _cannot_ reach, not because of kernel isolation:
 
-- **No system binaries.** Only kefka's built-in commands exist — roughly the
-  POSIX coreutils: `cat`, `ls`, `echo`, `printf`, `head`, `tail`, `cut`, `sort`,
-  `uniq`, `wc`, `tr`, `grep`, `sha256sum`, `base64`, `mkdir`, `cp`, `mv`, `rm`,
-  `touch`, `date`, `sleep`, `seq`, `expr`, and so on. There is no `git`, no
-  package manager, no compiler, no `curl`.
+- **No system binaries.** Kefka provides Go commands, WASM-backed uutils, and
+  the WASM programs `jq`, `python3` (also `python`), `qjs`, and `rg`. Available
+  coreutils include `cat`, `ls`, `printf`, `head`, `tail`, `cut`, `sort`,
+  `uniq`, `wc`, `tr`, `sha256sum`, `base64`, `base32`, `mkdir`, `cp`, `mv`,
+  `rm`, `touch`, `date`, `sleep`, `seq`, and `expr`. There is no `git`,
+  package manager, compiler, or `curl`.
 - **No network.**
 - **No host filesystem.** The only files a hook can see are the two mounts
   below.
@@ -218,5 +219,6 @@ Hook failure is logged, but it cannot undo the accepted push.
 - No writable working tree: `/src` is strictly read-only and `/tmp` is the only
   scratch space.
 - No way to reject a push from a hook (it runs after the fact).
-- No system tooling, network, or arbitrary executables — only kefka built-ins.
+- No system tooling, network, or arbitrary executables — only kefka's
+  registered commands.
 - Hook output reaches the pusher only when the client negotiated sideband.

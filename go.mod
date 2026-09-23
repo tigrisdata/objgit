@@ -18,7 +18,7 @@ require (
 	golang.org/x/sync v0.20.0
 	golang.org/x/term v0.43.0
 	mvdan.cc/sh/v3 v3.13.1
-	tangled.org/xeiaso.net/kefka v0.0.6-0.20260528192045-e0a84e40ceb8
+	tangled.org/xeiaso.net/kefka v0.0.6-0.20260823145432-0592fe1f1777
 )
 
 require (
@@ -60,13 +60,13 @@ require (
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/sergi/go-diff v1.4.0 // indirect
+	github.com/tetratelabs/wazero v1.11.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	golang.org/x/exp/typeparams v0.0.0-20231108232855-2478ac86f678 // indirect
 	golang.org/x/mod v0.36.0 // indirect
 	golang.org/x/net v0.54.0 // indirect
 	golang.org/x/sys v0.44.0 // indirect
 	golang.org/x/telemetry v0.0.0-20260508192327-42602be52be6 // indirect
-	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/tools v0.45.0 // indirect
 	google.golang.org/protobuf v1.36.8
 	honnef.co/go/tools v0.7.0 // indirect
