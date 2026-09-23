@@ -21,9 +21,10 @@ literals live in `manifest/kustomization.yaml`:
 
 - `BUCKET` in the `objgitd-config` configMapGenerator is **required**. The
   daemon does not start when this variable does not name a Tigris bucket.
-- The `objgitd-tigris` secretGenerator holds a static Tigris keypair
-  (`TIGRIS_STORAGE_ACCESS_KEY_ID`, `TIGRIS_STORAGE_SECRET_ACCESS_KEY`).
-  Before you apply the configuration, replace both placeholder values.
+- The `objgitd-tigris` secretGenerator holds a static Tigris keypair under
+  the standard AWS names (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`).
+  Before you apply the configuration, replace both placeholder values. Add
+  `AWS_SESSION_TOKEN` for temporary credentials.
 
 To avoid a long-lived keypair, use IRSA or workload identity:
 

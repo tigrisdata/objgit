@@ -65,8 +65,10 @@ configMapGenerator:
       - SLOG_LEVEL=INFO
 
 secretGenerator:
-  # Static Tigris credentials. The storage-go client prefers these over the
-  # AWS SDK default chain. Replace the placeholder values before you apply.
+  # Static Tigris credentials under their standard AWS names. The AWS SDK
+  # default chain reads them from the environment. Replace the placeholder
+  # values before you apply. Add AWS_SESSION_TOKEN for temporary
+  # credentials.
   #
   # To avoid a long-lived keypair: delete this generator and the secretRef in
   # deployment.yaml (it is optional). Then annotate the objgitd
@@ -74,5 +76,5 @@ secretGenerator:
   # the role on its own.
   - name: objgitd-tigris
     literals:
-      - TIGRIS_STORAGE_ACCESS_KEY_ID=replace-me
-      - TIGRIS_STORAGE_SECRET_ACCESS_KEY=replace-me
+      - AWS_ACCESS_KEY_ID=replace-me
+      - AWS_SECRET_ACCESS_KEY=replace-me
