@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: objgitd-pack-cache
+  labels:
+    app.kubernetes.io/name: objgitd
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: objgit
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # storageClassName is deliberately unset, so the cluster uses its default
+  # StorageClass. If the default is not the provisioner you want, name a
+  # class explicitly.
+  resources:
+    requests:
+      storage: 16Gi

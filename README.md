@@ -123,4 +123,6 @@ To ssh://localhost:2222/xeiaso.net/objgit.git
 
 ### Deployment to production
 
-TODO(Xe): re-evaluate performance-based life choices and write.
+There is a kustomize deployment in [`manifest/`](./manifest/). See
+[docs/usage/kubernetes.md](./docs/usage/kubernetes.md) for configuration and
+caveats.

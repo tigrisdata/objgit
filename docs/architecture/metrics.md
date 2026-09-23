@@ -7,7 +7,8 @@ the **default registry**. The Go-runtime and process collectors from
 `main.go` serves `promhttp.Handler()` on its own listener. The flag is
 `-metrics-bind`, the default is `:9090`, and an empty value disables the
 listener. It uses the same errgroup Serve and Shutdown idiom as the HTTP
-transport.
+transport. The same listener also answers `GET /healthz` with `200 ok` for
+probes and load balancers, and serves pprof under `/debug/pprof/`.
 
 All series carry the prefix `objgit_`. There is no `repo` label, because
 repository names have unbounded cardinality. Git operations are keyed by
