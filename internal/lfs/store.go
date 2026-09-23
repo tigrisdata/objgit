@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 
@@ -95,7 +96,20 @@ func (s *Store) Marker(ctx context.Context, repo, oid string) (int64, bool, erro
 		}
 		return 0, false, fmt.Errorf("heading lfs marker for %s: %w", oid, err)
 	}
-	size, _ := strconv.ParseInt(out.Metadata[metaSize], 10, 64)
+	// A marker whose size is absent or unreadable is not a zero-byte object.
+	// Reporting it as one holds the oid at size 0 forever: every later upload
+	// batch answers 422 "stored with size 0", and because the object reads as
+	// held, batch never offers an upload action, so the client has no way back.
+	// Treating the marker as unusable costs one re-upload, and that re-upload
+	// rewrites the marker with a good size. The repository loses no access it
+	// could otherwise keep, because absence only ever denies.
+	raw := out.Metadata[metaSize]
+	size, perr := strconv.ParseInt(raw, 10, 64)
+	if perr != nil {
+		slog.Warn("lfs marker has an unusable size, treating the object as not held so it can be uploaded again",
+			"repo", repo, "oid", oid, "value", raw, "err", perr)
+		return 0, false, nil
+	}
 	return size, true, nil
 }
 
@@ -125,12 +139,7 @@ func (s *Store) Verify(ctx context.Context, repo, oid string, size int64) (Verif
 	})
 	if err != nil {
 		if isNotFound(err) {
-			// Nothing staged. Either the upload never happened, or it was
-			// already promoted by an earlier verify.
-			if _, held, mErr := s.Marker(ctx, repo, oid); mErr == nil && held {
-				return VerifyOK, nil
-			}
-			return VerifyMissing, nil
+			return s.verifyPromoted(ctx, repo, oid)
 		}
 		return VerifyMissing, fmt.Errorf("heading staged lfs object %s: %w", oid, err)
 	}
@@ -167,6 +176,14 @@ func (s *Store) Verify(ctx context.Context, repo, oid string, size int64) (Verif
 		Key:        aws.String(BlobKey(oid)),
 		CopySource: aws.String(s.bucket + "/" + staged),
 	}); err != nil {
+		// The staging key went away between the head and the rename. Two
+		// verifies for the same object race in normal use: git-lfs retries a
+		// failed verify, and a client may re-POST. The first one consumes the
+		// staging key, so the second finds nothing to promote. That is the same
+		// state as an upload already promoted, and not a server fault.
+		if isNotFound(err) {
+			return s.verifyPromoted(ctx, repo, oid)
+		}
 		return VerifyMissing, fmt.Errorf("promoting staged lfs object %s: %w", oid, err)
 	}
 
@@ -174,6 +191,25 @@ func (s *Store) Verify(ctx context.Context, repo, oid string, size int64) (Verif
 		return VerifyMissing, err
 	}
 	return VerifyOK, nil
+}
+
+// verifyPromoted answers a verify that found no staged bytes. Either the upload
+// never happened, or an earlier verify already promoted it, so the marker
+// decides.
+//
+// A bucket failure reading the marker is an error and never absence. Reporting
+// it as VerifyMissing answers the client 404 "object was not uploaded", which
+// sends it to re-upload an object that is already there, and records "missing"
+// on the verify metric, which hides the fault from the alert.
+func (s *Store) verifyPromoted(ctx context.Context, repo, oid string) (VerifyStatus, error) {
+	_, held, err := s.Marker(ctx, repo, oid)
+	if err != nil {
+		return VerifyMissing, err
+	}
+	if held {
+		return VerifyOK, nil
+	}
+	return VerifyMissing, nil
 }
 
 // rejectStaged deletes a staged object whose bytes are not what they claim.

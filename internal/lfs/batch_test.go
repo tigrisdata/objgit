@@ -139,6 +139,17 @@ func TestBatchUpload(t *testing.T) {
 			wantErrCode: 422,
 		},
 		{
+			// A marker whose size cannot be read must leave the client a way
+			// out. Counting it as held at size 0 answers every later batch 422
+			// and never offers an upload action, so nothing can repair it.
+			name: "marker with an unreadable size is uploaded again",
+			seed: func(f *fakeS3) {
+				f.set(MarkerKey(testRepo, testOID), fakeObject{})
+			},
+			size:       4,
+			wantUpload: true,
+		},
+		{
 			// The bytes are in the bucket but this repository has no marker, so
 			// it must upload. Trusting the global blob here is the read oracle.
 			name: "bytes exist elsewhere so the client still uploads",

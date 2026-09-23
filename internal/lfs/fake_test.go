@@ -42,6 +42,15 @@ type fakeS3 struct {
 	// putHook runs before a Put is applied, so a test can land a competing
 	// write in the middle of a compare-and-swap loop.
 	putHook func(key string)
+
+	// headHook runs before a Head is answered. A returned error fails that one
+	// call, which is how a test makes the bucket fail for one key and answer
+	// another normally.
+	headHook func(key string) error
+
+	// renameHook runs before a Rename is applied, so a test can land a
+	// competing verify between this call's head and its promotion.
+	renameHook func(src string)
 }
 
 func newFakeS3() *fakeS3 {
@@ -53,6 +62,13 @@ func newFakeS3() *fakeS3 {
 var errPreconditionFailed = &smithy.GenericAPIError{
 	Code:    "PreconditionFailed",
 	Message: "At least one of the pre-conditions you specified did not hold",
+}
+
+// errBucketUnavailable is a transient bucket fault. It carries a code
+// isNotFound does not match, because a fault is never absence.
+var errBucketUnavailable = &smithy.GenericAPIError{
+	Code:    "InternalError",
+	Message: "We encountered an internal error. Please try again.",
 }
 
 // readAll drains a request body, which is nil for a bodyless PUT.
@@ -95,6 +111,13 @@ func (f *fakeS3) putMarker(repo, oid string, size int64) {
 	})
 }
 
+// drop removes an object directly, bypassing the API. For seeding only.
+func (f *fakeS3) drop(key string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.objects, key)
+}
+
 func (f *fakeS3) has(key string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -105,6 +128,11 @@ func (f *fakeS3) has(key string) bool {
 func (f *fakeS3) HeadObject(_ context.Context, in *s3.HeadObjectInput, _ ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
 	if f.headErr != nil {
 		return nil, f.headErr
+	}
+	if f.headHook != nil {
+		if err := f.headHook(aws.ToString(in.Key)); err != nil {
+			return nil, err
+		}
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -177,10 +205,14 @@ func (f *fakeS3) RenameObject(_ context.Context, in *s3.CopyObjectInput, _ ...fu
 	if f.renameErr != nil {
 		return nil, f.renameErr
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	// CopySource is "<bucket>/<key>"; the fake has one bucket, so drop it.
 	_, src, _ := strings.Cut(aws.ToString(in.CopySource), "/")
+	if f.renameHook != nil {
+		f.renameHook(src)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	o, ok := f.objects[src]
 	if !ok {
 		return nil, &types.NoSuchKey{}
