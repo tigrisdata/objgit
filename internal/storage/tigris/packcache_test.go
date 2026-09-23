@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -494,7 +495,15 @@ func TestPackCacheEvictIdle(t *testing.T) {
 func TestPackCacheObserver(t *testing.T) {
 	var mu sync.Mutex
 	var events []string
-	observe := func(e string) { mu.Lock(); events = append(events, e); mu.Unlock() }
+	var c *PackCache
+	observe := func(e string) {
+		// Taking c.mu from inside the callback deadlocks if any emit ever
+		// runs under the lock. The long idle limit means it evicts nothing.
+		c.EvictIdle(24 * time.Hour)
+		mu.Lock()
+		events = append(events, e)
+		mu.Unlock()
+	}
 
 	now := time.Unix(1000, 0)
 	c, err := NewSnapshotCache(t.TempDir(), 10, observe) // 10-byte budget
@@ -504,28 +513,107 @@ func TestPackCacheObserver(t *testing.T) {
 	t.Cleanup(func() { c.Cleanup() })
 	c.now = func() time.Time { return now }
 
-	get := func(id string, body []byte) {
+	get := func(id string, body []byte, fetchErr error) {
 		sum := sha256.Sum256(body)
 		f, err := c.GetChecked(id, func(w io.Writer) (string, error) {
+			if fetchErr != nil {
+				return "", fetchErr
+			}
 			_, err := w.Write(body)
 			return hex.EncodeToString(sum[:]), err
 		})
-		if err != nil {
-			t.Fatalf("GetChecked(%s): %v", id, err)
+		if (err != nil) != (fetchErr != nil) {
+			t.Errorf("GetChecked(%s) err = %v, want %v", id, err, fetchErr)
 		}
-		f.Close()
+		if f != nil {
+			f.Close()
+		}
 	}
 
-	get("a", []byte("123456")) // miss
-	get("a", []byte("123456")) // hit
-	get("b", []byte("abcdef")) // miss, evicts a: evict_budget
-	now = now.Add(time.Hour)
-	c.EvictIdle(time.Minute) // evicts b: evict_idle
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		get("a", []byte("123456"), nil)          // miss
+		get("a", []byte("123456"), nil)          // hit
+		get("x", nil, errors.New("bucket down")) // miss, and no hit for the failure
+		get("b", []byte("abcdef"), nil)          // miss, evicts a: evict_budget
+		now = now.Add(time.Hour)
+		c.EvictIdle(time.Minute) // evicts b: evict_idle
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("observer deadlocked: an emit runs under c.mu")
+	}
 
-	want := []string{"miss", "hit", "miss", "evict_budget", "evict_idle"}
+	want := []string{"miss", "hit", "miss", "miss", "evict_budget", "evict_idle"}
 	mu.Lock()
 	defer mu.Unlock()
 	if !slices.Equal(events, want) {
 		t.Errorf("events = %v, want %v", events, want)
+	}
+}
+
+// TestPackCacheEvictIdleSkipsInFlight pins two EvictIdle invariants: it never
+// touches a download that has not settled, and an idle eviction gives its
+// bytes back to the budget.
+func TestPackCacheEvictIdleSkipsInFlight(t *testing.T) {
+	var events []string
+	var mu sync.Mutex
+	now := time.Unix(1000, 0)
+	c, err := NewSnapshotCache(t.TempDir(), 10, func(e string) { mu.Lock(); events = append(events, e); mu.Unlock() })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Cleanup() })
+	c.now = func() time.Time { return now }
+
+	body := []byte("12345678") // 8 of the 10-byte budget
+	sum := sha256.Sum256(body)
+	release := make(chan struct{})
+	started := make(chan struct{})
+	got := make(chan error, 1)
+	go func() {
+		f, err := c.GetChecked("slow", func(w io.Writer) (string, error) {
+			close(started)
+			<-release
+			_, err := w.Write(body)
+			return hex.EncodeToString(sum[:]), err
+		})
+		if f != nil {
+			f.Close()
+		}
+		got <- err
+	}()
+	<-started
+
+	now = now.Add(time.Hour)
+	if n := c.EvictIdle(0); n != 0 {
+		t.Fatalf("EvictIdle evicted %d entries while a download was in flight, want 0", n)
+	}
+	close(release)
+	if err := <-got; err != nil {
+		t.Fatalf("GetChecked after EvictIdle: %v", err)
+	}
+
+	// Settled now: an idle sweep takes it, and its bytes leave the budget, so
+	// a second 8-byte entry fits without a budget eviction.
+	now = now.Add(time.Hour)
+	if n := c.EvictIdle(time.Minute); n != 1 {
+		t.Fatalf("EvictIdle = %d, want 1", n)
+	}
+	sum2 := sha256.Sum256([]byte("abcdefgh"))
+	f, err := c.GetChecked("next", func(w io.Writer) (string, error) {
+		_, err := w.Write([]byte("abcdefgh"))
+		return hex.EncodeToString(sum2[:]), err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	mu.Lock()
+	defer mu.Unlock()
+	if slices.Contains(events, "evict_budget") {
+		t.Errorf("events = %v: EvictIdle did not return the evicted bytes to the budget", events)
 	}
 }

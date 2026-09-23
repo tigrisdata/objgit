@@ -156,22 +156,30 @@ func expectID(id string, fetch func(io.Writer) error) func(io.Writer) (string, e
 }
 
 // GetChecked is Get for ids that are not content digests, such as a snapshot
-// id (see NewSnapshotCache): fetch writes the body and reports the SHA-256 it
-// must have. A body whose digest disagrees is refused and not cached.
+// id (see NewSnapshotCache): fetch writes the body and reports the lower-case
+// hex SHA-256 it must have. A body whose digest disagrees is refused and not
+// cached.
+//
+// The observer sees "miss" once for each download this call runs, and "hit"
+// only when this call returns a file without running one. Joining another
+// caller's download counts as a hit, because this call downloaded nothing.
 //
 // The caller owns the returned descriptor and must close it.
 func (c *PackCache) GetChecked(id string, fetch func(w io.Writer) (wantSHA256 string, err error)) (*os.File, error) {
+	ranFill := false
 	// Bounded, because an entry can in principle be evicted by competing
 	// downloads between the fill and the open. Exhausting the budget returns an
 	// error, and packindex.go's bulk tier degrades to ranged GETs on one.
 	for try := 0; try < 3; try++ {
 		e, mine := c.claim(id)
 		if mine {
+			ranFill = true
 			c.emit("miss", 1)
 			slog.Debug("cache entry not cached, downloading", "id", id, "try", try)
-			c.fill(e, fetch)
+			// fill has closed e.ready by the time it returns, so the observer
+			// below never holds up a waiter.
+			c.emit("evict_budget", c.fill(e, fetch))
 		} else {
-			c.emit("hit", 1)
 			// Either a settled entry or a download another caller is already
 			// running; both mean this caller downloads nothing.
 			slog.Debug("cache entry served from cache", "id", id, "path", e.path)
@@ -184,6 +192,9 @@ func (c *PackCache) GetChecked(id string, fetch func(w io.Writer) (wantSHA256 st
 		f, err := os.Open(e.path)
 		switch {
 		case err == nil:
+			if !ranFill {
+				c.emit("hit", 1)
+			}
 			return f, nil
 		case errors.Is(err, os.ErrNotExist):
 			// Evicted between the lookup and the open. Forget this entry and
@@ -252,7 +263,9 @@ func (c *PackCache) forget(e *cacheEntry) {
 }
 
 // fill runs the download for an entry this caller claimed, then releases every
-// waiter. A failed download un-registers the entry, so the failure is not
+// waiter, and reports how many entries the admission evicted to meet the
+// budget. It emits nothing itself: the caller reports the count after fill
+// returns, which is after ready closes. A failed download un-registers the entry, so the failure is not
 // cached: the per-Storer packAccess.start guard in packindex.go is what stops
 // a retry storm, and a genuinely transient error stays retryable by a later
 // request.
@@ -261,7 +274,7 @@ func (c *PackCache) forget(e *cacheEntry) {
 // e.stream, so readers of this pack never have to wait for the whole container
 // — see packindex.go's watermark tier. The stream is torn down before ready
 // closes, so nothing can be served out of a body that failed its checksum.
-func (c *PackCache) fill(e *cacheEntry, fetch func(io.Writer) (string, error)) {
+func (c *PackCache) fill(e *cacheEntry, fetch func(io.Writer) (string, error)) int {
 	defer close(e.ready)
 
 	start := time.Now()
@@ -270,10 +283,10 @@ func (c *PackCache) fill(e *cacheEntry, fetch func(io.Writer) (string, error)) {
 	// filesystem boundary.
 	tmp, err := os.CreateTemp(c.dir, "download-*")
 	if err != nil {
-		e.err = fmt.Errorf("tigris: stage pack %s: %w", e.id, err)
-		slog.Debug("pack download failed", "pack", e.id, "err", e.err)
+		e.err = fmt.Errorf("tigris: stage cache entry %s: %w", e.id, err)
+		slog.Debug("cache download failed", "id", e.id, "err", e.err)
 		c.forget(e)
-		return
+		return 0
 	}
 
 	// A second, read-only descriptor on the same inode. It has to be its own
@@ -290,13 +303,13 @@ func (c *PackCache) fill(e *cacheEntry, fetch func(io.Writer) (string, error)) {
 		// references the stream at all.
 		runtime.AddCleanup(ps, func(f *os.File) { f.Close() }, rd)
 	} else {
-		slog.Debug("cannot open the staging file for watermark reads", "pack", e.id, "err", oerr)
+		slog.Debug("cannot open the staging file for watermark reads", "id", e.id, "err", oerr)
 	}
 
 	size, err := verifiedCopy(tmp, e.id, fetch, progress)
 	e.stream.Store(nil)
 	if cerr := tmp.Close(); err == nil && cerr != nil {
-		err = fmt.Errorf("tigris: stage pack %s: %w", e.id, cerr)
+		err = fmt.Errorf("tigris: stage cache entry %s: %w", e.id, cerr)
 	}
 	if err == nil {
 		err = os.Rename(tmp.Name(), e.path)
@@ -304,9 +317,9 @@ func (c *PackCache) fill(e *cacheEntry, fetch func(io.Writer) (string, error)) {
 	if err != nil {
 		os.Remove(tmp.Name())
 		e.err = err
-		slog.Debug("pack download failed", "pack", e.id, "dur", time.Since(start), "err", err)
+		slog.Debug("cache download failed", "id", e.id, "dur", time.Since(start), "err", err)
 		c.forget(e)
-		return
+		return 0
 	}
 
 	c.mu.Lock()
@@ -321,7 +334,7 @@ func (c *PackCache) fill(e *cacheEntry, fetch func(io.Writer) (string, error)) {
 		"cache_entries", len(c.entries))
 	n := c.evictLocked(e.id)
 	c.mu.Unlock()
-	c.emit("evict_budget", n)
+	return n
 }
 
 // evictLocked unlinks least-recently-used entries until the budget is met,
