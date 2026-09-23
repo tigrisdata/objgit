@@ -22,6 +22,7 @@ require (
 
 require (
 	github.com/Xe/erofs v0.6.1 // indirect
+	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/pierrec/lz4/v4 v4.1.26 // indirect
 )
 
