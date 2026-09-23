@@ -36,6 +36,7 @@ Three behaviors live on `*daemon`, so every transport acts the same way:
 | [auth.md](auth.md)                   | The one authorization interface that every transport calls.       |
 | [hooks.md](hooks.md)                 | Push hooks, live output streaming, and the kefka sandbox.         |
 | [metrics.md](metrics.md)             | Prometheus vectors and the three instrumentation seams.           |
+| [snapshots.md](snapshots.md)         | erofs images of pushed trees, and the snapshot cache.             |
 | [tigris-storer.md](tigris-storer.md) | Repository storage: a `storage.Storer` on one Tigris bucket.      |
 | [s3fs.md](s3fs.md)                   | Daemon-level state: a `billy.Filesystem` on Tigris.               |
 

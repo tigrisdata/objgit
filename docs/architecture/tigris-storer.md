@@ -32,6 +32,7 @@ call has run.
 | `packs/<id>.cue`   | The record index for one container.                 |
 | `packed-refs`      | Every reference in one object. See "References".     |
 | `refs/<name>`      | One legacy loose reference. Read-only.               |
+| `snapshots/erofs/v1/<tree>.erofs` | One erofs image of a tree. See [snapshots.md](snapshots.md). |
 
 Shallow marks, the worktree index, and the repository configuration sit at
 root-level keys. They carry the same prefix as everything else. The `shallow`
@@ -501,6 +502,26 @@ Three design notes are worth not deriving a second time:
 - **The stream is cleared before the download settles.** A reader can then
   take one ranged GET in that window, which is correct. The alternative
   serves bytes out of a body that failed its checksum.
+
+### The second instance: the snapshot cache
+
+The same type also caches erofs snapshot images. `NewSnapshotCache` makes a
+second instance in an `objgit-snapshots-*` directory, with its own budget.
+`WithSnapshotCache` installs it, and `Scoped` shares it.
+
+Three functions exist for this instance. The pack cache does not use them.
+
+- `GetChecked` is `Get` for an id that is not a content digest. Its fetch
+  returns the lower-case hex SHA-256 that the body must have. `Get` is
+  `GetChecked` with a fetch that returns the id.
+- `EvictIdle` deletes every settled entry that nobody claimed during the idle
+  limit. It never touches a download that has not settled.
+- The observer gets `miss` for each download that one call runs, and `hit`
+  when a call returns a file with no download. It also gets `evict_budget`
+  and `evict_idle`. The observer always runs outside the cache lock, and
+  after the waiters of a download are released.
+
+See [snapshots.md](snapshots.md).
 
 ## Testing seams
 
