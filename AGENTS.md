@@ -18,8 +18,8 @@ One backend answers three transports:
 All three funnel authorization through one pluggable
 `internal/auth.Authorizer`.
 
-A fourth listener serves Prometheus metrics at `/metrics` (`-metrics-bind`,
-default `:9090`). An empty value disables it.
+A fourth listener serves Prometheus metrics at `/metrics` and a `/healthz`
+probe endpoint (`-metrics-bind`, default `:9090`). An empty value disables it.
 
 ## Commands
 
