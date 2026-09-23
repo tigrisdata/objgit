@@ -56,6 +56,7 @@ Notes on the tests and on configuration:
 | `cmd/objgitd/git_protocol.go`                             | The git:// server. Also holds `operationFor` and `(*daemon).authorize`.           |
 | `cmd/objgitd/http.go`                                     | Smart HTTP. `*daemon` is the `http.Handler` itself.                               |
 | `cmd/objgitd/ssh.go`                                      | The SSH server and its per-session dispatch.                                      |
+| `cmd/objgitd/shell.go`                                    | The SSH `sh` command: an interactive shell in the hook sandbox.                   |
 | `cmd/objgitd/receivepack.go`                              | The go-git fork that streams hook output, plus `writePack`.                       |
 | `cmd/objgitd/hooks.go`                                    | Ref diffing and the sandboxed hook run.                                           |
 | `internal/auth`                                           | The one authorization interface.                                                  |

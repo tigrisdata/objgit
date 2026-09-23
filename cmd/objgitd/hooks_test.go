@@ -76,11 +76,12 @@ func TestReceivePackHook(t *testing.T) {
 	runGit(t, work, "config", "user.email", "test@example.com")
 	runGit(t, work, "config", "user.name", "Test")
 
-	// The hook reads /src (cwd), writes scratch to /tmp, then attempts a write
-	// into the read-only /src. The final write aborts the shell with a
+	// The hook reads /src (cwd, and $PWD), writes scratch to /tmp, then attempts
+	// a write into the read-only /src. The final write aborts the shell with a
 	// read-only error, so WROTE_SRC must never print.
 	hook := strings.Join([]string{
 		"cat README.md",
+		`echo "cwd=$PWD"`,
 		"echo built > /tmp/out",
 		"cat /tmp/out",
 		"echo nope > /src/nope.txt",
@@ -101,7 +102,7 @@ func TestReceivePackHook(t *testing.T) {
 		t.Fatalf("hook did not run; logs:\n%s", logs)
 	}
 	// /src is readable and /tmp is writable; their output streamed to the client.
-	for _, want := range []string{"hello from repo", "built"} {
+	for _, want := range []string{"hello from repo", "cwd=/src", "built"} {
 		if !strings.Contains(pushOut, want) {
 			t.Errorf("push output missing streamed hook output %q; output:\n%s", want, pushOut)
 		}

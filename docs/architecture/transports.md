@@ -59,6 +59,11 @@ restart, and the server needs no local disk.
 Receive-pack goes through `d.receivePack`, and not through
 `transport.ReceivePack`, so [push hooks](hooks.md) also run over SSH.
 
+**One command is not git.** `sh <repo> [branch]` goes to `handleShell` in
+`shell.go`, before `gitServiceFor` runs. It opens the [hook sandbox](hooks.md)
+as an interactive shell over the session PTY. It needs `-allow-hooks`, a PTY,
+and `auth.Write` on the repository, because only a pusher can trigger a hook.
+
 Protocol v2 is not forwarded yet. `s.Environ()` carries `GIT_PROTOCOL`, but v0
 and v1 are enough for now.
 

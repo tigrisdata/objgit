@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/memfs"
+	"github.com/go-git/go-billy/v6/util"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/transport"
@@ -28,6 +30,11 @@ import (
 	"tangled.org/xeiaso.net/kefka/command/registry"
 	"tangled.org/xeiaso.net/kefka/command/registry/coreutils"
 )
+
+// receivePackHook names the hook that a push runs, and so its script at
+// .objgit/hooks/receive-pack and its OBJGIT_SERVICE. It is not the transport
+// service name, which is "git-receive-pack".
+const receivePackHook = "receive-pack"
 
 // refUpdate records a single branch ref change applied by a receive-pack.
 // A zero Old means the branch was created; a zero New means it was deleted.
@@ -67,7 +74,7 @@ func (d *daemon) receivePack(ctx context.Context, st storage.Storer, repoPath st
 					branches = append(branches, u)
 				}
 			}
-			d.runHooks(repoPath, "receive-pack", st, branches, progress)
+			d.runHooks(repoPath, receivePackHook, st, branches, progress)
 		}
 		d.emitPushWebhooks(ctx, st, repoPath, webhooks, updates, acceptedAt)
 	}
@@ -132,57 +139,11 @@ func (d *daemon) runHook(repoPath, service string, st storage.Storer, u refUpdat
 		return
 	}
 
-	fsys := mountfs.New(map[string]billy.Filesystem{
-		"src": treefs.New(tree),
-		"tmp": memfs.New(),
-	})
-
 	ctx, cancel := context.WithTimeout(context.Background(), d.hookTimeout)
 	defer cancel()
-	changes, err := pushevents.Diff(ctx, st, u.Old, u.New)
+	changes, err := loadHookChanges(ctx, st, u)
 	if err != nil {
 		log.Error("hook: diff changed files", "err", err)
-		return
-	}
-	// Keep empty lists as JSON arrays. Paths can contain whitespace or newlines,
-	// so JSON is the only unambiguous representation in environment variables.
-	added := append([]string{}, changes.GetAdded()...)
-	changed := append([]string{}, changes.GetChanged()...)
-	deleted := append([]string{}, changes.GetDeleted()...)
-	addedJSON, err := json.Marshal(added)
-	if err != nil {
-		log.Error("hook: encode added files", "err", err)
-		return
-	}
-	changedJSON, err := json.Marshal(changed)
-	if err != nil {
-		log.Error("hook: encode changed files", "err", err)
-		return
-	}
-	deletedJSON, err := json.Marshal(deleted)
-	if err != nil {
-		log.Error("hook: encode deleted files", "err", err)
-		return
-	}
-	metadata, err := json.Marshal(struct {
-		Added   []string `json:"added"`
-		Changed []string `json:"changed"`
-		Deleted []string `json:"deleted"`
-	}{added, changed, deleted})
-	if err != nil {
-		log.Error("hook: encode changed files", "err", err)
-		return
-	}
-	const changesFile = "/tmp/objgit-changes.json"
-	f, err := fsys.Create(changesFile)
-	if err != nil {
-		log.Error("hook: create changes file", "err", err)
-		return
-	}
-	_, writeErr := io.Copy(f, bytes.NewReader(metadata))
-	closeErr := f.Close()
-	if err := errors.Join(writeErr, closeErr); err != nil {
-		log.Error("hook: write changes file", "err", err)
 		return
 	}
 
@@ -196,49 +157,8 @@ func (d *daemon) runHook(repoPath, service string, st storage.Storer, u refUpdat
 		stdout, stderr = progress, progress
 	}
 
-	reg := registry.New()
-	coreutils.Register(reg)
-	if err := reg.Chdir(fsys, "/src"); err != nil {
-		log.Error("hook: chdir /src", "err", err)
-		return
-	}
-
-	env := expand.ListEnviron(
-		"HOME=/tmp",
-		"PWD=/src",
-		"TMPDIR=/tmp",
-		"IFS= \t\n",
-		"PATH=/usr/bin:/bin",
-		"KEFKA=1",
-		"OBJGIT_REPO="+repoPath,
-		"OBJGIT_SERVICE="+service,
-		"OBJGIT_REF="+u.Name.String(),
-		"OBJGIT_BRANCH="+u.Name.Short(),
-		"OBJGIT_OLD_SHA="+u.Old.String(),
-		"OBJGIT_NEW_SHA="+u.New.String(),
-		"OBJGIT_ADDED_FILES_JSON="+string(addedJSON),
-		"OBJGIT_CHANGED_FILES_JSON="+string(changedJSON),
-		"OBJGIT_DELETED_FILES_JSON="+string(deletedJSON),
-		"OBJGIT_CHANGES_FILE="+changesFile,
-	)
-	// Mirror git's post-receive stdin: "<old> <new> <ref>\n".
-	stdin := strings.NewReader(u.Old.String() + " " + u.New.String() + " " + u.Name.String() + "\n")
-
-	var sh *interp.Runner
-	middleware := func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
-		return func(ctx context.Context, args []string) error {
-			return reg.Exec(ctx, fsys, sh, args)
-		}
-	}
-	sh, err = interp.New(
-		interp.Env(env),
-		interp.StdIO(stdin, stdout, stderr),
-		interp.ExecHandlers(middleware),
-		interp.CallHandler(kefkash.CallHandler(reg, fsys, stdout, stderr)),
-		interp.StatHandler(kefkash.FsysStatHandler(reg, fsys)),
-		interp.OpenHandler(kefkash.FsysOpenHandler(reg, fsys)),
-		interp.ReadDirHandler2(kefkash.FsysReadDirHandler(reg, fsys)),
-	)
+	stdin := strings.NewReader(hookStdin(u))
+	sh, err := newHookShell(tree, changes, hookEnv(repoPath, service, u, changes), stdin, stdout, stderr)
 	if err != nil {
 		log.Error("hook: build shell", "err", err)
 		return
@@ -270,6 +190,123 @@ func (d *daemon) runHook(repoPath, service string, st storage.Storer, u refUpdat
 		return
 	}
 	log.Info("hook: finished", attrs...)
+}
+
+// hookChangesFile is where a hook finds the JSON object of its file changes.
+const hookChangesFile = "/tmp/objgit-changes.json"
+
+// hookChanges holds the net file changes of one update, encoded the way a hook
+// reads them. Paths can contain whitespace or newlines, so JSON is the only
+// unambiguous form in environment variables.
+type hookChanges struct {
+	added, changed, deleted []byte // JSON arrays, for the environment
+	file                    []byte // JSON object, for hookChangesFile
+}
+
+// loadHookChanges diffs u.Old against u.New. A zero Old diffs against the
+// empty tree, so every file of a new branch is added.
+func loadHookChanges(ctx context.Context, st storage.Storer, u refUpdate) (hookChanges, error) {
+	changes, err := pushevents.Diff(ctx, st, u.Old, u.New)
+	if err != nil {
+		return hookChanges{}, err
+	}
+	// Keep empty lists as JSON arrays, not null.
+	lists := struct {
+		Added   []string `json:"added"`
+		Changed []string `json:"changed"`
+		Deleted []string `json:"deleted"`
+	}{
+		append([]string{}, changes.GetAdded()...),
+		append([]string{}, changes.GetChanged()...),
+		append([]string{}, changes.GetDeleted()...),
+	}
+	var c hookChanges
+	for _, enc := range []struct {
+		dst *[]byte
+		v   any
+	}{
+		{&c.added, lists.Added},
+		{&c.changed, lists.Changed},
+		{&c.deleted, lists.Deleted},
+		{&c.file, lists},
+	} {
+		if *enc.dst, err = json.Marshal(enc.v); err != nil {
+			return hookChanges{}, fmt.Errorf("encode changed files: %w", err)
+		}
+	}
+	return c, nil
+}
+
+// hookEnv returns the environment a hook sees for update u, as KEY=value
+// pairs.
+func hookEnv(repoPath, service string, u refUpdate, c hookChanges) []string {
+	return []string{
+		"HOME=/tmp",
+		"PWD=/src",
+		"TMPDIR=/tmp",
+		"IFS= \t\n",
+		"PATH=/usr/bin:/bin",
+		"KEFKA=1",
+		"OBJGIT_REPO=" + repoPath,
+		"OBJGIT_SERVICE=" + service,
+		"OBJGIT_REF=" + u.Name.String(),
+		"OBJGIT_BRANCH=" + u.Name.Short(),
+		"OBJGIT_OLD_SHA=" + u.Old.String(),
+		"OBJGIT_NEW_SHA=" + u.New.String(),
+		"OBJGIT_ADDED_FILES_JSON=" + string(c.added),
+		"OBJGIT_CHANGED_FILES_JSON=" + string(c.changed),
+		"OBJGIT_DELETED_FILES_JSON=" + string(c.deleted),
+		"OBJGIT_CHANGES_FILE=" + hookChangesFile,
+	}
+}
+
+// hookStdin mirrors git's post-receive stdin for update u: "<old> <new> <ref>\n".
+func hookStdin(u refUpdate) string {
+	return u.Old.String() + " " + u.New.String() + " " + u.Name.String() + "\n"
+}
+
+// newHookShell builds the kefka sandbox a hook runs in: /src is a lazy
+// read-only view of tree, /tmp is writable scratch that holds hookChangesFile,
+// and the shell starts in /src with env. Both push hooks and the SSH sh command
+// use it, so the two environments cannot drift apart.
+func newHookShell(tree *object.Tree, changes hookChanges, env []string, stdin io.Reader, stdout, stderr io.Writer) (*interp.Runner, error) {
+	fsys := mountfs.New(map[string]billy.Filesystem{
+		"src": treefs.New(tree),
+		"tmp": memfs.New(),
+	})
+	if err := util.WriteFile(fsys, hookChangesFile, changes.file, 0o644); err != nil {
+		return nil, fmt.Errorf("write changes file: %w", err)
+	}
+
+	reg := registry.New()
+	coreutils.Register(reg)
+	if err := reg.Chdir(fsys, "/src"); err != nil {
+		return nil, fmt.Errorf("chdir /src: %w", err)
+	}
+
+	var sh *interp.Runner
+	middleware := func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+		return func(ctx context.Context, args []string) error {
+			return reg.Exec(ctx, fsys, sh, args)
+		}
+	}
+	sh, err := interp.New(
+		interp.Env(expand.ListEnviron(env...)),
+		interp.StdIO(stdin, stdout, stderr),
+		interp.ExecHandlers(middleware),
+		interp.CallHandler(kefkash.CallHandler(reg, fsys, stdout, stderr)),
+		interp.StatHandler(kefkash.FsysStatHandler(reg, fsys)),
+		interp.OpenHandler(kefkash.FsysOpenHandler(reg, fsys)),
+		interp.ReadDirHandler2(kefkash.FsysReadDirHandler(reg, fsys)),
+	)
+	if err != nil {
+		return nil, err
+	}
+	// interp seeds $PWD from Dir, which defaults to the daemon's host working
+	// directory. interp.Dir would stat the host, so set the field directly. The
+	// handlers above resolve paths through reg, so nothing else reads Dir.
+	sh.Dir = "/src"
+	return sh, nil
 }
 
 // hookStatus classifies a hook run for metrics: "timeout" when the hook's
