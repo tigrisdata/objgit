@@ -1,3 +1,9 @@
+# [1.7.0](https://github.com/tigrisdata/objgit/compare/v1.6.0...v1.7.0) (2026-09-23)
+
+### Features
+
+- add signed push webhooks and hook file metadata ([#13](https://github.com/tigrisdata/objgit/issues/13)) ([34e61cf](https://github.com/tigrisdata/objgit/commit/34e61cf7e253593b3848d1db56cae6ddc1d8b3f2))
+
 # [1.6.0](https://github.com/tigrisdata/objgit/compare/v1.5.1...v1.6.0) (2026-09-23)
 
 ### Features
