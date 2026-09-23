@@ -128,7 +128,7 @@ func writeConditions(b *strings.Builder, meta runMeta) {
 		if ref == "" {
 			ref = "current checkout"
 		}
-		fmt.Fprintf(b, "| Build %q | %s |\n", s.Name, ref)
+		fmt.Fprintf(b, "| Build %q | %s (%s) |\n", s.Name, ref, orDash(s.Commit))
 	}
 
 	fmt.Fprintf(b, "\n### Corpus\n\n")

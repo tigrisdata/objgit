@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	tstorage "github.com/tigrisdata/storage-go"
 )
 
@@ -76,8 +78,16 @@ func (c *bucketClient) usage(ctx context.Context, prefix string) (bucketUsage, e
 	return out, nil
 }
 
+// deleteBatch is how many keys one DeleteObjects call carries. S3 caps a single
+// request at 1000 keys, so that cap is what the chunking below is for.
+const deleteBatch = 1000
+
 // remove deletes every key a repository left behind. It is only reached from
 // -cleanup; a benchmark run never deletes anything on its own.
+//
+// The count it returns is how many keys the bucket confirmed gone, including on
+// the error path, where it is the keys deleted before the failure and not the
+// whole chunk that failure happened in.
 func (c *bucketClient) remove(ctx context.Context, prefix string) (int, error) {
 	var keys []string
 	for _, p := range keyPrefixes(prefix) {
@@ -89,21 +99,34 @@ func (c *bucketClient) remove(ctx context.Context, prefix string) (int, error) {
 		}
 	}
 
-	for i := 0; i < len(keys); i += 1000 {
-		end := min(i+1000, len(keys))
+	deleted := 0
+	for i := 0; i < len(keys); i += deleteBatch {
+		end := min(i+deleteBatch, len(keys))
 
+		objects := make([]types.ObjectIdentifier, 0, end-i)
 		for _, key := range keys[i:end] {
-			_, err := c.api.DeleteObject(ctx, &s3.DeleteObjectInput{
-				Bucket: &c.bucket,
-				Key:    &key,
-			})
-			if err != nil {
-				return i, fmt.Errorf("formatbench: can't delete %q: %w", key, err)
-			}
+			objects = append(objects, types.ObjectIdentifier{Key: aws.String(key)})
+		}
+
+		out, err := c.api.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: &c.bucket,
+			Delete: &types.Delete{Objects: objects},
+		})
+		if err != nil {
+			return deleted, fmt.Errorf("formatbench: can't delete %d keys under %q: %w", len(objects), prefix, err)
+		}
+
+		// DeleteObjects answers 200 even when some of the keys failed, so a
+		// per-key failure arrives in the body and never as err.
+		deleted += len(out.Deleted)
+		if len(out.Errors) > 0 {
+			bad := out.Errors[0]
+			return deleted, fmt.Errorf("formatbench: can't delete %q (%d of %d keys failed): %s: %s",
+				aws.ToString(bad.Key), len(out.Errors), len(objects), aws.ToString(bad.Code), aws.ToString(bad.Message))
 		}
 	}
 
-	return len(keys), nil
+	return deleted, nil
 }
 
 // walk pages one exact prefix and calls fn for every key.
