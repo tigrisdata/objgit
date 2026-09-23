@@ -118,6 +118,10 @@ func TestFoldStoppedBeforeCleanupKeepsRefsReadable(t *testing.T) {
 	if err == nil {
 		t.Fatal("a failed loose-key delete must surface, not be swallowed")
 	}
+	var committed interface{ RefUpdateCommitted() bool }
+	if !errors.As(err, &committed) || !committed.RefUpdateCommitted() {
+		t.Errorf("cleanup error did not identify the completed packed write: %v", err)
+	}
 
 	// packed-refs holds both refs, and the loose key is still there.
 	if _, ok := f.objs[packedRefsKey]; !ok {
@@ -147,6 +151,29 @@ func TestFoldStoppedBeforeCleanupKeepsRefsReadable(t *testing.T) {
 	}
 	if _, ok := f.objs[refPrefix+"refs/heads/main"]; ok {
 		t.Error("the retry did not finish deleting the loose key")
+	}
+}
+
+func TestCheckedUpdateRecordsCommitBeforeCleanupFailure(t *testing.T) {
+	f := newFakeS3(t)
+	s := packedTestStorer(t, f)
+	f.put(refPrefix+"refs/heads/main", headAB+"\n", nil)
+	f.batchDelErr = errors.New("delete failed")
+
+	acceptedAt, err := s.UpdateReferencesChecked(
+		[]*plumbing.Reference{hashRef("refs/heads/topic", headCD)}, nil,
+		map[plumbing.ReferenceName]plumbing.Hash{"refs/heads/topic": plumbing.ZeroHash},
+	)
+	if acceptedAt.IsZero() {
+		t.Error("packed write has no acceptance timestamp")
+	}
+	var committed interface{ RefUpdateCommitted() bool }
+	if !errors.As(err, &committed) || !committed.RefUpdateCommitted() {
+		t.Fatalf("cleanup error did not identify committed write: %v", err)
+	}
+	ref, err := s.Reference("refs/heads/topic")
+	if err != nil || ref.Hash().String() != headCD {
+		t.Errorf("new ref is not visible after cleanup failure: ref=%v err=%v", ref, err)
 	}
 }
 

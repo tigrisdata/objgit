@@ -88,6 +88,33 @@ func (s *Storer) UpdateReferences(sets []*plumbing.Reference, removes []plumbing
 	return nil
 }
 
+// SupportsCheckedRefUpdates reports whether this storer can compare every
+// advertised old hash at the atomic packed-refs commit point. Loose refs have
+// no batch compare-and-swap, so receive-pack uses its per-command path there.
+func (s *Storer) SupportsCheckedRefUpdates() bool { return s.packedRefs }
+
+// UpdateReferencesChecked applies a batch only if every ref still has the
+// value advertised by the pushing client. A zero expected hash requires the
+// ref to be absent. The check is repeated after each packed-refs CAS retry.
+// It returns the packed write's acceptance time, even when subsequent
+// loose-ref cleanup fails.
+func (s *Storer) UpdateReferencesChecked(sets []*plumbing.Reference, removes []plumbing.ReferenceName, expected map[plumbing.ReferenceName]plumbing.Hash) (time.Time, error) {
+	if !s.packedRefs {
+		return time.Time{}, errors.New("checked ref updates require packed refs")
+	}
+	expectations := make([]refExpectation, 0, len(expected))
+	for name, old := range expected {
+		var ref *plumbing.Reference
+		if !old.IsZero() {
+			ref = plumbing.NewHashReference(name, old)
+		}
+		expectations = append(expectations, refExpectation{name: name, old: ref, strict: true})
+	}
+	var acceptedAt time.Time
+	err := s.commitRefsNotifying(sets, removes, expectations, func(at time.Time) { acceptedAt = at })
+	return acceptedAt, err
+}
+
 // setLooseReference writes one refs/<name> object. It flushes every upload
 // queued through this Storer first, so a ref can never point at an object that
 // failed — or hasn't yet finished — its asynchronous upload (see upload.go).

@@ -25,6 +25,7 @@ The package exposes thin helpers, so no call site carries label plumbing:
 | `TrackInFlight`   | Returns a deferred decrement.    |
 | `ObserveAuth`     | Maps the `auth` enums to labels. |
 | `ObserveHook`     | One hook run.                    |
+| `ObserveWebhook`  | One push webhook event.         |
 | `ReposCreated`    | A new repository.                |
 | `TrackPushWait`   | Returns a deferred decrement.    |
 | `TrackPushSlot`   | Returns a deferred decrement.    |
@@ -79,3 +80,8 @@ keyed by protocol and service.
 HTTP folds an authorization denial into the `error` git status. The exact
 denial stays visible in `objgit_auth_requests_total`. git:// and SSH record
 `denied` directly.
+
+Webhook delivery reports `objgit_webhook_deliveries_total` by final status
+(`ok` or `error`) and `objgit_webhook_delivery_duration_seconds` for event
+construction and delivery, including retries. Neither metric uses a repository
+label.

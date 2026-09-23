@@ -3,77 +3,25 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"log/slog"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/go-git/go-billy/v6/memfs"
-	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/tigrisdata/objgit/internal/auth"
 	"github.com/tigrisdata/objgit/internal/repofs"
 )
 
-func TestDiffRefs(t *testing.T) {
-	main := plumbing.NewBranchReferenceName("main")
-	dev := plumbing.NewBranchReferenceName("dev")
-	h1 := plumbing.NewHash("1111111111111111111111111111111111111111")
-	h2 := plumbing.NewHash("2222222222222222222222222222222222222222")
-
-	tests := []struct {
-		name   string
-		before map[plumbing.ReferenceName]plumbing.Hash
-		after  map[plumbing.ReferenceName]plumbing.Hash
-		want   []refUpdate
-	}{
-		{
-			name:   "created",
-			before: map[plumbing.ReferenceName]plumbing.Hash{},
-			after:  map[plumbing.ReferenceName]plumbing.Hash{main: h1},
-			want:   []refUpdate{{Name: main, Old: plumbing.ZeroHash, New: h1}},
-		},
-		{
-			name:   "updated",
-			before: map[plumbing.ReferenceName]plumbing.Hash{main: h1},
-			after:  map[plumbing.ReferenceName]plumbing.Hash{main: h2},
-			want:   []refUpdate{{Name: main, Old: h1, New: h2}},
-		},
-		{
-			name:   "deleted",
-			before: map[plumbing.ReferenceName]plumbing.Hash{main: h1, dev: h2},
-			after:  map[plumbing.ReferenceName]plumbing.Hash{main: h1},
-			want:   []refUpdate{{Name: dev, Old: h2, New: plumbing.ZeroHash}},
-		},
-		{
-			name:   "unchanged",
-			before: map[plumbing.ReferenceName]plumbing.Hash{main: h1},
-			after:  map[plumbing.ReferenceName]plumbing.Hash{main: h1},
-			want:   nil,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := diffRefs(tt.before, tt.after)
-			if len(got) != len(tt.want) {
-				t.Fatalf("diffRefs = %v, want %v", got, tt.want)
-			}
-			for i, u := range got {
-				if u != tt.want[i] {
-					t.Errorf("update[%d] = %+v, want %+v", i, u, tt.want[i])
-				}
-			}
-		})
-	}
-}
-
 // syncBuffer is a goroutine-safe buffer for capturing slog output while the
-// server and an async hook write concurrently.
+// server handles a push on another goroutine.
 type syncBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -168,6 +116,128 @@ func TestReceivePackHook(t *testing.T) {
 	}
 	if strings.Contains(pushOut, "WROTE_SRC") {
 		t.Errorf("hook was able to write to read-only /src; output:\n%s", pushOut)
+	}
+}
+
+func TestReceivePackHookFileChanges(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+
+	d := &daemon{
+		sysFS:       memfs.New(),
+		resolver:    repofs.BucketResolver{Base: newMemBase()},
+		authz:       auth.AllowAnonymous{AllowWrite: true},
+		allowHooks:  true,
+		hookTimeout: 30 * time.Second,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go func() { _ = d.ServeGitProtocol(ctx, ln) }()
+	remote := "git://" + ln.Addr().String() + "/acme/changes.git"
+
+	work := t.TempDir()
+	runGit(t, work, "init", "-b", "main")
+	runGit(t, work, "config", "user.email", "test@example.com")
+	runGit(t, work, "config", "user.name", "Test")
+	writeFile(t, filepath.Join(work, ".objgit", "hooks", "receive-pack"), strings.Join([]string{
+		`printf 'ADDED=%s\n' "$OBJGIT_ADDED_FILES_JSON"`,
+		`printf 'CHANGED=%s\n' "$OBJGIT_CHANGED_FILES_JSON"`,
+		`printf 'DELETED=%s\n' "$OBJGIT_DELETED_FILES_JSON"`,
+		`printf 'DOCUMENT=%s\n' "$(cat "$OBJGIT_CHANGES_FILE")"`,
+	}, "\n")+"\n")
+
+	// The second push contains two commits. A path added and then deleted
+	// within that push must not appear in the net file lists.
+	for _, tt := range []struct {
+		name        string
+		prepare     func(t *testing.T)
+		wantAdded   []string
+		wantChanged []string
+		wantDeleted []string
+	}{
+		{
+			name: "new branch compares against empty tree",
+			prepare: func(t *testing.T) {
+				writeFile(t, filepath.Join(work, "changed.txt"), "before\n")
+				writeFile(t, filepath.Join(work, "deleted.txt"), "before\n")
+			},
+			wantAdded: []string{".objgit/hooks/receive-pack", "changed.txt", "deleted.txt"},
+		},
+		{
+			name: "updated branch reports escaped paths and net changes",
+			prepare: func(t *testing.T) {
+				writeFile(t, filepath.Join(work, "changed.txt"), "after\n")
+				writeFile(t, filepath.Join(work, "a b\nc.txt"), "new\n")
+				writeFile(t, filepath.Join(work, "transient.txt"), "temporary\n")
+				runGit(t, work, "add", ".")
+				runGit(t, work, "commit", "-m", "add transient")
+				if err := os.Remove(filepath.Join(work, "transient.txt")); err != nil {
+					t.Fatalf("remove transient: %v", err)
+				}
+				if err := os.Remove(filepath.Join(work, "deleted.txt")); err != nil {
+					t.Fatalf("remove deleted: %v", err)
+				}
+			},
+			wantAdded:   []string{"a b\nc.txt"},
+			wantChanged: []string{"changed.txt"},
+			wantDeleted: []string{"deleted.txt"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.prepare(t)
+			runGit(t, work, "add", "-A")
+			runGit(t, work, "commit", "-m", tt.name)
+			pushOut := runGit(t, work, "push", remote, "main")
+
+			want := map[string][]string{
+				"ADDED":   tt.wantAdded,
+				"CHANGED": tt.wantChanged,
+				"DELETED": tt.wantDeleted,
+			}
+			for key, paths := range want {
+				if paths == nil {
+					paths = []string{}
+				}
+				encoded, err := json.Marshal(paths)
+				if err != nil {
+					t.Fatalf("marshal expected %s: %v", key, err)
+				}
+				if !strings.Contains(pushOut, key+"="+string(encoded)) {
+					t.Errorf("push output lacks %s=%s; output:\n%s", key, encoded, pushOut)
+				}
+			}
+
+			var document struct {
+				Added   []string `json:"added"`
+				Changed []string `json:"changed"`
+				Deleted []string `json:"deleted"`
+			}
+			found := false
+			for _, line := range strings.Split(pushOut, "\n") {
+				if _, raw, ok := strings.Cut(line, "DOCUMENT="); ok {
+					found = true
+					if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &document); err != nil {
+						t.Fatalf("parse changes file %q: %v", raw, err)
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("hook did not print changes file; output:\n%s", pushOut)
+			}
+			for key, got := range map[string][]string{"added": document.Added, "changed": document.Changed, "deleted": document.Deleted} {
+				if got == nil {
+					t.Errorf("changes file %s is missing or null; want a JSON array", key)
+				}
+				if !slices.Equal(got, want[strings.ToUpper(key)]) {
+					t.Errorf("changes file %s = %q, want %q", key, got, want[strings.ToUpper(key)])
+				}
+			}
+		})
 	}
 }
 

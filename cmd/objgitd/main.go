@@ -101,8 +101,8 @@ func main() {
 	}
 	// Harden the client's HTTP path so stale keep-alive connections to Tigris
 	// fail fast and retry on a fresh connection instead of hanging the request
-	// forever (see internal/s3fs/resilient.go). Only sysFS (the SSH host key)
-	// uses this client; internal/storage/tigris dials its own.
+	// forever (see internal/s3fs/resilient.go). Only sysFS (the SSH host key
+	// and webhook settings) uses this client; internal/storage/tigris dials its own.
 	client := s3fs.Harden(rawClient)
 
 	fsys, err := s3fs.NewS3FS(client, *bucket)

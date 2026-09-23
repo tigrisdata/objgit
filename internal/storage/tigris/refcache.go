@@ -34,6 +34,15 @@ type refCache struct {
 	loose  map[plumbing.ReferenceName]*plumbing.Reference
 }
 
+// refCommitCleanupError means the packed-refs write landed, but removing
+// legacy loose refs failed afterward. Callers must inspect the effective refs:
+// an old loose ref can still shadow the packed value until cleanup succeeds.
+type refCommitCleanupError struct{ err error }
+
+func (e *refCommitCleanupError) Error() string            { return e.err.Error() }
+func (e *refCommitCleanupError) Unwrap() error            { return e.err }
+func (e *refCommitCleanupError) RefUpdateCommitted() bool { return true }
+
 func newRefCache() *refCache { return &refCache{} }
 
 // ensureRefsBuilt fills the cache once. Two calls: one GetObject for
@@ -129,11 +138,13 @@ func (s *Storer) invalidateRefs() {
 // something is wrong that another attempt will not fix.
 const maxRefCASRetries = 8
 
-// refExpectation is one CheckAndSetReference precondition: the caller believes
-// that name currently holds old. A nil old means "the ref must not exist".
+// refExpectation records the tip a caller advertised. A strict nil old
+// requires the ref to be absent; the older CheckAndSetReference path retains
+// its lenient nil/missing behavior when strict is false.
 type refExpectation struct {
-	name plumbing.ReferenceName
-	old  *plumbing.Reference
+	name   plumbing.ReferenceName
+	old    *plumbing.Reference
+	strict bool
 }
 
 // commitRefs applies a whole batch of ref mutations in one conditional
@@ -145,6 +156,12 @@ type refExpectation struct {
 // upload has not finished — and one flush per batch instead of one per ref is
 // most of why this path is faster than the loose one.
 func (s *Storer) commitRefs(sets []*plumbing.Reference, removes []plumbing.ReferenceName, expect []refExpectation) error {
+	return s.commitRefsNotifying(sets, removes, expect, nil)
+}
+
+// commitRefsNotifying calls onCommit immediately after the conditional packed
+// write succeeds, before legacy loose-ref cleanup can delay the caller.
+func (s *Storer) commitRefsNotifying(sets []*plumbing.Reference, removes []plumbing.ReferenceName, expect []refExpectation, onCommit func(time.Time)) error {
 	if len(sets) == 0 && len(removes) == 0 {
 		return nil
 	}
@@ -212,6 +229,9 @@ func (s *Storer) commitRefs(sets []*plumbing.Reference, removes []plumbing.Refer
 		default:
 			return fmt.Errorf("tigris: commit refs: %w", err)
 		}
+		if onCommit != nil {
+			onCommit(time.Now())
+		}
 
 		// The commit landed. Adopt it in place rather than re-reading, and hand
 		// the folded names to the loose-key cleanup.
@@ -222,7 +242,10 @@ func (s *Storer) commitRefs(sets []*plumbing.Reference, removes []plumbing.Refer
 		s.refs.built = true
 		s.refs.mu.Unlock()
 
-		return s.dropFoldedLooseRefs(folded, removes)
+		if err := s.dropFoldedLooseRefs(folded, removes); err != nil {
+			return &refCommitCleanupError{err: err}
+		}
+		return nil
 	}
 	return fmt.Errorf("%w after %d attempts", ErrRefContention, maxRefCASRetries)
 }
@@ -235,6 +258,10 @@ func checkRefExpectations(view map[plumbing.ReferenceName]*plumbing.Reference, e
 	for _, e := range expect {
 		cur, ok := view[e.name]
 		switch {
+		case e.strict && e.old == nil && ok:
+			return storage.ErrReferenceHasChanged
+		case e.strict && e.old != nil && (!ok || cur.Hash() != e.old.Hash()):
+			return storage.ErrReferenceHasChanged
 		case e.old == nil:
 			// A nil old is lenient, matching the in-memory storer: a missing
 			// current reference falls through to creation.

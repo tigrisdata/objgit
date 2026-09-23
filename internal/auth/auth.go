@@ -6,13 +6,14 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 )
 
-// Operation is the access a request needs. Transports map the git service:
-// upload-pack/upload-archive → Read, receive-pack → Write.
+// Operation is the access a request needs. Git upload services use Read,
+// receive-pack uses Write, and the webhook settings query uses Admin.
 type Operation int
 
 const (
 	Read Operation = iota
 	Write
+	Admin
 )
 
 // String renders the operation for logs and metrics.
@@ -22,6 +23,8 @@ func (o Operation) String() string {
 		return "read"
 	case Write:
 		return "write"
+	case Admin:
+		return "admin"
 	default:
 		return "unknown"
 	}
@@ -91,8 +94,15 @@ type Authorizer interface {
 type AllowAnonymous struct{ AllowWrite bool }
 
 func (a AllowAnonymous) Authorize(_ context.Context, req Request) Decision {
-	if req.Operation == Write && !a.AllowWrite {
+	switch req.Operation {
+	case Read:
+		return Allow
+	case Write:
+		if a.AllowWrite {
+			return Allow
+		}
+		return Deny
+	default:
 		return Deny
 	}
-	return Allow
 }
