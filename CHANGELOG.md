@@ -1,3 +1,9 @@
+# [1.11.0](https://github.com/tigrisdata/objgit/compare/v1.10.0...v1.11.0) (2026-09-23)
+
+### Features
+
+- **hooks:** add kefka WASM and uutils commands ([#17](https://github.com/tigrisdata/objgit/issues/17)) ([a43e89e](https://github.com/tigrisdata/objgit/commit/a43e89ea410ee47140c970a4c65a73bcc36ab3f2))
+
 # [1.10.0](https://github.com/tigrisdata/objgit/compare/v1.9.0...v1.10.0) (2026-09-23)
 
 ### Features
