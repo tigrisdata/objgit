@@ -10,11 +10,11 @@ daemon through all three transports at the same time.
 
 The struct holds three fields, plus the hook configuration:
 
-| Field      | Type                 | Purpose                                     |
-| ---------- | -------------------- | ------------------------------------------- |
-| `sysFS`    | `billy.Filesystem`   | Daemon-level state only, which is the SSH host key. Still `internal/s3fs`. |
-| `resolver` | `repofs.Resolver`    | Maps a repository path to its storage.      |
-| `authz`    | `auth.Authorizer`    | One decision point for every transport.     |
+| Field      | Type               | Purpose                                                                    |
+| ---------- | ------------------ | -------------------------------------------------------------------------- |
+| `sysFS`    | `billy.Filesystem` | Daemon-level state only, which is the SSH host key. Still `internal/s3fs`. |
+| `resolver` | `repofs.Resolver`  | Maps a repository path to its storage.                                     |
+| `authz`    | `auth.Authorizer`  | One decision point for every transport.                                    |
 
 `resolver.Resolve` returns a go-git `storage.Storer` directly. No
 `billy.Filesystem` is involved in repository data. The production resolver is
@@ -30,14 +30,15 @@ Three behaviors live on `*daemon`, so every transport acts the same way:
 
 ## Pages
 
-| Page                                 | Contents                                                         |
-| ------------------------------------ | ---------------------------------------------------------------- |
+| Page                                 | Contents                                                                     |
+| ------------------------------------ | ---------------------------------------------------------------------------- |
 | [transports.md](transports.md)       | Smart HTTP, git://, and SSH. Two protocol points that are easy to get wrong. |
-| [auth.md](auth.md)                   | The one authorization interface that every transport calls.       |
-| [hooks.md](hooks.md)                 | Push hooks, webhook dispatch, live output streaming, and the kefka sandbox. |
-| [metrics.md](metrics.md)             | Prometheus vectors and the three instrumentation seams.           |
-| [tigris-storer.md](tigris-storer.md) | Repository storage: a `storage.Storer` on one Tigris bucket.      |
-| [s3fs.md](s3fs.md)                   | Daemon-level state: a `billy.Filesystem` on Tigris.               |
+| [auth.md](auth.md)                   | The one authorization interface that every transport calls.                  |
+| [hooks.md](hooks.md)                 | Push hooks, webhook dispatch, live output streaming, and the kefka sandbox.  |
+| [metrics.md](metrics.md)             | Prometheus vectors and the three instrumentation seams.                      |
+| [snapshots.md](snapshots.md)         | erofs images of pushed trees, and the snapshot cache.                        |
+| [tigris-storer.md](tigris-storer.md) | Repository storage: a `storage.Storer` on one Tigris bucket.                 |
+| [s3fs.md](s3fs.md)                   | Daemon-level state: a `billy.Filesystem` on Tigris.                          |
 
 Related documents outside this directory:
 

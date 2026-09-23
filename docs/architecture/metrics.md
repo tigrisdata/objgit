@@ -18,18 +18,20 @@ repository names have unbounded cardinality. Git operations are keyed by
 
 The package exposes thin helpers, so no call site carries label plumbing:
 
-| Helper            | Use                              |
-| ----------------- | -------------------------------- |
-| `ObserveS3`       | The s3fs observer.               |
-| `ObserveGitOp`    | One git operation.               |
-| `TrackInFlight`   | Returns a deferred decrement.    |
-| `ObserveAuth`     | Maps the `auth` enums to labels. |
-| `ObserveHook`     | One hook run.                    |
-| `ObserveWebhook`  | One push webhook event.         |
-| `ReposCreated`    | A new repository.                |
-| `TrackPushWait`   | Returns a deferred decrement.    |
-| `TrackPushSlot`   | Returns a deferred decrement.    |
-| `ObservePushWait` | One wait for a push slot.        |
+| Helper                 | Use                              |
+| ---------------------- | -------------------------------- |
+| `ObserveS3`            | The s3fs observer.               |
+| `ObserveGitOp`         | One git operation.               |
+| `TrackInFlight`        | Returns a deferred decrement.    |
+| `ObserveAuth`          | Maps the `auth` enums to labels. |
+| `ObserveHook`          | One hook run.                    |
+| `ObserveWebhook`       | One push webhook event.          |
+| `ReposCreated`         | A new repository.                |
+| `TrackPushWait`        | Returns a deferred decrement.    |
+| `TrackPushSlot`        | Returns a deferred decrement.    |
+| `ObservePushWait`      | One wait for a push slot.        |
+| `ObserveSnapshot`      | One snapshot Ensure call.        |
+| `ObserveSnapshotCache` | One snapshot cache event.        |
 
 ## The push queue
 
@@ -51,6 +53,20 @@ that from outside the process.
 The outcome label separates the two ways a wait ends badly. `timeout` means the
 client waited out `-push-queue-timeout`, which is the signal that the cap is too
 low. `canceled` means the client hung up while queued, which is not.
+
+## Snapshots
+
+Snapshot Ensure calls and cache events have five series:
+
+| Series                                   | Type      | Labels | Meaning                              |
+| ---------------------------------------- | --------- | ------ | ------------------------------------ |
+| `objgit_snapshot_builds_total`           | counter   | result | Ensure calls by result.              |
+| `objgit_snapshot_build_duration_seconds` | histogram | (none) | Time for builds.                     |
+| `objgit_snapshot_image_bytes`            | histogram | (none) | Built image size after compression.  |
+| `objgit_snapshot_cache_opens_total`      | counter   | result | Cache lookups by result (hit, miss). |
+| `objgit_snapshot_cache_evictions_total`  | counter   | reason | Evictions by reason (budget, idle).  |
+
+The size histogram is data for a later decision about a size limit.
 
 ## Three instrumentation seams
 

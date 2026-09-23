@@ -120,6 +120,7 @@ type Storer struct {
 	// Reading it is unconditional — see WithPackedRefs for why the two differ.
 	packedRefs bool
 	cache      *PackCache // optional process-wide local pack cache; see packcache.go
+	snapCache  *PackCache // optional process-wide snapshot image cache; see snapshot.go
 	// fetchSem bounds whole-pack downloads in flight; see maxLivePackFetches.
 	// Scoped shares it rather than replacing it, so one root Storer's
 	// descendants — every repository, in production — share one budget.
@@ -170,6 +171,13 @@ func WithObserver(fn func(operation string, dur time.Duration, err error)) Optio
 // process — see NewPackCache.
 func WithPackCache(c *PackCache) Option {
 	return func(s *Storer) { s.cache = c }
+}
+
+// WithSnapshotCache installs the local cache that OpenSnapshot downloads
+// images into. Like WithPackCache, pass one cache built once per process —
+// see NewSnapshotCache. Scoped shares it.
+func WithSnapshotCache(c *PackCache) Option {
+	return func(s *Storer) { s.snapCache = c }
 }
 
 // WithPackCompression controls whether newly written pack containers store
@@ -308,10 +316,13 @@ var _ storer.PackfileWriter = (*Storer)(nil)
 // Every one of those is a pointer field, so the struct copy above shares it
 // until it is replaced. Adding a cache to Storer means adding a line here.
 //
-// Two things are shared on purpose. The pack cache, because sharing downloaded
-// packs across requests is the whole point of it, and its keys are content
-// hashes, so a hit is always the exact bytes the caller named. And fetchSem,
-// because the bandwidth it rations is the process's, not one repository's.
+// Three things are shared on purpose. The pack cache, because sharing
+// downloaded packs across requests is the whole point of it, and its keys are
+// content hashes, so a hit is always the exact bytes the caller named. The
+// snapshot cache, for the same reason: its ids are tree hashes, and an image
+// of one tree is the same tree in every repository that holds it. And
+// fetchSem, because the bandwidth it rations is the process's, not one
+// repository's.
 func (s *Storer) Scoped(prefix string) *Storer {
 	cp := *s
 	prefix = strings.Trim(prefix, "/")

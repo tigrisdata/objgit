@@ -45,8 +45,9 @@ type refUpdate struct {
 }
 
 // receivePack runs the receive-pack service and dispatches post-receive work
-// for the commands whose ref updates succeeded. Hook output streams to the
-// client before the response closes. Webhook delivery also finishes before the
+// for the commands whose ref updates succeeded: erofs snapshots of the updated
+// branch and tag tips (see runSnapshots), then hooks, then webhooks. Snapshot
+// and hook output streams to the client before the response closes. Webhook delivery also finishes before the
 // response closes, but cannot reject an already accepted push.
 //
 // This is also the one place every push funnels through — smart HTTP and SSH
@@ -57,7 +58,7 @@ func (d *daemon) receivePack(ctx context.Context, st storage.Storer, repoPath st
 	if settingsErr != nil {
 		slog.Error("webhook: load repository settings", "repo", repoPath, "err", settingsErr)
 	}
-	if !d.allowHooks && (webhooks == nil || !webhooks.Enabled(repoPath)) {
+	if !d.allowHooks && !d.snapshots && (webhooks == nil || !webhooks.Enabled(repoPath)) {
 		err := receivePackStreaming(ctx, st, r, w, req, d.pushes.admit, nil)
 		d.healHEADAfterPush(err, st, repoPath)
 		return err
@@ -67,6 +68,9 @@ func (d *daemon) receivePack(ctx context.Context, st storage.Storer, repoPath st
 	// updates are taken from this request's successful commands, so another
 	// concurrent push cannot be attributed to this one.
 	onUpdated := func(progress io.Writer, updates []refUpdate, acceptedAt time.Time) {
+		if d.snapshots {
+			d.runSnapshots(repoPath, st, updates, progress)
+		}
 		if d.allowHooks {
 			var branches []refUpdate
 			for _, u := range updates {
@@ -102,8 +106,8 @@ func (d *daemon) healHEADAfterPush(recvErr error, st storage.Storer, repoPath st
 // streaming each hook's output to progress (nil = log only).
 func (d *daemon) runHooks(repoPath, service string, st storage.Storer, updates []refUpdate, progress io.Writer) {
 	for _, u := range updates {
-		if u.New.IsZero() {
-			continue // branch deletion: nothing to check out
+		if u.New.IsZero() || !u.Name.IsBranch() {
+			continue // a deletion, or a tag: hooks run for branches only
 		}
 		d.runHook(repoPath, service, st, u, progress)
 	}

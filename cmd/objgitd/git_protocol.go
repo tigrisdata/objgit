@@ -54,6 +54,12 @@ type daemon struct {
 	allowHooks  bool
 	hookTimeout time.Duration
 
+	// snapshots gates building an erofs image of each updated ref tip after
+	// a push; see snapshots.go.
+	snapshots       bool
+	snapshotTimeout time.Duration
+	snapshotTmpDir  string // parent directory for image temp files; "" is the OS temp dir
+
 	// pushes bounds how many pushes unpack a packfile at once, which is the
 	// only thing that bounds the daemon's resident set under concurrent pushes.
 	// A nil pushes is unlimited, which is what every test that does not care

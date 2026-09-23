@@ -59,6 +59,7 @@ Notes on the tests and on configuration:
 | `cmd/objgitd/shell.go`                                    | The SSH `sh` command: an interactive shell in the hook sandbox.                   |
 | `cmd/objgitd/receivepack.go`                              | The go-git fork that streams hook output, plus `writePack`.                       |
 | `cmd/objgitd/hooks.go`                                    | Ref diffing and the sandboxed hook run.                                           |
+| `cmd/objgitd/snapshots.go`                                | The erofs snapshot run after a push.                                              |
 | `internal/auth`                                           | The one authorization interface.                                                  |
 | `internal/repofs`                                         | Maps a repository path to a `storage.Storer`.                                     |
 | `internal/storage/tigris`                                 | Repository storage. A `storage.Storer` on the bucket.                             |
@@ -66,6 +67,7 @@ Notes on the tests and on configuration:
 | `internal/s3fs`                                           | Daemon-level state only, which is the SSH host key.                               |
 | `internal/mountfs`, `internal/treefs`, `internal/kefkash` | The hook sandbox filesystem and shell wiring.                                     |
 | `internal/metrics`                                        | Every Prometheus vector, plus thin helpers.                                       |
+| `internal/snapshot`                                       | erofs images of git trees: `Ensure`, `Open`, and the `Store` interface.           |
 | `internal/slog.go`                                        | JSON handler init.                                                                |
 | `cmd/membench/`                                           | Push memory benchmark harness. Not shipped; see `docs/usage/memory-benchmark.md`. |
 
@@ -80,6 +82,7 @@ describes the daemon and links to one page for each subsystem.
 | [auth.md](docs/architecture/auth.md)                   | Credentials, decisions, or a new `Authorizer`.                          |
 | [hooks.md](docs/architecture/hooks.md)                 | Push hooks, output streaming, or the sandbox.                           |
 | [metrics.md](docs/architecture/metrics.md)             | Any metric or instrumentation seam.                                     |
+| [snapshots.md](docs/architecture/snapshots.md)         | Snapshot images, the snapshot cache, or `runSnapshots`.                 |
 | [tigris-storer.md](docs/architecture/tigris-storer.md) | Object layout, refs, packs, the pack cache, or the upload path.         |
 | [s3fs.md](docs/architecture/s3fs.md)                   | The `billy.Filesystem` over the bucket.                                 |
 

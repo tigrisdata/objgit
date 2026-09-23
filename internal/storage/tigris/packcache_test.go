@@ -4,15 +4,18 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/go-git/go-git/v6/plumbing"
 )
@@ -103,6 +106,51 @@ func TestPackCacheSweepsOrphans(t *testing.T) {
 		{path: filepath.Join(parent, "objgit-packs-also-stale"), want: false},
 		{path: filepath.Join(parent, "not-a-cache"), want: true},
 		{path: c.dir, want: true},
+	} {
+		_, err := os.Stat(tt.path)
+		exists := err == nil
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("stat %s: %v", tt.path, err)
+		}
+		if exists != tt.want {
+			t.Errorf("%s exists = %v, want %v", tt.path, exists, tt.want)
+		}
+	}
+}
+
+// TestSnapshotCacheSweepKeepsPackCache pins that each cache sweeps only its
+// own prefix. main.go makes the pack cache first and the snapshot cache second,
+// under one parent. A sweep keyed on the pack prefix would delete the live pack
+// cache the moment the snapshot cache starts.
+func TestSnapshotCacheSweepKeepsPackCache(t *testing.T) {
+	t.Parallel()
+
+	parent := t.TempDir()
+	for _, name := range []string{"objgit-packs-stale", "objgit-snapshots-stale"} {
+		if err := os.MkdirAll(filepath.Join(parent, name), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", name, err)
+		}
+	}
+
+	packs, err := NewPackCache(parent, 0)
+	if err != nil {
+		t.Fatalf("NewPackCache: %v", err)
+	}
+	t.Cleanup(func() { _ = packs.Cleanup() })
+	snaps, err := NewSnapshotCache(parent, 0, nil)
+	if err != nil {
+		t.Fatalf("NewSnapshotCache: %v", err)
+	}
+	t.Cleanup(func() { _ = snaps.Cleanup() })
+
+	for _, tt := range []struct {
+		path string
+		want bool // want the path to still exist after both sweeps
+	}{
+		{path: packs.dir, want: true},
+		{path: snaps.dir, want: true},
+		{path: filepath.Join(parent, "objgit-packs-stale"), want: false},
+		{path: filepath.Join(parent, "objgit-snapshots-stale"), want: false},
 	} {
 		_, err := os.Stat(tt.path)
 		exists := err == nil
@@ -422,5 +470,241 @@ func TestPackCacheSharedAcrossStorers(t *testing.T) {
 	readAndSettle(newTestStorer(t, f2), id)
 	if got := f2.nfullBinGets(); got != 2 {
 		t.Errorf("without a cache two readers caused %d whole-pack GETs, want 2", got)
+	}
+}
+
+// TestPackCacheGetChecked pins GetChecked's contract for ids that are not
+// content digests: fetch reports the SHA-256 the body must have, and a body
+// that disagrees is refused and leaves nothing behind.
+func TestPackCacheGetChecked(t *testing.T) {
+	body := []byte("snapshot bytes")
+	sum := sha256.Sum256(body)
+	good := hex.EncodeToString(sum[:])
+
+	tests := []struct {
+		name    string
+		want    string
+		wantErr bool
+	}{
+		{"digest matches", good, false},
+		{"digest differs", strings.Repeat("0", 64), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, err := NewSnapshotCache(t.TempDir(), 1<<20, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { c.Cleanup() })
+			f, err := c.GetChecked("erofs-v1-abc", func(w io.Writer) (string, error) {
+				_, err := w.Write(body)
+				return tt.want, err
+			})
+			if tt.wantErr {
+				if err == nil {
+					f.Close()
+					t.Fatal("GetChecked accepted bytes with the wrong digest")
+				}
+				if n := countCacheFiles(t, c); n != 0 {
+					t.Errorf("cache kept %d files after a bad digest", n)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("GetChecked: %v", err)
+			}
+			defer f.Close()
+			if got := readAll(t, f); !bytes.Equal(got, body) {
+				t.Errorf("body = %q, want %q", got, body)
+			}
+			if !strings.HasSuffix(f.Name(), ".erofs") {
+				t.Errorf("cached file %q does not end in .erofs", f.Name())
+			}
+		})
+	}
+}
+
+// TestPackCacheGetStillChecksID pins that Get, unlike GetChecked, still treats
+// id itself as the digest fetch's bytes must hash to.
+func TestPackCacheGetStillChecksID(t *testing.T) {
+	c := newTestPackCache(t, 1<<20)
+	_, err := c.Get(strings.Repeat("0", 64), func(w io.Writer) error {
+		_, err := w.Write([]byte("not the digest"))
+		return err
+	})
+	if err == nil {
+		t.Fatal("Get accepted bytes whose SHA-256 is not the id")
+	}
+}
+
+// TestPackCacheEvictIdle pins the idle sweep: an entry nobody has claimed
+// since maxIdle ago is unlinked, an entry claimed more recently survives, and
+// an open descriptor on the evicted entry keeps reading.
+func TestPackCacheEvictIdle(t *testing.T) {
+	now := time.Unix(1000, 0)
+	c, err := NewSnapshotCache(t.TempDir(), 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Cleanup() })
+	c.now = func() time.Time { return now }
+
+	put := func(id string) *os.File {
+		body := []byte(id)
+		sum := sha256.Sum256(body)
+		f, err := c.GetChecked(id, func(w io.Writer) (string, error) {
+			_, err := w.Write(body)
+			return hex.EncodeToString(sum[:]), err
+		})
+		if err != nil {
+			t.Fatalf("GetChecked(%s): %v", id, err)
+		}
+		return f
+	}
+
+	old := put("old")        // used at t=1000
+	now = now.Add(time.Hour) // t=4600
+	put("fresh").Close()     // used at t=4600
+	now = now.Add(time.Minute)
+
+	if n := c.EvictIdle(30 * time.Minute); n != 1 {
+		t.Fatalf("EvictIdle = %d, want 1", n)
+	}
+	if n := countCacheFiles(t, c); n != 1 {
+		t.Errorf("%d files left, want 1", n)
+	}
+	// The evicted entry's open descriptor still reads.
+	if got := readAll(t, old); string(got) != "old" {
+		t.Errorf("evicted file read %q, want %q", got, "old")
+	}
+	old.Close()
+}
+
+// TestPackCacheObserver pins the event sequence an observer sees across a
+// miss, a hit, a budget eviction, and an idle eviction. The observer must run
+// outside c.mu, so a slow or reentrant callback can never deadlock the cache.
+func TestPackCacheObserver(t *testing.T) {
+	var mu sync.Mutex
+	var events []string
+	var c *PackCache
+	observe := func(e string) {
+		// Taking c.mu from inside the callback deadlocks if any emit ever
+		// runs under the lock. The long idle limit means it evicts nothing.
+		c.EvictIdle(24 * time.Hour)
+		mu.Lock()
+		events = append(events, e)
+		mu.Unlock()
+	}
+
+	now := time.Unix(1000, 0)
+	c, err := NewSnapshotCache(t.TempDir(), 10, observe) // 10-byte budget
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Cleanup() })
+	c.now = func() time.Time { return now }
+
+	get := func(id string, body []byte, fetchErr error) {
+		sum := sha256.Sum256(body)
+		f, err := c.GetChecked(id, func(w io.Writer) (string, error) {
+			if fetchErr != nil {
+				return "", fetchErr
+			}
+			_, err := w.Write(body)
+			return hex.EncodeToString(sum[:]), err
+		})
+		if (err != nil) != (fetchErr != nil) {
+			t.Errorf("GetChecked(%s) err = %v, want %v", id, err, fetchErr)
+		}
+		if f != nil {
+			f.Close()
+		}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		get("a", []byte("123456"), nil)          // miss
+		get("a", []byte("123456"), nil)          // hit
+		get("x", nil, errors.New("bucket down")) // miss, and no hit for the failure
+		get("b", []byte("abcdef"), nil)          // miss, evicts a: evict_budget
+		now = now.Add(time.Hour)
+		c.EvictIdle(time.Minute) // evicts b: evict_idle
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("observer deadlocked: an emit runs under c.mu")
+	}
+
+	want := []string{"miss", "hit", "miss", "miss", "evict_budget", "evict_idle"}
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(events, want) {
+		t.Errorf("events = %v, want %v", events, want)
+	}
+}
+
+// TestPackCacheEvictIdleSkipsInFlight pins two EvictIdle invariants: it never
+// touches a download that has not settled, and an idle eviction gives its
+// bytes back to the budget.
+func TestPackCacheEvictIdleSkipsInFlight(t *testing.T) {
+	var events []string
+	var mu sync.Mutex
+	now := time.Unix(1000, 0)
+	c, err := NewSnapshotCache(t.TempDir(), 10, func(e string) { mu.Lock(); events = append(events, e); mu.Unlock() })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Cleanup() })
+	c.now = func() time.Time { return now }
+
+	body := []byte("12345678") // 8 of the 10-byte budget
+	sum := sha256.Sum256(body)
+	release := make(chan struct{})
+	started := make(chan struct{})
+	got := make(chan error, 1)
+	go func() {
+		f, err := c.GetChecked("slow", func(w io.Writer) (string, error) {
+			close(started)
+			<-release
+			_, err := w.Write(body)
+			return hex.EncodeToString(sum[:]), err
+		})
+		if f != nil {
+			f.Close()
+		}
+		got <- err
+	}()
+	<-started
+
+	now = now.Add(time.Hour)
+	if n := c.EvictIdle(0); n != 0 {
+		t.Fatalf("EvictIdle evicted %d entries while a download was in flight, want 0", n)
+	}
+	close(release)
+	if err := <-got; err != nil {
+		t.Fatalf("GetChecked after EvictIdle: %v", err)
+	}
+
+	// Settled now: an idle sweep takes it, and its bytes leave the budget, so
+	// a second 8-byte entry fits without a budget eviction.
+	now = now.Add(time.Hour)
+	if n := c.EvictIdle(time.Minute); n != 1 {
+		t.Fatalf("EvictIdle = %d, want 1", n)
+	}
+	sum2 := sha256.Sum256([]byte("abcdefgh"))
+	f, err := c.GetChecked("next", func(w io.Writer) (string, error) {
+		_, err := w.Write([]byte("abcdefgh"))
+		return hex.EncodeToString(sum2[:]), err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	mu.Lock()
+	defer mu.Unlock()
+	if slices.Contains(events, "evict_budget") {
+		t.Errorf("events = %v: EvictIdle did not return the evicted bytes to the budget", events)
 	}
 }

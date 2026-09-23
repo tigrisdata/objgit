@@ -87,6 +87,43 @@ var (
 		Buckets:   prometheus.DefBuckets,
 	})
 
+	snapshotBuilds = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "snapshot",
+		Name:      "builds_total",
+		Help:      "erofs snapshot Ensure calls by result (built, exists, error).",
+	}, []string{"result"})
+
+	snapshotDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: "snapshot",
+		Name:      "build_duration_seconds",
+		Help:      "Time for one erofs snapshot Ensure call that built an image.",
+		Buckets:   prometheus.ExponentialBuckets(0.1, 2, 12), // 0.1s .. ~205s
+	})
+
+	snapshotImageBytes = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: "snapshot",
+		Name:      "image_bytes",
+		Help:      "Size of one built erofs snapshot image, after compression.",
+		Buckets:   prometheus.ExponentialBuckets(64<<10, 4, 10), // 64 KiB .. 16 GiB
+	})
+
+	snapshotCacheOpens = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "snapshot",
+		Name:      "cache_opens_total",
+		Help:      "Snapshot cache lookups by result (hit, miss).",
+	}, []string{"result"})
+
+	snapshotCacheEvictions = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "snapshot",
+		Name:      "cache_evictions_total",
+		Help:      "Snapshot cache evictions by reason (budget, idle).",
+	}, []string{"reason"})
+
 	webhookDeliveries = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: "webhook",
@@ -249,6 +286,30 @@ func decisionLabel(d auth.Decision) string {
 func ObserveHook(status string, dur time.Duration) {
 	hookRuns.WithLabelValues(status).Inc()
 	hookDuration.Observe(dur.Seconds())
+}
+
+// ObserveSnapshot records one snapshot Ensure call. The duration and size
+// histograms only describe builds, so they observe only when result is
+// "built".
+func ObserveSnapshot(result string, dur time.Duration, bytes int64) {
+	snapshotBuilds.WithLabelValues(result).Inc()
+	if result == "built" {
+		snapshotDuration.Observe(dur.Seconds())
+		snapshotImageBytes.Observe(float64(bytes))
+	}
+}
+
+// ObserveSnapshotCache records one snapshot cache event. Its signature
+// matches the observer tigris.NewSnapshotCache takes.
+func ObserveSnapshotCache(event string) {
+	switch event {
+	case "hit", "miss":
+		snapshotCacheOpens.WithLabelValues(event).Inc()
+	case "evict_budget":
+		snapshotCacheEvictions.WithLabelValues("budget").Inc()
+	case "evict_idle":
+		snapshotCacheEvictions.WithLabelValues("idle").Inc()
+	}
 }
 
 // ObserveWebhook records the final outcome and elapsed time of one event.

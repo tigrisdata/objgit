@@ -712,7 +712,7 @@ func (s *Storer) openWholePack(id string, a *packAccess) (*os.File, error) {
 	// nothing is ever served out of a body that failed its checksum.
 	ps := &packStream{f: f}
 	a.stream.Store(ps)
-	_, err = verifiedCopy(f, id, s.streamPack(id), &ps.n)
+	_, err = verifiedCopy(f, id, expectID(id, s.streamPack(id)), &ps.n)
 	a.stream.Store(nil)
 	if err != nil {
 		f.Close()
