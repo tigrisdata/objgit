@@ -87,6 +87,21 @@ var (
 		Buckets:   prometheus.DefBuckets,
 	})
 
+	webhookDeliveries = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace,
+		Subsystem: "webhook",
+		Name:      "deliveries_total",
+		Help:      "Push webhook events by final outcome (ok or error).",
+	}, []string{"status"})
+
+	webhookDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: namespace,
+		Subsystem: "webhook",
+		Name:      "delivery_duration_seconds",
+		Help:      "Time to build and deliver a push webhook event, including retries.",
+		Buckets:   prometheus.DefBuckets,
+	})
+
 	reposCreated = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,
 		Name:      "repos_created_total",
@@ -215,10 +230,7 @@ func ObserveAuth(transport string, op auth.Operation, d auth.Decision, start tim
 }
 
 func operationLabel(op auth.Operation) string {
-	if op == auth.Write {
-		return "write"
-	}
-	return "read"
+	return op.String()
 }
 
 func decisionLabel(d auth.Decision) string {
@@ -237,6 +249,12 @@ func decisionLabel(d auth.Decision) string {
 func ObserveHook(status string, dur time.Duration) {
 	hookRuns.WithLabelValues(status).Inc()
 	hookDuration.Observe(dur.Seconds())
+}
+
+// ObserveWebhook records the final outcome and elapsed time of one event.
+func ObserveWebhook(status string, dur time.Duration) {
+	webhookDeliveries.WithLabelValues(status).Inc()
+	webhookDuration.Observe(dur.Seconds())
 }
 
 // ReposCreated counts a repository auto-created on first push.

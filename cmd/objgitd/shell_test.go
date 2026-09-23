@@ -20,7 +20,12 @@ func TestHookEnv(t *testing.T) {
 		Old:  plumbing.NewHash("1111111111111111111111111111111111111111"),
 		New:  plumbing.NewHash("2222222222222222222222222222222222222222"),
 	}
-	env := expand.ListEnviron(hookEnv("acme/test", "receive-pack", u)...)
+	c := hookChanges{
+		added:   []byte(`["a.txt"]`),
+		changed: []byte(`["b.txt"]`),
+		deleted: []byte(`[]`),
+	}
+	env := expand.ListEnviron(hookEnv("acme/test", "receive-pack", u, c)...)
 
 	for _, tt := range []struct {
 		name string
@@ -36,6 +41,10 @@ func TestHookEnv(t *testing.T) {
 		{name: "OBJGIT_BRANCH", want: "main"},
 		{name: "OBJGIT_OLD_SHA", want: u.Old.String()},
 		{name: "OBJGIT_NEW_SHA", want: u.New.String()},
+		{name: "OBJGIT_ADDED_FILES_JSON", want: `["a.txt"]`},
+		{name: "OBJGIT_CHANGED_FILES_JSON", want: `["b.txt"]`},
+		{name: "OBJGIT_DELETED_FILES_JSON", want: `[]`},
+		{name: "OBJGIT_CHANGES_FILE", want: "/tmp/objgit-changes.json"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := env.Get(tt.name).String(); got != tt.want {
@@ -232,6 +241,8 @@ func TestSSHShell(t *testing.T) {
 				`echo "branch=$OBJGIT_BRANCH cwd=$PWD svc=$OBJGIT_SERVICE"`,
 				`read old new ref; echo "stdin=$ref"`,
 				`cat README.md`,
+				`echo "added=$OBJGIT_ADDED_FILES_JSON"`,
+				`cat "$OBJGIT_CHANGES_FILE"`,
 				`printf 'x%sy\n' tmp > /tmp/x && cat /tmp/x`,
 				`if true; then`,
 				`echo "cont$((1))"`,
@@ -246,6 +257,8 @@ func TestSSHShell(t *testing.T) {
 				"branch=main cwd=/src svc=receive-pack\r",
 				"stdin=refs/heads/main",
 				"hello from the shell repo",
+				`added=["README.md"]`,
+				`{"added":["README.md"],"changed":[],"deleted":[]}`,
 				"xtmpy",
 				"cont1",
 				"read-only filesystem",

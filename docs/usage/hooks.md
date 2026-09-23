@@ -26,17 +26,16 @@ push, so in practice you want both.
 - **On push only.** The hook is named after the git service that triggered it,
   and the only service that runs a hook is `receive-pack` (push). Fetches,
   clones, and archives never run hooks.
-- **After the push completes.** Refs are already updated and the client has
-  already received its response when the hook starts. A hook therefore **cannot
-  reject a push** and its output is never shown to the person pushing — it goes
-  to the server log only. This is a post-receive hook, not a pre-receive gate.
+- **After refs are updated.** The hook runs after Git's status report is sent,
+  but before the push response closes. Its stdout and stderr stream to the
+  pushing client as `remote:` lines when sideband is available. A hook
+  **cannot reject a push**. This is a post-receive hook, not a pre-receive gate.
 - **Once per changed branch.** If a push updates or creates several branches,
   the hook runs once for each, with environment variables describing that
   branch (see below). Branch **deletions** are skipped (there is nothing to
   check out).
-- **Asynchronously.** The push returns immediately; the hook runs in the
-  background. On server shutdown, in-flight hooks are given a short grace period
-  to finish.
+- **Synchronously.** The client waits for the hook to finish or reach
+  `-hook-timeout` before the push response closes.
 
 The script is read from the **commit that was just pushed**, so a hook travels
 with the branch — different branches can carry different hooks, and updating a
@@ -80,14 +79,34 @@ redirections like `echo x > out` — must target `/tmp`.
 
 Each run gets variables describing the branch that triggered it:
 
-| Variable         | Example           | Notes                                               |
-| ---------------- | ----------------- | --------------------------------------------------- |
-| `OBJGIT_REPO`    | `/myproject.git`  | Repository path                                     |
-| `OBJGIT_SERVICE` | `receive-pack`    | Always `receive-pack`                               |
-| `OBJGIT_REF`     | `refs/heads/main` | Full ref name                                       |
-| `OBJGIT_BRANCH`  | `main`            | Short branch name                                   |
-| `OBJGIT_OLD_SHA` | `0000…0000`       | Previous tip; all zeros when the branch was created |
-| `OBJGIT_NEW_SHA` | `f43417…`         | New tip                                             |
+| Variable                    | Example                    | Notes                                                     |
+| --------------------------- | -------------------------- | --------------------------------------------------------- |
+| `OBJGIT_REPO`               | `/myproject.git`           | Repository path                                           |
+| `OBJGIT_SERVICE`            | `receive-pack`             | Always `receive-pack`                                     |
+| `OBJGIT_REF`                | `refs/heads/main`          | Full ref name                                             |
+| `OBJGIT_BRANCH`             | `main`                     | Short branch name                                         |
+| `OBJGIT_OLD_SHA`            | `0000…0000`                | Previous tip; all zeros when the branch was created       |
+| `OBJGIT_NEW_SHA`            | `f43417…`                  | New tip                                                   |
+| `OBJGIT_ADDED_FILES_JSON`   | `["new.txt"]`              | Added paths, as a JSON array                              |
+| `OBJGIT_CHANGED_FILES_JSON` | `["README.md"]`            | Changed paths, as a JSON array                            |
+| `OBJGIT_DELETED_FILES_JSON` | `["old.txt"]`              | Deleted paths, as a JSON array                            |
+| `OBJGIT_CHANGES_FILE`       | `/tmp/objgit-changes.json` | File containing all three arrays in a single JSON object |
+
+The file lists describe the **net change of the branch tip** across the push.
+If one commit adds a path and a later commit deletes it, that path does not
+appear in these lists. A new branch compares its tip against an empty tree.
+Renames appear as one added path and one deleted path. Mode-only changes
+appear in `changed`. Whitespace and newlines in paths are JSON escaped;
+parse the JSON rather than splitting on spaces or lines. A path with invalid
+UTF-8 bytes is represented as `/objgit/raw-path/base64url/` followed by the
+unpadded base64url encoding of its raw bytes.
+
+`OBJGIT_CHANGES_FILE` lives in the hook's writable `/tmp` filesystem and
+contains the same complete lists. For example:
+
+```json
+{"added":["new.txt"],"changed":["README.md"],"deleted":["old.txt"]}
+```
 
 For compatibility with scripts written for stock git, the same information is
 also fed on **stdin** as a single `<old> <new> <ref>` line.
@@ -149,9 +168,12 @@ commands before you put them in a hook.
 The shell is the same as the one that a hook gets:
 
 - `/src` is the tip commit of the branch, read-only, and the shell starts there.
-- `/tmp` is scratch space, and it is empty at the start of each session.
+- `/tmp` is scratch space. At the start of each session, it holds only
+  `objgit-changes.json`.
 - The `OBJGIT_*` variables describe the tip commit as if you pushed it.
   `OBJGIT_OLD_SHA` is its first parent, or all zeros for a root commit.
+- The file lists compare the tip commit with that first parent. For a root
+  commit, every file is in `OBJGIT_ADDED_FILES_JSON`.
 - Each command gets the hook stdin line, so `read old new ref` works.
 
 The shell is different from a hook in these ways:
@@ -188,8 +210,8 @@ All hook activity is logged through the server's structured (`slog`) logger:
 - `hook: no hook file in pushed tree` (debug level) — the push had no
   `.objgit/hooks/receive-pack`, so nothing ran.
 
-Because output is log-only, a hook cannot communicate back to the client that
-pushed.
+When sideband is unavailable, hook output is captured in the server log.
+Hook failure is logged, but it cannot undo the accepted push.
 
 ## Limitations
 
@@ -197,4 +219,4 @@ pushed.
   scratch space.
 - No way to reject a push from a hook (it runs after the fact).
 - No system tooling, network, or arbitrary executables — only kefka built-ins.
-- Output is not relayed to the pusher.
+- Hook output reaches the pusher only when the client negotiated sideband.

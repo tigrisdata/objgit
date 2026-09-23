@@ -135,6 +135,15 @@ func (d *daemon) handleSSH(s ssh.Session) {
 		_ = s.Exit(1)
 		return
 	}
+	if cmd[0] == "objgit-webhook-settings" {
+		if len(cmd) != 2 {
+			fmt.Fprintln(s.Stderr(), "objgitd: usage: objgit-webhook-settings org/repo")
+			_ = s.Exit(1)
+			return
+		}
+		d.handleSSHWebhookSettings(s, cmd[1])
+		return
+	}
 
 	service, ok := gitServiceFor(cmd[0])
 	if !ok {

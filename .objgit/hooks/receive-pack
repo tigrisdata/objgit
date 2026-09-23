@@ -6,7 +6,7 @@
 # -allow-hooks. It does NOT run on a normal `git` server — it only has meaning
 # when this repository is served by objgitd.
 #
-# Execution environment (see CLAUDE.md "Push hooks"):
+# Execution environment (see docs/usage/hooks.md):
 #   * It runs in a kefka virtual shell, NOT a real OS shell. Only kefka's
 #     built-in commands are available (coreutils: cat, ls, echo, printf, head,
 #     tail, cut, sort, uniq, wc, sha256sum, grep, ...). There is no PATH to
@@ -15,9 +15,9 @@
 #     starts here.
 #   * /tmp is the only writable location (also $HOME and $TMPDIR). Writing
 #     anywhere else fails; a redirect into /src aborts the script.
-#   * The hook runs asynchronously after the push response, so it cannot reject
-#     a push. Its stdout/stderr and exit status are written to the server log
-#     only — the person pushing never sees them.
+#   * The hook runs after refs are updated. It cannot reject a push. Its output
+#     streams to the pushing client when sideband is available, and its exit
+#     status is logged. The push waits for the hook to finish.
 #   * One run happens per created or updated branch. Branch deletions are
 #     skipped.
 #
@@ -28,9 +28,15 @@
 #   OBJGIT_BRANCH    short branch name, e.g. main
 #   OBJGIT_OLD_SHA   previous tip (all zeros when the branch was created)
 #   OBJGIT_NEW_SHA   new tip
+#   OBJGIT_ADDED_FILES_JSON, OBJGIT_CHANGED_FILES_JSON,
+#   OBJGIT_DELETED_FILES_JSON are JSON arrays of net file changes.
+#   OBJGIT_CHANGES_FILE points to the full JSON object in /tmp.
 # git's usual "<old> <new> <ref>" line is also fed on stdin.
 
 echo "push to ${OBJGIT_REPO} ${OBJGIT_REF}: ${OBJGIT_OLD_SHA} -> ${OBJGIT_NEW_SHA}"
+echo "file changes:"
+cat "${OBJGIT_CHANGES_FILE}"
+echo
 
 # /src is the checkout of the new commit. List what landed at the top level.
 echo "top-level contents:"

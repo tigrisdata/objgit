@@ -138,6 +138,16 @@ func (d *daemon) handleShell(s ssh.Session, args []string) {
 		fail("%v", err)
 		return
 	}
+	// A push hook diffs within its -hook-timeout, so bound this diff the same way.
+	diffCtx, cancel := context.WithTimeout(s.Context(), d.hookTimeout)
+	changes, err := loadHookChanges(diffCtx, st, u)
+	cancel()
+	if err != nil {
+		metrics.ObserveGitOp("ssh", "sh", "error", start)
+		slog.Error("ssh shell: diff changed files", "repo", ref.Path(), "sha", u.New.String(), "err", err)
+		fail("cannot list the changed files of %s", u.New)
+		return
+	}
 
 	log := slog.With("repo", ref.Path(), "ref", u.Name.String(), "sha", u.New.String(), "remote", s.RemoteAddr().String())
 	log.Info("serving ssh shell")
@@ -157,7 +167,7 @@ func (d *daemon) handleShell(s ssh.Session, args []string) {
 		}
 	}()
 
-	sh, err := newHookShell(tree, hookEnv(ref.Path(), receivePackHook, u), nil, t, t)
+	sh, err := newHookShell(tree, changes, hookEnv(ref.Path(), receivePackHook, u, changes), nil, t, t)
 	if err != nil {
 		metrics.ObserveGitOp("ssh", "sh", "error", start)
 		log.Error("ssh shell: build shell", "err", err)
