@@ -1,3 +1,9 @@
+# [1.8.0](https://github.com/tigrisdata/objgit/compare/v1.7.0...v1.8.0) (2026-09-23)
+
+### Features
+
+- **ssh:** add sh command to explore the hook sandbox ([#16](https://github.com/tigrisdata/objgit/issues/16)) ([ed5dc6c](https://github.com/tigrisdata/objgit/commit/ed5dc6c911502cb954fc27e0e2904ddce366166d))
+
 # [1.7.0](https://github.com/tigrisdata/objgit/compare/v1.6.0...v1.7.0) (2026-09-23)
 
 ### Features
