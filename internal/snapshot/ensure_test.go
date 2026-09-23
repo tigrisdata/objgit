@@ -3,8 +3,11 @@ package snapshot
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"strings"
@@ -191,6 +194,77 @@ func TestEnsureCompresses(t *testing.T) {
 	}
 }
 
+func TestEnsureResolvesLFSPointers(t *testing.T) {
+	content := []byte("actual LFS file contents\n")
+	digest := sha256.Sum256(content)
+	oid := hex.EncodeToString(digest[:])
+	pointer := fmt.Sprintf("version https://git-lfs.github.com/spec/v1\noid sha256:%s\nsize %d\n", oid, len(content))
+	tests := []struct {
+		name    string
+		blob    string
+		mode    filemode.FileMode
+		opener  bool
+		openErr error
+		want    string
+		wantErr string
+	}{
+		{name: "regular pointer", blob: pointer, mode: filemode.Regular, opener: true, want: string(content)},
+		{name: "executable pointer", blob: pointer, mode: filemode.Executable, opener: true, want: string(content)},
+		{name: "ordinary file", blob: "ordinary\n", mode: filemode.Regular, want: "ordinary\n"},
+		{name: "missing object store", blob: pointer, mode: filemode.Regular, wantErr: "no object store"},
+		{name: "missing LFS object", blob: pointer, mode: filemode.Regular, opener: true, openErr: fs.ErrNotExist, wantErr: "file does not exist"},
+		{name: "malformed size", blob: strings.Replace(pointer, fmt.Sprintf("size %d", len(content)), "size -1", 1), mode: filemode.Regular, opener: true, wantErr: "invalid LFS object size"},
+		{name: "extension", blob: strings.Replace(pointer, "oid sha256:", "ext-0-foo sha256:"+oid+"\noid sha256:", 1), mode: filemode.Regular, opener: true, wantErr: "unsupported or malformed LFS pointer"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := memory.NewStorage()
+			tree := buildTree(t, st, []fixture{{"file.bin", tt.mode, tt.blob}})
+			store := NewMemStore()
+			var open LFSOpener
+			if tt.opener {
+				open = func(_ context.Context, gotOID string, gotSize int64) (io.ReadCloser, error) {
+					if gotOID != oid || gotSize != int64(len(content)) {
+						t.Errorf("open LFS %s, %d; want %s, %d", gotOID, gotSize, oid, len(content))
+					}
+					if tt.openErr != nil {
+						return nil, tt.openErr
+					}
+					return io.NopCloser(bytes.NewReader(content)), nil
+				}
+			}
+			_, err := EnsureWithLFS(context.Background(), st, store, tree, t.TempDir(), open)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("EnsureWithLFS error = %v, want %q", err, tt.wantErr)
+				}
+				if store.PutCount() != 0 {
+					t.Error("stored an incomplete image")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("EnsureWithLFS: %v", err)
+			}
+			snap, err := Open(context.Background(), store, tree)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer snap.Close()
+			got, err := fs.ReadFile(snap, "file.bin")
+			if err != nil || string(got) != tt.want {
+				t.Errorf("file.bin = %q, %v; want %q", got, err, tt.want)
+			}
+			if tt.mode == filemode.Executable {
+				info, err := fs.Stat(snap, "file.bin")
+				if err != nil || info.Mode().Perm() != 0o755 {
+					t.Errorf("file.bin mode = %v, %v; want 0755", info, err)
+				}
+			}
+		})
+	}
+}
+
 func TestEnsureDeterministic(t *testing.T) {
 	entries := []fixture{
 		{"a.txt", filemode.Regular, strings.Repeat("a", 9000)},
@@ -233,7 +307,7 @@ func TestEnsureMetadata(t *testing.T) {
 	if !ok {
 		t.Fatal("no object at Key(tree)")
 	}
-	want := map[string]string{MetaFormat: "1", MetaTree: tree.String(), MetaFiles: "2"}
+	want := map[string]string{MetaFormat: "2", MetaTree: tree.String(), MetaFiles: "2"}
 	for k, v := range want {
 		if meta[k] != v {
 			t.Errorf("meta[%q] = %q, want %q", k, meta[k], v)

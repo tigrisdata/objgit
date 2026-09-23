@@ -125,7 +125,7 @@ func checkSSHBinaries(t *testing.T) {
 // startSSHServer creates an in-memory daemon and starts the SSH server on an
 // ephemeral port. It returns the listening address and the backing resolver
 // store.
-func startSSHServer(t *testing.T, allowPush, allowHooks bool) (string, *memBase) {
+func startSSHServer(t *testing.T, allowPush, allowHooks bool, opts ...func(*daemon)) (string, *memBase) {
 	t.Helper()
 	mb := newMemBase()
 	d := &daemon{
@@ -134,6 +134,9 @@ func startSSHServer(t *testing.T, allowPush, allowHooks bool) (string, *memBase)
 		authz:       auth.AllowAnonymous{AllowWrite: allowPush},
 		allowHooks:  allowHooks,
 		hookTimeout: 30 * time.Second,
+	}
+	for _, opt := range opts {
+		opt(d)
 	}
 	srv, err := newSSHServer(d, "")
 	if err != nil {

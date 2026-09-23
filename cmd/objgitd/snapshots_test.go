@@ -3,7 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"net/http/httptest"
@@ -21,6 +24,7 @@ import (
 	"github.com/go-git/go-git/v6/storage"
 	"github.com/go-git/go-git/v6/storage/memory"
 	"github.com/tigrisdata/objgit/internal/auth"
+	"github.com/tigrisdata/objgit/internal/lfs"
 	"github.com/tigrisdata/objgit/internal/repofs"
 	"github.com/tigrisdata/objgit/internal/snapshot"
 )
@@ -113,6 +117,51 @@ func TestSmartHTTPPushSnapshots(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("push output missing %q:\n%s", want, out)
 		}
+	}
+}
+
+func TestSmartHTTPPushSnapshotResolvesLFS(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	const repoPath = "acme/lfs-snap"
+	content := []byte("the full LFS payload\n")
+	sum := sha256.Sum256(content)
+	oid := hex.EncodeToString(sum[:])
+	pointer := fmt.Sprintf("version https://git-lfs.github.com/spec/v1\noid sha256:%s\nsize %d\n", oid, len(content))
+
+	base := newSnapBase()
+	bucket := newMemBucket()
+	bucket.put(lfs.BlobKey(oid), content)
+	bucket.put(lfs.MarkerKey(repoPath, oid), nil)
+	bucket.meta[lfs.MarkerKey(repoPath, oid)] = map[string]string{"lfs-size": fmt.Sprint(len(content))}
+	d := &daemon{
+		sysFS:           memfs.New(),
+		resolver:        repofs.BucketResolver{Base: base},
+		authz:           auth.AllowAnonymous{AllowWrite: true},
+		snapshots:       true,
+		snapshotTimeout: 30 * time.Second,
+		snapshotTmpDir:  t.TempDir(),
+		lfs:             &lfsService{store: lfs.NewStore(bucket, nil, "test-bucket")},
+	}
+	ts := httptest.NewServer(d.httpHandler())
+	t.Cleanup(ts.Close)
+	work := seedRepo(t)
+	writeFile(t, filepath.Join(work, "asset.bin"), pointer)
+	runGit(t, work, "add", "asset.bin")
+	runGit(t, work, "commit", "-m", "add LFS pointer")
+	if out, err := tryGit(work, "push", ts.URL+"/"+repoPath+".git", "main"); err != nil {
+		t.Fatalf("push: %v\n%s", err, out)
+	}
+	tree := plumbing.NewHash(strings.TrimSpace(runGit(t, work, "rev-parse", "HEAD^{tree}")))
+	snap, err := snapshot.Open(context.Background(), base.repo(repoPath), tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snap.Close()
+	got, err := fs.ReadFile(snap, "asset.bin")
+	if err != nil || !bytes.Equal(got, content) {
+		t.Errorf("asset.bin = %q, %v; want LFS payload", got, err)
 	}
 }
 

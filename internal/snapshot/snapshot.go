@@ -18,7 +18,7 @@ import (
 // FormatVersion names the mapping from git to EROFS and the build options.
 // Changing either one is a new version, and a new key, so an image written
 // under one version is never overwritten by another.
-const FormatVersion = 1
+const FormatVersion = 2
 
 // Object metadata keys carried by every image. Lowercase, because S3 returns
 // user metadata keys lowercased.
@@ -37,7 +37,7 @@ func Key(tree plumbing.Hash) string {
 	return fmt.Sprintf("%sv%d/%s.erofs", keyPrefix, FormatVersion, tree)
 }
 
-// CacheID returns the local cache id for key: "erofs-v1-<tree>". It holds no
+// CacheID returns the local cache id for key: "erofs-v2-<tree>". It holds no
 // repository prefix, so two repositories with one tree share one cached file.
 func CacheID(key string) string {
 	id := strings.TrimSuffix(strings.TrimPrefix(key, keyPrefix), ".erofs")

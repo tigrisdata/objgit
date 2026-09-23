@@ -32,7 +32,7 @@ call has run.
 | `packs/<id>.cue`                  | The record index for one container.                          |
 | `packed-refs`                     | Every reference in one object. See "References".             |
 | `refs/<name>`                     | One legacy loose reference. Read-only.                       |
-| `snapshots/erofs/v1/<tree>.erofs` | One erofs image of a tree. See [snapshots.md](snapshots.md). |
+| `snapshots/erofs/v2/<tree>.erofs` | One erofs image of a tree. See [snapshots.md](snapshots.md). |
 
 Shallow marks, the worktree index, and the repository configuration sit at
 root-level keys. They carry the same prefix as everything else. The `shallow`

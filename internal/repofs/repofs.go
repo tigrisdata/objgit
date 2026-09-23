@@ -25,6 +25,18 @@ var ErrInvalidPath = errors.New("repository path must be of the form {orgID}/{re
 // authentication challenge (HTTP 401) rather than a 404 or 500.
 var ErrUnauthenticated = errors.New("repofs: authentication required")
 
+// ErrReservedPath is returned by Parse when a repository path would collide
+// with a key prefix the daemon reserves for itself.
+var ErrReservedPath = errors.New("repofs: repository path is reserved")
+
+// reservedOrgs are the org IDs a repository may not use, because the daemon
+// stores its own data under those bucket prefixes. A repository is scoped to
+// "orgID/name/", so an org of "lfs" would put a repository's keys underneath
+// the LFS blob prefix and make any sweep of it eat a repository.
+var reservedOrgs = map[string]struct{}{
+	"lfs": {},
+}
+
 // RepoRef identifies a repository. OrgID is an opaque reference a later API call
 // will validate; for now it is accepted as-is. Name has any trailing ".git"
 // stripped, so org/repo.git and org/repo denote the same repository.
@@ -39,6 +51,12 @@ func (r RepoRef) Path() string { return path.Join(r.OrgID, r.Name) }
 // Parse converts a raw transport path into a RepoRef. It trims surrounding
 // slashes, requires exactly two non-empty segments, and strips a trailing
 // ".git" from the name. OrgID is not otherwise validated.
+//
+// Parse rejects the prefixes the daemon reserves for its own state with
+// ErrReservedPath: a dot-prefixed segment (which holds the SSH host key under
+// ".objgit/"), and a reserved org ID (which holds LFS blobs under "lfs/").
+// Both checks live here rather than in a transport, so every transport gets
+// them.
 func Parse(raw string) (RepoRef, error) {
 	parts := strings.Split(strings.Trim(raw, "/"), "/")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
@@ -47,6 +65,12 @@ func Parse(raw string) (RepoRef, error) {
 	name := strings.TrimSuffix(parts[1], ".git")
 	if name == "" {
 		return RepoRef{}, ErrInvalidPath
+	}
+	if strings.HasPrefix(parts[0], ".") || strings.HasPrefix(name, ".") {
+		return RepoRef{}, ErrReservedPath
+	}
+	if _, ok := reservedOrgs[parts[0]]; ok {
+		return RepoRef{}, ErrReservedPath
 	}
 	return RepoRef{OrgID: parts[0], Name: name}, nil
 }
