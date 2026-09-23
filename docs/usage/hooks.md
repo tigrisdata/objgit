@@ -48,7 +48,7 @@ virtual `bash` interpreter. **This is not a container, VM, or OS sandbox.** It i
 safe because of what it _cannot_ reach, not because of kernel isolation:
 
 - **No system binaries.** Kefka provides Go commands, WASM-backed uutils, and
-  the WASM programs `jq`, `python3` (also `python`), `qjs`, and `rg`. Available
+  the WASM programs `jo`, `jq`, `python3` (also `python`), `qjs`, and `rg`. Available
   coreutils include `cat`, `ls`, `printf`, `head`, `tail`, `cut`, `sort`,
   `uniq`, `wc`, `tr`, `sha256sum`, `base64`, `base32`, `mkdir`, `cp`, `mv`,
   `rm`, `touch`, `date`, `sleep`, `seq`, and `expr`. There is no `git`,

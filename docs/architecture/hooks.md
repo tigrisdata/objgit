@@ -73,6 +73,7 @@ Its `OpenHandler` is adapted to permit writes, so `/tmp` redirections work.
 The filesystem is what enforces the read-only `/src`.
 `internal/mountfs` also provides read-only directory handles for the WASI
 programs, which need to open `/` and directories below it to resolve paths.
+Open files report their full mounted path so WASI can stat them after open.
 
 `newHookShell` builds this sandbox, and `hookEnv` builds its environment.
 `loadHookChanges` gives both of them the file changes of the update.

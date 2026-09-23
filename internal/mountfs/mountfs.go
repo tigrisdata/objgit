@@ -73,8 +73,13 @@ func (f *FS) OpenFile(filename string, flag int, perm fs.FileMode) (billy.File, 
 		return f.openDir(filename, flag)
 	}
 	file, err := sub.OpenFile(rel, flag, perm)
-	if err == nil || flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_APPEND|os.O_TRUNC) != 0 {
-		return file, err
+	if err == nil {
+		// The mounted filesystem may return only the basename from Name().
+		// WASI uses it to stat the open file against this composite filesystem.
+		return namedFile{File: file, name: path.Clean("/" + filename)}, nil
+	}
+	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_APPEND|os.O_TRUNC) != 0 {
+		return nil, err
 	}
 	// Some mounted filesystems cannot open directories. WASI needs directory
 	// handles to resolve paths beneath the preopened root.
@@ -83,6 +88,13 @@ func (f *FS) OpenFile(filename string, flag int, perm fs.FileMode) (billy.File, 
 	}
 	return nil, err
 }
+
+type namedFile struct {
+	billy.File
+	name string
+}
+
+func (f namedFile) Name() string { return f.name }
 
 func (f *FS) openDir(filename string, flag int) (billy.File, error) {
 	if flag&(os.O_WRONLY|os.O_RDWR|os.O_CREATE|os.O_APPEND|os.O_TRUNC) != 0 {

@@ -166,5 +166,5 @@ honnef.co/go/tools v0.7.0 h1:w6WUp1VbkqPEgLz4rkBzH/CSU6HkoqNLp6GstyTx3lU=
 honnef.co/go/tools v0.7.0/go.mod h1:pm29oPxeP3P82ISxZDgIYeOaf9ta6Pi0EWvCFoLG2vc=
 mvdan.cc/sh/v3 v3.13.1 h1:DP3TfgZhDkT7lerUdnp6PTGKyxxzz6T+cOlY/xEvfWk=
 mvdan.cc/sh/v3 v3.13.1/go.mod h1:lXJ8SexMvEVcHCoDvAGLZgFJ9Wsm2sulmoNEXGhYZD0=
-tangled.org/xeiaso.net/kefka v0.0.6 h1:umz6a3ZwnSEZb72xmSUaMXTprxTJFntSy1LHXveAc4g=
-tangled.org/xeiaso.net/kefka v0.0.6/go.mod h1:h2ZITASpfUqC6PzLUfYTTO9AKPAft45UvCyxe/LAN2k=
+tangled.org/xeiaso.net/kefka v0.0.8 h1:RbiOJn+b+zxa4gNVkW1mSIBj0Qjbcji2eo7wdBf5Gu8=
+tangled.org/xeiaso.net/kefka v0.0.8/go.mod h1:h2ZITASpfUqC6PzLUfYTTO9AKPAft45UvCyxe/LAN2k=
