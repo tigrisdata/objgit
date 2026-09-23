@@ -119,12 +119,29 @@ func newSSHServer(d *daemon, addr string) (*ssh.Server, error) {
 
 // handleSSH services one git-over-SSH exec request: parse the command, authorize,
 // resolve the repository, and hand the session to the matching go-git transport
-// command. The session is the protocol stream (reader and writer).
+// command. The session is the protocol stream (reader and writer). The one
+// non-git command, sh, goes to handleShell.
 func (d *daemon) handleSSH(s ssh.Session) {
 	cmd := s.Command()
+	if len(cmd) > 0 && cmd[0] == "sh" {
+		d.handleShell(s, cmd[1:])
+		return
+	}
 	if len(cmd) < 2 {
 		fmt.Fprintln(s.Stderr(), "objgitd: this is a git SSH endpoint; interactive shells are not supported")
+		if d.allowHooks {
+			fmt.Fprintln(s.Stderr(), "objgitd: to explore the hook sandbox, run: ssh -t <host> sh <repo> [branch]")
+		}
 		_ = s.Exit(1)
+		return
+	}
+	if cmd[0] == "objgit-webhook-settings" {
+		if len(cmd) != 2 {
+			fmt.Fprintln(s.Stderr(), "objgitd: usage: objgit-webhook-settings org/repo")
+			_ = s.Exit(1)
+			return
+		}
+		d.handleSSHWebhookSettings(s, cmd[1])
 		return
 	}
 

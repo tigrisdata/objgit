@@ -72,6 +72,97 @@ func countCacheFiles(t *testing.T, c *PackCache) int {
 	return len(ents)
 }
 
+// TestPackCacheSweepsOrphans covers the startup sweep: a previous run that
+// died without Cleanup leaves its objgit-packs-* directory on disk, and a
+// persistent -pack-cache-dir must not accumulate them.
+func TestPackCacheSweepsOrphans(t *testing.T) {
+	t.Parallel()
+
+	parent := t.TempDir()
+	for _, name := range []string{"objgit-packs-stale", "objgit-packs-also-stale"} {
+		dir := filepath.Join(parent, name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "orphan.bin"), []byte("junk"), 0o644); err != nil {
+			t.Fatalf("write orphan in %s: %v", name, err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(parent, "not-a-cache"), 0o755); err != nil {
+		t.Fatalf("mkdir unrelated: %v", err)
+	}
+
+	c, err := NewPackCache(parent, 0)
+	if err != nil {
+		t.Fatalf("NewPackCache: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Cleanup() })
+
+	for _, tt := range []struct {
+		path string
+		want bool // want the path to still exist after the sweep
+	}{
+		{path: filepath.Join(parent, "objgit-packs-stale"), want: false},
+		{path: filepath.Join(parent, "objgit-packs-also-stale"), want: false},
+		{path: filepath.Join(parent, "not-a-cache"), want: true},
+		{path: c.dir, want: true},
+	} {
+		_, err := os.Stat(tt.path)
+		exists := err == nil
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("stat %s: %v", tt.path, err)
+		}
+		if exists != tt.want {
+			t.Errorf("%s exists = %v, want %v", tt.path, exists, tt.want)
+		}
+	}
+}
+
+// TestSnapshotCacheSweepKeepsPackCache pins that each cache sweeps only its
+// own prefix. main.go makes the pack cache first and the snapshot cache second,
+// under one parent. A sweep keyed on the pack prefix would delete the live pack
+// cache the moment the snapshot cache starts.
+func TestSnapshotCacheSweepKeepsPackCache(t *testing.T) {
+	t.Parallel()
+
+	parent := t.TempDir()
+	for _, name := range []string{"objgit-packs-stale", "objgit-snapshots-stale"} {
+		if err := os.MkdirAll(filepath.Join(parent, name), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", name, err)
+		}
+	}
+
+	packs, err := NewPackCache(parent, 0)
+	if err != nil {
+		t.Fatalf("NewPackCache: %v", err)
+	}
+	t.Cleanup(func() { _ = packs.Cleanup() })
+	snaps, err := NewSnapshotCache(parent, 0, nil)
+	if err != nil {
+		t.Fatalf("NewSnapshotCache: %v", err)
+	}
+	t.Cleanup(func() { _ = snaps.Cleanup() })
+
+	for _, tt := range []struct {
+		path string
+		want bool // want the path to still exist after both sweeps
+	}{
+		{path: packs.dir, want: true},
+		{path: snaps.dir, want: true},
+		{path: filepath.Join(parent, "objgit-packs-stale"), want: false},
+		{path: filepath.Join(parent, "objgit-snapshots-stale"), want: false},
+	} {
+		_, err := os.Stat(tt.path)
+		exists := err == nil
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("stat %s: %v", tt.path, err)
+		}
+		if exists != tt.want {
+			t.Errorf("%s exists = %v, want %v", tt.path, exists, tt.want)
+		}
+	}
+}
+
 // TestPackCacheDownloadsOnce is the whole point of the cache: a second request
 // for a pack already on disk must not go back to the network.
 func TestPackCacheDownloadsOnce(t *testing.T) {

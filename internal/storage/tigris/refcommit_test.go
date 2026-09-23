@@ -226,6 +226,44 @@ func TestCommitRefsRevalidatesExpectations(t *testing.T) {
 	}
 }
 
+func TestUpdateReferencesCheckedRejectsRacingTip(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		seed bool
+		old  string
+	}{
+		{name: "update races another update", seed: true, old: headAB},
+		{name: "create races another create", old: plumbing.ZeroHash.String()},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFakeS3(t)
+			s := packedTestStorer(t, f)
+			if tt.seed {
+				seedPackedRefs(t, f, s, hashRef("refs/heads/main", headAB))
+			}
+			f.putHook = func(p *putSnapshot) {
+				if p.n == 1 {
+					f.putLocked(packedRefsKey, string(encodePackedRefs(refSet(hashRef("refs/heads/main", headCD)))), nil)
+				}
+			}
+			acceptedAt, err := s.UpdateReferencesChecked(
+				[]*plumbing.Reference{hashRef("refs/heads/main", headAB)}, nil,
+				map[plumbing.ReferenceName]plumbing.Hash{"refs/heads/main": plumbing.NewHash(tt.old)},
+			)
+			if !errors.Is(err, storage.ErrReferenceHasChanged) {
+				t.Fatalf("checked update error = %v, want ErrReferenceHasChanged", err)
+			}
+			if !acceptedAt.IsZero() {
+				t.Errorf("rejected update has acceptance time %v", acceptedAt)
+			}
+			ref, err := s.Reference("refs/heads/main")
+			if err != nil || ref.Hash().String() != headCD {
+				t.Errorf("racing value was overwritten: ref=%v err=%v", ref, err)
+			}
+		})
+	}
+}
+
 // TestCommitRefsFlushesOnce pins the invariant refs.go protects — a ref never
 // names an object whose upload has not finished — and pins that a batch pays
 // for one flush rather than one per ref.

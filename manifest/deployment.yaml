@@ -1,0 +1,133 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: objgitd
+  labels:
+    app.kubernetes.io/name: objgitd
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: objgit
+spec:
+  # One replica. Repositories and the SSH host key live in the Tigris bucket.
+  # The pack cache is the only node-local state, and this claim is
+  # ReadWriteOnce. Scale-out needs ReadOnlyMany storage or one cache per pod.
+  replicas: 1
+  strategy:
+    # A rolling update schedules the replacement pod while the old pod still
+    # holds the ReadWriteOnce volume. The new pod then blocks until the
+    # timeout.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: objgitd
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: objgitd
+        app.kubernetes.io/component: server
+        app.kubernetes.io/part-of: objgit
+    spec:
+      serviceAccountName: objgitd
+      securityContext:
+        # The image is distroless/static nonroot, uid and gid 65532. fsGroup
+        # hands the pack-cache volume to that group so the daemon can
+        # MkdirTemp its cache directory under the mount. Storage classes with
+        # fsGroupPolicy: None skip this chown. Such classes need a
+        # securityContext.fsGroupChangePolicy or an initContainer.
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: objgitd
+          # CI builds this image on every commit and publishes it to
+          # ghcr.io/tigrisdata/objgit (see .github/workflows/docker.yml). The
+          # tags are :latest, :main, :sha-<commit>, and one per release. GHCR
+          # packages start private. Make the package public, or configure an
+          # imagePullSecret. To use a different registry, change this
+          # reference.
+          #
+          # imagePullPolicy: Always pulls on every pod start, so a cached
+          # :latest on a node cannot pin an old image. Pin an immutable
+          # :sha-<commit> tag through an `images:` entry in
+          # kustomization.yaml for a fixed deployment.
+          image: ghcr.io/tigrisdata/objgit:latest
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: objgitd-config
+            - secretRef:
+                name: objgitd-tigris
+                # Credentials can also come from the AWS SDK default chain
+                # (IRSA, workload identity, node profile). Then the Secret is
+                # never created.
+                optional: true
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: git
+              containerPort: 9418
+            - name: ssh
+              containerPort: 2222
+            - name: metrics
+              containerPort: 9090
+          # /healthz on the metrics listener is the dedicated probe endpoint.
+          # The smart-HTTP mux 404s every non-git path, so the git ports
+          # cannot answer probes.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 5
+          resources:
+            # Each concurrent push costs roughly 400 MiB of resident set for
+            # a large repository. The limit must cover MAX_CONCURRENT_PUSHES
+            # (4 by default) plus fetch traffic. See
+            # docs/plans/bound-concurrent-pushes.md.
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          volumeMounts:
+            - name: pack-cache
+              mountPath: /var/cache/objgit
+            # The tigris storer stages uploads in the OS temp directory
+            # through os.CreateTemp (internal/storage/tigris/writer.go and
+            # packwriter.go). Distroless ships a writable /tmp, but the root
+            # filesystem of the container is read-only, so the OS temp
+            # directory needs its own volume.
+            #
+            # CAUTION: Do not set sizeLimit below the largest expected push.
+            # A pack stages whole in /tmp, and an exceeded sizeLimit evicts
+            # the entire pod, which kills every push in flight. For very
+            # large pushes, raise sizeLimit, or set TMPDIR to a path on the
+            # pack-cache volume.
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+      volumes:
+        - name: pack-cache
+          persistentVolumeClaim:
+            claimName: objgitd-pack-cache
+        - name: tmp
+          emptyDir:
+            sizeLimit: 4Gi

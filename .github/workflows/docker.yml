@@ -1,0 +1,87 @@
+name: Docker
+
+on:
+  push:
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # A pull request from a branch of this repository skips this job. The
+    # push event for that branch already built and published the commit, so
+    # a second run doubles the cost and adds nothing. A pull request from a
+    # fork has no push event here, so it runs.
+    if: "${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository }}"
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to the GitHub Container Registry
+        if: github.event_name == 'push'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # Build one platform and load it, so the smoke test runs before any
+      # push. A broken image then never reaches the registry.
+      - name: Build the amd64 image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: objgitd:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the health endpoint
+        run: |
+          docker run -d --name objgitd -e BUCKET=ci-dummy -p 127.0.0.1:9090:9090 objgitd:smoke
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9090/healthz; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs objgitd
+          exit 1
+
+      # The build stage is pinned to the runner platform (see the Dockerfile),
+      # so both targets compile without emulation. The builder cache already
+      # holds the amd64 layers from the smoke build. Push events publish.
+      # Pull requests build both platforms and push nothing.
+      - name: Build every platform
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

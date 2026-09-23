@@ -214,7 +214,7 @@ func TestHumanBytes(t *testing.T) {
 }
 
 // TestHooksIgnoreTags pins that a pushed tag does not run the hook, now that
-// snapshotRefs returns tags as well as branches.
+// every successful ref command, tags included, reaches onUpdated.
 func TestHooksIgnoreTags(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")

@@ -1,0 +1,64 @@
+{
+  "eventId": "11111111-1111-4111-8111-111111111111",
+  "pushId": "22222222-2222-4222-8222-222222222222",
+  "repository": "acme/widgets",
+  "ref": "refs/heads/main",
+  "before": "1111111111111111111111111111111111111111",
+  "after": "3333333333333333333333333333333333333333",
+  "created": false,
+  "deleted": false,
+  "forced": false,
+  "pushedAt": "2026-09-23T18:00:00Z",
+  "commits": [
+    {
+      "id": "2222222222222222222222222222222222222222",
+      "treeId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "message": "Add API draft",
+      "author": {
+        "name": "A. Developer",
+        "email": "dev@example.com",
+        "when": "2026-09-23T17:30:00Z"
+      },
+      "committer": {
+        "name": "A. Developer",
+        "email": "dev@example.com",
+        "when": "2026-09-23T17:30:00Z"
+      },
+      "parentIds": ["1111111111111111111111111111111111111111"],
+      "files": {
+        "added": ["api/openapi.yaml"],
+        "changed": ["README.md"],
+        "deleted": []
+      }
+    },
+    {
+      "id": "3333333333333333333333333333333333333333",
+      "treeId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "message": "Add push event schema",
+      "author": {
+        "name": "A. Developer",
+        "email": "dev@example.com",
+        "when": "2026-09-23T17:45:00Z"
+      },
+      "committer": {
+        "name": "A. Developer",
+        "email": "dev@example.com",
+        "when": "2026-09-23T17:45:00Z"
+      },
+      "parentIds": ["2222222222222222222222222222222222222222"],
+      "files": {
+        "added": ["proto/tigrisdata/objgit/events/push/v1/push.proto"],
+        "changed": ["README.md"],
+        "deleted": ["old/schema.json"]
+      }
+    }
+  ],
+  "files": {
+    "added": [
+      "api/openapi.yaml",
+      "proto/tigrisdata/objgit/events/push/v1/push.proto"
+    ],
+    "changed": ["README.md"],
+    "deleted": ["old/schema.json"]
+  }
+}

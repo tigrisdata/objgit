@@ -22,8 +22,8 @@ import (
 const maxTagDepth = 16
 
 // runSnapshots makes sure that an erofs image exists for the tree at the tip
-// of each updated ref. It runs synchronously inside onUpdated, so the push
-// waits for it, and it writes one progress line per ref. A failure is logged
+// of each updated branch and tag. It runs synchronously inside onUpdated, so
+// the push waits for it, and it writes one progress line per ref. A failure is logged
 // and counted and never fails the push: the refs are already committed.
 func (d *daemon) runSnapshots(repoPath string, st storage.Storer, updates []refUpdate, progress io.Writer) {
 	store, ok := st.(snapshot.Store)
@@ -35,9 +35,9 @@ func (d *daemon) runSnapshots(repoPath string, st storage.Storer, updates []refU
 	ctx, cancel := context.WithTimeout(context.Background(), d.snapshotTimeout)
 	defer cancel()
 
-	// diffRefs ranges over a map, so its order is random. Branches go first,
-	// then tags, each by name, so the ref that builds a shared tree (and the
-	// progress output) is the same on every push.
+	// Branches go first, then tags, each by name, so the ref that builds a
+	// shared tree (and the progress output) is the same on every push, however
+	// the client ordered its commands.
 	ordered := slices.Clone(updates)
 	slices.SortFunc(ordered, func(a, b refUpdate) int {
 		if a.Name.IsBranch() != b.Name.IsBranch() {
@@ -52,8 +52,8 @@ func (d *daemon) runSnapshots(repoPath string, st storage.Storer, updates []refU
 	// A branch and a tag on one commit share one tree, and one build.
 	seen := map[plumbing.Hash]string{}
 	for _, u := range ordered {
-		if u.New.IsZero() {
-			continue
+		if u.New.IsZero() || !(u.Name.IsBranch() || u.Name.IsTag()) {
+			continue // a deletion, or a ref such as refs/notes/*
 		}
 		log := slog.With("repo", repoPath, "ref", u.Name.String(), "sha", u.New.String())
 

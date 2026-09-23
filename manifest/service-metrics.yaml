@@ -1,0 +1,17 @@
+# Prometheus /metrics (and pprof), kept off the git Service on purpose.
+apiVersion: v1
+kind: Service
+metadata:
+  name: objgit-metrics
+  labels:
+    app.kubernetes.io/name: objgitd
+    app.kubernetes.io/component: metrics
+    app.kubernetes.io/part-of: objgit
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: objgitd
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics

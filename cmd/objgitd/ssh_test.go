@@ -148,16 +148,21 @@ func startSSHServer(t *testing.T, allowPush, allowHooks bool) (string, *memBase)
 	return ln.Addr().String(), mb
 }
 
-// gitSSHEnv generates a throw-away ed25519 client key and returns an env slice
-// with GIT_SSH_COMMAND pointing at ssh using that key with host-key checking
-// disabled. The server accepts any public key.
-func gitSSHEnv(t *testing.T) []string {
+// sshClientKey generates a throw-away ed25519 client key and returns its path.
+func sshClientKey(t *testing.T) string {
 	t.Helper()
-	keyDir := t.TempDir()
-	key := filepath.Join(keyDir, "id_ed25519")
+	key := filepath.Join(t.TempDir(), "id_ed25519")
 	if out, err := exec.Command("ssh-keygen", "-t", "ed25519", "-N", "", "-f", key).CombinedOutput(); err != nil {
 		t.Fatalf("ssh-keygen: %v\n%s", err, out)
 	}
+	return key
+}
+
+// gitSSHEnv returns an env slice with GIT_SSH_COMMAND pointing at ssh using that key with host-key checking
+// disabled. The server accepts any public key.
+func gitSSHEnv(t *testing.T) []string {
+	t.Helper()
+	key := sshClientKey(t)
 	sshCmd := fmt.Sprintf("ssh -i %q -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null", key)
 	return append(os.Environ(),
 		"GIT_SSH_COMMAND="+sshCmd,

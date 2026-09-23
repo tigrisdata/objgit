@@ -34,7 +34,7 @@ Three behaviors live on `*daemon`, so every transport acts the same way:
 | ------------------------------------ | ---------------------------------------------------------------------------- |
 | [transports.md](transports.md)       | Smart HTTP, git://, and SSH. Two protocol points that are easy to get wrong. |
 | [auth.md](auth.md)                   | The one authorization interface that every transport calls.                  |
-| [hooks.md](hooks.md)                 | Push hooks, live output streaming, and the kefka sandbox.                    |
+| [hooks.md](hooks.md)                 | Push hooks, webhook dispatch, live output streaming, and the kefka sandbox.  |
 | [metrics.md](metrics.md)             | Prometheus vectors and the three instrumentation seams.                      |
 | [snapshots.md](snapshots.md)         | erofs images of pushed trees, and the snapshot cache.                        |
 | [tigris-storer.md](tigris-storer.md) | Repository storage: a `storage.Storer` on one Tigris bucket.                 |
@@ -45,4 +45,5 @@ Related documents outside this directory:
 - [../reference/tigris-backend.md](../reference/tigris-backend.md) — the `.cue`
   binary layout, the failure modes, and the build order.
 - [../usage/hooks.md](../usage/hooks.md) — how to write a hook script.
+- [../usage/webhooks.md](../usage/webhooks.md) — how to configure and verify push webhooks.
 - `../plans/` — plans for work that is not yet complete.

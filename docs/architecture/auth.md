@@ -18,23 +18,23 @@ Authorizer.Authorize(ctx, auth.Request) auth.Decision
 
 `auth.Request` carries four fields:
 
-| Field        | Meaning                          |
-| ------------ | -------------------------------- |
-| `Repo`       | The repository path.             |
-| `Operation`  | `Read` or `Write`.               |
-| `Credential` | What the client presented.       |
-| `Transport`  | Which transport asked.           |
+| Field        | Meaning                      |
+| ------------ | ---------------------------- |
+| `Repo`       | The repository path.         |
+| `Operation`  | `Read`, `Write`, or `Admin`. |
+| `Credential` | What the client presented.   |
+| `Transport`  | Which transport asked.       |
 
 ## Credential
 
 `Credential` is a sum type. An unexported method seals it, so no other package
 can add a case.
 
-| Case                             | Source                                          |
-| -------------------------------- | ----------------------------------------------- |
-| `Anonymous{}`                    | git://, or HTTP and SSH with nothing presented. |
-| `PublicKey{Key}`                 | SSH.                                            |
-| `BasicAuth{Username, Password}`  | HTTP.                                           |
+| Case                            | Source                                          |
+| ------------------------------- | ----------------------------------------------- |
+| `Anonymous{}`                   | git://, or HTTP and SSH with nothing presented. |
+| `PublicKey{Key}`                | SSH.                                            |
+| `BasicAuth{Username, Password}` | HTTP.                                           |
 
 CAUTION: `BasicAuth` is unvalidated. The `Authorizer` owns the user store, so
 the `Authorizer` must check the password itself.
@@ -61,7 +61,9 @@ and stderr plus a non-zero exit status for SSH.
 ## The one implementation today
 
 `auth.AllowAnonymous{AllowWrite}` allows read for everyone. It allows write
-only when `AllowWrite` is set.
+only when `AllowWrite` is set. It always denies `Admin`. The webhook-settings
+queries over HTTP and SSH request `Admin`; an ACL-backed authorizer must
+explicitly grant it before they reveal the raw signing secret.
 
 `main.go` wires it as `AllowAnonymous{AllowWrite: *allowPush}`. The
 `-allow-push` flag is therefore configuration for this default, and not a

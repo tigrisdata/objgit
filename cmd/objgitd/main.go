@@ -106,8 +106,8 @@ func main() {
 	}
 	// Harden the client's HTTP path so stale keep-alive connections to Tigris
 	// fail fast and retry on a fresh connection instead of hanging the request
-	// forever (see internal/s3fs/resilient.go). Only sysFS (the SSH host key)
-	// uses this client; internal/storage/tigris dials its own.
+	// forever (see internal/s3fs/resilient.go). Only sysFS (the SSH host key
+	// and webhook settings) uses this client; internal/storage/tigris dials its own.
 	client := s3fs.Harden(rawClient)
 
 	fsys, err := s3fs.NewS3FS(client, *bucket)
@@ -212,14 +212,7 @@ func main() {
 			os.Exit(1)
 		}
 		runtime.SetBlockProfileRate(100)
-		mux := http.NewServeMux()
-		mux.Handle("/metrics", promhttp.Handler())
-		mux.HandleFunc("GET /debug/pprof/", pprof.Index)
-		mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
-		mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
-		mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
-		mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
-		srv := &http.Server{Handler: mux}
+		srv := &http.Server{Handler: newMetricsMux()}
 		g.Go(func() error {
 			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				return err
@@ -290,4 +283,28 @@ func main() {
 		slog.Error("server stopped", "err", err)
 		os.Exit(1)
 	}
+}
+
+// newMetricsMux builds the metrics listener's handler: the Prometheus scrape
+// endpoint, pprof, and /healthz for probes and load balancers.
+func newMetricsMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("GET /healthz", handleHealthz)
+	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+	return mux
+}
+
+// handleHealthz answers 200 while the process is serving. The daemon has no
+// deeper signal to report. A dead transport listener fails the errgroup and
+// exits the process, and the probe turns that exit into a restart. The
+// handler reads no bucket state, so a Tigris outage does not fail the probes
+// of every pod at the same time.
+func handleHealthz(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	fmt.Fprintln(w, "ok")
 }

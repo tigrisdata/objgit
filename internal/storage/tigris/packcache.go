@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -106,6 +107,14 @@ func newFileCache(parent, pattern, suffix string, maxBytes int64, observe func(s
 	if err != nil {
 		return nil, fmt.Errorf("tigris: create cache directory: %w", err)
 	}
+	// A run that died without Cleanup leaves its cache directory behind. On
+	// the OS temp directory that is harmless, but on a persistent parent
+	// (kubernetes -pack-cache-dir on a volume) the orphans survive every
+	// restart, hold packs no later run can read, and starve maxBytes. One
+	// daemon owns the parent in every supported deployment, so the sweep is
+	// safe; a reader from an older process keeps its descriptors through the
+	// unlink, exactly like an eviction.
+	sweepOrphanedCaches(parent, strings.TrimSuffix(pattern, "*"), dir)
 	return &PackCache{
 		dir:      dir,
 		maxBytes: maxBytes,
@@ -126,6 +135,29 @@ func (c *PackCache) emit(event string, n int) {
 	}
 	for range n {
 		c.observe(event)
+	}
+}
+
+// sweepOrphanedCaches removes the directories under parent whose names start
+// with prefix, which earlier runs left behind, and keeps keep, the directory
+// this run just created. Each cache sweeps only its own prefix: the pack cache
+// and the snapshot cache share a parent, and the one made second must not
+// delete the directory of the first. It is best effort: a ReadDir failure leaves everything alone, and
+// a directory that cannot be removed stays for the next start to try again.
+func sweepOrphanedCaches(parent, prefix, keep string) {
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), prefix) {
+			continue
+		}
+		dir := filepath.Join(parent, e.Name())
+		if dir == keep {
+			continue
+		}
+		os.RemoveAll(dir)
 	}
 }
 

@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package tigrisdata.objgit.events.push.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// PushEvent describes one accepted Git ref update. A push that updates several
+// refs produces one event per ref, with the same push_id in each event.
+message PushEvent {
+  // A stable identifier for this event, reused across delivery attempts.
+  string event_id = 1;
+
+  // Identifies the receive-pack request that produced this ref update.
+  string push_id = 2;
+
+  // Canonical repository path, such as "acme/widgets".
+  string repository = 3;
+
+  // Full Git ref name, such as "refs/heads/main". Non-UTF-8 ref names use
+  // the reversible base64url representation described for FileChanges paths.
+  string ref = 4;
+
+  // Ref value before the update, or the all-zero hash for a new ref.
+  string before = 5;
+
+  // Ref value after the update, or the all-zero hash for a deleted ref.
+  string after = 6;
+
+  // True when this update created the ref.
+  bool created = 7;
+
+  // True when this update deleted the ref.
+  bool deleted = 8;
+
+  // True for a non-fast-forward update of an existing ref; false for ref
+  // creation and deletion.
+  bool forced = 9;
+
+  // Time the server accepted the ref update, not a commit's author time.
+  google.protobuf.Timestamp pushed_at = 10;
+
+  // Every commit reachable from after but not reachable from before, with
+  // parents before children. Empty for deletion or a non-commit ref target.
+  repeated Commit commits = 11;
+
+  // Net file changes from the before tree to the after tree. A file added
+  // and then deleted within this push does not appear here; its two changes
+  // still appear in the corresponding commits.
+  FileChanges files = 12;
+}
+
+// Commit describes a commit included in a ref update.
+message Commit {
+  // Git object ID of the commit.
+  string id = 1;
+
+  // Git object ID of the commit's tree.
+  string tree_id = 2;
+
+  // Full commit message. Invalid UTF-8 bytes are replaced with U+FFFD.
+  string message = 3;
+
+  Signature author = 4;
+  Signature committer = 5;
+
+  // Parent commit IDs, in Git's recorded order.
+  repeated string parent_ids = 6;
+
+  // File changes against the first parent's tree, or the empty tree for a
+  // root commit. For merges, this is a first-parent diff.
+  FileChanges files = 7;
+}
+
+// Signature records a Git commit's author or committer identity and time.
+// Invalid UTF-8 bytes in name and email are replaced with U+FFFD.
+message Signature {
+  string name = 1;
+  string email = 2;
+  google.protobuf.Timestamp when = 3;
+}
+
+// FileChanges lists paths only; it does not include file contents or patches.
+// A rename appears as one deleted path and one added path. Mode-only changes
+// appear in changed. Valid UTF-8 paths are literal. A path containing invalid
+// UTF-8 bytes is encoded as "/objgit/raw-path/base64url/" followed by the
+// unpadded base64url encoding of its original bytes. Git paths cannot start
+// with "/", so this representation is reversible without collisions.
+message FileChanges {
+  repeated string added = 1;
+  repeated string changed = 2;
+  repeated string deleted = 3;
+}

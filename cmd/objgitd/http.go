@@ -25,6 +25,7 @@ import (
 // matches a pattern and falls through to ServeMux's 404.
 func (d *daemon) httpHandler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /_objgit/webhooks/{orgID}/{repoName}/settings", d.handleHTTPWebhookSettings)
 	mux.HandleFunc("GET /{orgID}/{repoName}/info/refs", d.handleInfoRefs)
 	mux.HandleFunc("POST /{orgID}/{repoName}/git-upload-pack", func(w http.ResponseWriter, r *http.Request) {
 		d.handleRPC(w, r, transport.UploadPackService)

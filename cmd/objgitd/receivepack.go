@@ -3,8 +3,11 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"time"
 
 	"github.com/go-git/go-git/v6/config"
 	"github.com/go-git/go-git/v6/plumbing"
@@ -28,7 +31,8 @@ import (
 //     capabilities are known and before the packfile is read, and the slot it
 //     returns is held until this function returns, which covers unpacking, the
 //     ref update, and any hooks. A nil admit means unlimited.
-//   - onUpdated runs after refs are updated and report-status is sent, but
+//   - onUpdated receives only the ref commands this request committed. It runs
+//     after refs are updated and report-status is attempted, but
 //     *before* the closing sideband flush-pkt. go-git keeps its sideband Muxer
 //     internal and flushes it before returning, so there is no other way to
 //     stream "remote:" progress to the client. The seam hands back a band-2
@@ -52,7 +56,7 @@ func receivePackStreaming(
 	w io.WriteCloser,
 	opts *transport.ReceivePackRequest,
 	admit admitFunc,
-	onUpdated func(progress io.Writer),
+	onUpdated func(progress io.Writer, updates []refUpdate, acceptedAt time.Time),
 ) error {
 	if w == nil {
 		return fmt.Errorf("nil writer")
@@ -186,22 +190,29 @@ func receivePackStreaming(
 
 	var firstErr error
 	cmdStatus := make(map[plumbing.ReferenceName]error)
-	updateReferences(st, updreq, cmdStatus, &firstErr)
+	acceptedAt := updateReferences(st, updreq, cmdStatus, &firstErr)
 
-	if err := sendReportStatus(writeCloser, firstErr, cmdStatus); err != nil {
-		return err
+	// Record the commands that landed in this request, rather than diffing
+	// repository-wide snapshots that can include a concurrent push.
+	updates := successfulRefUpdates(updreq, cmdStatus)
+	statusErr := sendReportStatus(writeCloser, firstErr, cmdStatus)
+
+	// A failed status write does not roll back committed refs. Run the callback
+	// anyway so a client disconnect does not suppress a webhook or push hook.
+	if onUpdated != nil && len(updates) > 0 {
+		var progress io.Writer
+		if statusErr == nil && useSideband {
+			progress = sidebandProgress{mux: mux}
+		}
+		onUpdated(progress, updates, acceptedAt)
+	}
+
+	if statusErr != nil {
+		return statusErr
 	}
 
 	// Stream hook output over the sideband progress channel before the closing
 	// flush-pkt; once the client sees that flush it stops reading the sideband.
-	if onUpdated != nil {
-		var progress io.Writer
-		if useSideband {
-			progress = sidebandProgress{mux: mux}
-		}
-		onUpdated(progress)
-	}
-
 	if useSideband {
 		if err := pktline.WriteFlush(w); err != nil {
 			return fmt.Errorf("flushing sideband: %w", err)
@@ -211,6 +222,22 @@ func receivePackStreaming(
 		return firstErr
 	}
 	return closeWriter(w)
+}
+
+// successfulRefUpdates preserves command order and excludes rejected, failed,
+// and no-op commands. The old IDs were validated against the ref values at
+// commit, so they describe the actual transition instead of a stale
+// advertisement.
+func successfulRefUpdates(req *packp.UpdateRequests, status map[plumbing.ReferenceName]error) []refUpdate {
+	var updates []refUpdate
+	for _, cmd := range req.Commands {
+		err, ok := status[cmd.Name]
+		if !ok || err != nil || cmd.Old == cmd.New {
+			continue
+		}
+		updates = append(updates, refUpdate{Name: cmd.Name, Old: cmd.Old, New: cmd.New})
+	}
+	return updates
 }
 
 // writePack stores the incoming packfile as a single packfile object via the
@@ -304,13 +331,38 @@ func setStatus(cmdStatus map[plumbing.ReferenceName]error, firstErr *error, ref 
 	}
 }
 
-func referenceExists(s storer.ReferenceStorer, n plumbing.ReferenceName) (bool, error) {
-	_, err := s.Reference(n)
-	if err == plumbing.ErrReferenceNotFound {
-		return false, nil
+// validateRefCommand checks the advertised old hash against the current ref.
+// Packed refs repeat this check inside their atomic CAS update.
+func validateRefCommand(st storage.Storer, cmd *packp.Command) error {
+	current, err := st.Reference(cmd.Name)
+	if err != nil && !errors.Is(err, plumbing.ErrReferenceNotFound) {
+		return err
 	}
+	exists := err == nil
+	switch cmd.Action() {
+	case packp.Create:
+		if exists {
+			return transport.ErrUpdateReference
+		}
+	case packp.Update, packp.Delete:
+		if !exists || current.Type() != plumbing.HashReference || current.Hash() != cmd.Old {
+			return transport.ErrUpdateReference
+		}
+	default:
+		return transport.ErrUpdateReference
+	}
+	return nil
+}
 
-	return err == nil, err
+// refCommandVisible checks the effective ref after a post-commit cleanup
+// error. Legacy loose refs can shadow an accepted packed write; only visible
+// updates should be reported as successful or dispatched.
+func refCommandVisible(st storage.Storer, cmd *packp.Command) bool {
+	current, err := st.Reference(cmd.Name)
+	if cmd.New.IsZero() {
+		return errors.Is(err, plumbing.ErrReferenceNotFound)
+	}
+	return err == nil && current.Type() == plumbing.HashReference && current.Hash() == cmd.New
 }
 
 // refUpdater is the optional bulk ref-update surface. A storer that has one
@@ -326,12 +378,19 @@ type refUpdater interface {
 	UpdateReferences(sets []*plumbing.Reference, removes []plumbing.ReferenceName) error
 }
 
-func updateReferences(st storage.Storer, req *packp.UpdateRequests, cmdStatus map[plumbing.ReferenceName]error, firstErr *error) {
-	if bu, ok := st.(refUpdater); ok {
-		updateReferencesBatched(bu, st, req, cmdStatus, firstErr)
-		return
+type checkedRefUpdater interface {
+	SupportsCheckedRefUpdates() bool
+	UpdateReferencesChecked(sets []*plumbing.Reference, removes []plumbing.ReferenceName, expected map[plumbing.ReferenceName]plumbing.Hash) (time.Time, error)
+}
+
+func updateReferences(st storage.Storer, req *packp.UpdateRequests, cmdStatus map[plumbing.ReferenceName]error, firstErr *error) time.Time {
+	if checked, ok := st.(checkedRefUpdater); ok && !checked.SupportsCheckedRefUpdates() {
+		return updateReferencesOneByOne(st, req, cmdStatus, firstErr)
 	}
-	updateReferencesOneByOne(st, req, cmdStatus, firstErr)
+	if bu, ok := st.(refUpdater); ok {
+		return updateReferencesBatched(bu, st, req, cmdStatus, firstErr)
+	}
+	return updateReferencesOneByOne(st, req, cmdStatus, firstErr)
 }
 
 // updateReferencesBatched validates every command first, then applies the
@@ -347,92 +406,96 @@ func updateReferences(st storage.Storer, req *packp.UpdateRequests, cmdStatus ma
 // mid-loop leaves earlier commands applied. All-or-nothing is the better
 // behavior — it is what git push --atomic means — but report-status now
 // carries one shared error where it used to carry a mix.
-func updateReferencesBatched(bu refUpdater, st storage.Storer, req *packp.UpdateRequests, cmdStatus map[plumbing.ReferenceName]error, firstErr *error) {
+func updateReferencesBatched(bu refUpdater, st storage.Storer, req *packp.UpdateRequests, cmdStatus map[plumbing.ReferenceName]error, firstErr *error) time.Time {
 	var (
-		sets    []*plumbing.Reference
-		removes []plumbing.ReferenceName
-		staged  []plumbing.ReferenceName
+		sets     []*plumbing.Reference
+		removes  []plumbing.ReferenceName
+		staged   []*packp.Command
+		expected = make(map[plumbing.ReferenceName]plumbing.Hash)
 	)
 
 	for _, cmd := range req.Commands {
-		exists, err := referenceExists(st, cmd.Name)
-		if err != nil {
+		if err := validateRefCommand(st, cmd); err != nil {
 			setStatus(cmdStatus, firstErr, cmd.Name, err)
 			continue
 		}
 
 		switch cmd.Action() {
 		case packp.Create:
-			if exists {
-				setStatus(cmdStatus, firstErr, cmd.Name, transport.ErrUpdateReference)
-				continue
-			}
 			sets = append(sets, plumbing.NewHashReference(cmd.Name, cmd.New))
 		case packp.Delete:
-			if !exists {
-				setStatus(cmdStatus, firstErr, cmd.Name, transport.ErrUpdateReference)
-				continue
-			}
 			removes = append(removes, cmd.Name)
 		case packp.Update:
-			if !exists {
-				setStatus(cmdStatus, firstErr, cmd.Name, transport.ErrUpdateReference)
-				continue
-			}
 			sets = append(sets, plumbing.NewHashReference(cmd.Name, cmd.New))
 		default:
 			continue
 		}
-		staged = append(staged, cmd.Name)
+		staged = append(staged, cmd)
+		expected[cmd.Name] = cmd.Old
 	}
 
 	if len(staged) == 0 {
-		return
+		return time.Time{}
 	}
 
-	err := bu.UpdateReferences(sets, removes)
-	for _, n := range staged {
-		setStatus(cmdStatus, firstErr, n, err)
+	var err error
+	var acceptedAt time.Time
+	if checked, ok := st.(checkedRefUpdater); ok && checked.SupportsCheckedRefUpdates() {
+		acceptedAt, err = checked.UpdateReferencesChecked(sets, removes, expected)
+	} else {
+		err = bu.UpdateReferences(sets, removes)
+		acceptedAt = time.Now()
 	}
+	var postCommit interface{ RefUpdateCommitted() bool }
+	if err != nil && errors.As(err, &postCommit) && postCommit.RefUpdateCommitted() {
+		slog.Warn("ref cleanup failed after packed update", "err", err)
+		for _, cmd := range staged {
+			if refCommandVisible(st, cmd) {
+				setStatus(cmdStatus, firstErr, cmd.Name, nil)
+			} else {
+				setStatus(cmdStatus, firstErr, cmd.Name, err)
+			}
+		}
+		return acceptedAt
+	}
+	for _, cmd := range staged {
+		setStatus(cmdStatus, firstErr, cmd.Name, err)
+	}
+	return acceptedAt
 }
 
 // updateReferencesOneByOne is the pre-batch path, kept for any storer without
 // a refUpdater — memory.Storage in the tests, most notably.
-func updateReferencesOneByOne(st storage.Storer, req *packp.UpdateRequests, cmdStatus map[plumbing.ReferenceName]error, firstErr *error) {
+func updateReferencesOneByOne(st storage.Storer, req *packp.UpdateRequests, cmdStatus map[plumbing.ReferenceName]error, firstErr *error) time.Time {
+	var acceptedAt time.Time
 	for _, cmd := range req.Commands {
-		exists, err := referenceExists(st, cmd.Name)
-		if err != nil {
+		if err := validateRefCommand(st, cmd); err != nil {
 			setStatus(cmdStatus, firstErr, cmd.Name, err)
 			continue
 		}
 
 		switch cmd.Action() {
 		case packp.Create:
-			if exists {
-				setStatus(cmdStatus, firstErr, cmd.Name, transport.ErrUpdateReference)
-				continue
-			}
-
 			ref := plumbing.NewHashReference(cmd.Name, cmd.New)
 			err := st.SetReference(ref)
 			setStatus(cmdStatus, firstErr, cmd.Name, err)
-		case packp.Delete:
-			if !exists {
-				setStatus(cmdStatus, firstErr, cmd.Name, transport.ErrUpdateReference)
-				continue
+			if err == nil {
+				acceptedAt = time.Now()
 			}
-
+		case packp.Delete:
 			err := st.RemoveReference(cmd.Name)
 			setStatus(cmdStatus, firstErr, cmd.Name, err)
-		case packp.Update:
-			if !exists {
-				setStatus(cmdStatus, firstErr, cmd.Name, transport.ErrUpdateReference)
-				continue
+			if err == nil {
+				acceptedAt = time.Now()
 			}
-
+		case packp.Update:
 			ref := plumbing.NewHashReference(cmd.Name, cmd.New)
 			err := st.SetReference(ref)
 			setStatus(cmdStatus, firstErr, cmd.Name, err)
+			if err == nil {
+				acceptedAt = time.Now()
+			}
 		}
 	}
+	return acceptedAt
 }

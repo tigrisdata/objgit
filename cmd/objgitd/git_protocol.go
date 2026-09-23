@@ -45,7 +45,7 @@ func (d *daemon) authorize(ctx context.Context, req auth.Request) auth.Decision 
 // repo.
 type daemon struct {
 	// sysFS holds daemon-level state that is not scoped to a repository (the SSH
-	// host key); repository storage is resolved per request via resolver.
+	// host key and webhook settings); repository storage is resolved per request.
 	sysFS    billy.Filesystem
 	resolver repofs.Resolver
 	authz    auth.Authorizer

@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/memfs"
+	"github.com/go-git/go-billy/v6/util"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/transport"
@@ -18,7 +21,9 @@ import (
 	"github.com/tigrisdata/objgit/internal/kefkash"
 	"github.com/tigrisdata/objgit/internal/metrics"
 	"github.com/tigrisdata/objgit/internal/mountfs"
+	"github.com/tigrisdata/objgit/internal/pushevents"
 	"github.com/tigrisdata/objgit/internal/treefs"
+	"github.com/tigrisdata/objgit/internal/webhook"
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
 	"mvdan.cc/sh/v3/syntax"
@@ -26,7 +31,12 @@ import (
 	"tangled.org/xeiaso.net/kefka/command/registry/coreutils"
 )
 
-// refUpdate records a single branch ref change observed across a receive-pack.
+// receivePackHook names the hook that a push runs, and so its script at
+// .objgit/hooks/receive-pack and its OBJGIT_SERVICE. It is not the transport
+// service name, which is "git-receive-pack".
+const receivePackHook = "receive-pack"
+
+// refUpdate records a single branch ref change applied by a receive-pack.
 // A zero Old means the branch was created; a zero New means it was deleted.
 type refUpdate struct {
 	Name plumbing.ReferenceName
@@ -34,99 +44,46 @@ type refUpdate struct {
 	New  plumbing.Hash
 }
 
-// snapshotRefs returns the current hash of every branch and tag ref in st.
-// go-git's transport.ReceivePack does not report which refs it changed, so we
-// diff a snapshot taken before the push against one taken after. Hooks use
-// the branches only (see runHooks); erofs snapshots use both.
-func snapshotRefs(st storage.Storer) (map[plumbing.ReferenceName]plumbing.Hash, error) {
-	it, err := st.IterReferences()
-	if err != nil {
-		return nil, err
-	}
-	defer it.Close()
-
-	out := map[plumbing.ReferenceName]plumbing.Hash{}
-	err = it.ForEach(func(r *plumbing.Reference) error {
-		if r.Type() == plumbing.HashReference && (r.Name().IsBranch() || r.Name().IsTag()) {
-			out[r.Name()] = r.Hash()
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// diffRefs computes the ref changes between two snapshots.
-func diffRefs(before, after map[plumbing.ReferenceName]plumbing.Hash) []refUpdate {
-	var updates []refUpdate
-	for name, newHash := range after {
-		oldHash, ok := before[name]
-		switch {
-		case !ok:
-			updates = append(updates, refUpdate{Name: name, Old: plumbing.ZeroHash, New: newHash})
-		case oldHash != newHash:
-			updates = append(updates, refUpdate{Name: name, Old: oldHash, New: newHash})
-		}
-	}
-	for name, oldHash := range before {
-		if _, ok := after[name]; !ok {
-			updates = append(updates, refUpdate{Name: name, Old: oldHash, New: plumbing.ZeroHash})
-		}
-	}
-	return updates
-}
-
-// receivePack runs the receive-pack service. Once the push succeeds, it builds
-// an erofs snapshot of each updated ref tip when snapshots are enabled (see
-// runSnapshots), then fires the repository's receive-pack hook for each
-// updated branch when hooks are enabled. Both run synchronously, streaming
-// their output to the client over the sideband progress channel (rendered as
-// "remote: " lines) before the response stream is closed. st is both what the service writes through and the storer
-// used for ref snapshots and hook checkouts — all three transports now share the
-// same Scanner-bounded PackfileWriter path (see writePack), so no transport needs
-// a capability-hiding wrapper.
+// receivePack runs the receive-pack service and dispatches post-receive work
+// for the commands whose ref updates succeeded: erofs snapshots of the updated
+// branch and tag tips (see runSnapshots), then hooks, then webhooks. Snapshot
+// and hook output streams to the client before the response closes. Webhook delivery also finishes before the
+// response closes, but cannot reject an already accepted push.
 //
 // This is also the one place every push funnels through — smart HTTP and SSH
 // both land here, and git:// never serves receive-pack at all — so it is where
 // the push concurrency cap is applied, via the d.pushes.admit seam.
 func (d *daemon) receivePack(ctx context.Context, st storage.Storer, repoPath string, r io.ReadCloser, w io.WriteCloser, req *transport.ReceivePackRequest) error {
-	if !d.allowHooks && !d.snapshots {
+	webhooks, settingsErr := webhook.Load(d.sysFS, repoPath)
+	if settingsErr != nil {
+		slog.Error("webhook: load repository settings", "repo", repoPath, "err", settingsErr)
+	}
+	if !d.allowHooks && !d.snapshots && (webhooks == nil || !webhooks.Enabled(repoPath)) {
 		err := receivePackStreaming(ctx, st, r, w, req, d.pushes.admit, nil)
 		d.healHEADAfterPush(err, st, repoPath)
 		return err
 	}
 
-	before, err := snapshotRefs(st)
-	if err != nil {
-		slog.Warn("push: ref snapshot before push failed", "path", repoPath, "err", err)
-	}
-
-	// onUpdated runs after refs are updated and report-status is sent, but
-	// before the response stream closes, so snapshot and hook output reaches
-	// the client live.
-	// progress is the sideband band-2 writer, or nil when the client did not
-	// negotiate sideband (hooks then fall back to logging only).
-	onUpdated := func(progress io.Writer) {
-		after, err := snapshotRefs(st)
-		if err != nil {
-			slog.Error("push: ref snapshot after push failed", "path", repoPath, "err", err)
-			return
-		}
-		updates := diffRefs(before, after)
-		if len(updates) == 0 {
-			return
-		}
+	// The callback runs after refs change and report-status is attempted. The
+	// updates are taken from this request's successful commands, so another
+	// concurrent push cannot be attributed to this one.
+	onUpdated := func(progress io.Writer, updates []refUpdate, acceptedAt time.Time) {
 		if d.snapshots {
 			d.runSnapshots(repoPath, st, updates, progress)
 		}
 		if d.allowHooks {
-			d.runHooks(repoPath, "receive-pack", st, updates, progress)
+			var branches []refUpdate
+			for _, u := range updates {
+				if u.Name.IsBranch() {
+					branches = append(branches, u)
+				}
+			}
+			d.runHooks(repoPath, receivePackHook, st, branches, progress)
 		}
+		d.emitPushWebhooks(ctx, st, repoPath, webhooks, updates, acceptedAt)
 	}
 
-	err = receivePackStreaming(ctx, st, r, w, req, d.pushes.admit, onUpdated)
+	err := receivePackStreaming(ctx, st, r, w, req, d.pushes.admit, onUpdated)
 	d.healHEADAfterPush(err, st, repoPath)
 	return err
 }
@@ -186,13 +143,13 @@ func (d *daemon) runHook(repoPath, service string, st storage.Storer, u refUpdat
 		return
 	}
 
-	fsys := mountfs.New(map[string]billy.Filesystem{
-		"src": treefs.New(tree),
-		"tmp": memfs.New(),
-	})
-
 	ctx, cancel := context.WithTimeout(context.Background(), d.hookTimeout)
 	defer cancel()
+	changes, err := loadHookChanges(ctx, st, u)
+	if err != nil {
+		log.Error("hook: diff changed files", "err", err)
+		return
+	}
 
 	// When the client negotiated sideband, stream stdout+stderr straight to it
 	// ("remote: " lines); otherwise buffer for the log. git does not distinguish
@@ -204,45 +161,8 @@ func (d *daemon) runHook(repoPath, service string, st storage.Storer, u refUpdat
 		stdout, stderr = progress, progress
 	}
 
-	reg := registry.New()
-	coreutils.Register(reg)
-	if err := reg.Chdir(fsys, "/src"); err != nil {
-		log.Error("hook: chdir /src", "err", err)
-		return
-	}
-
-	env := expand.ListEnviron(
-		"HOME=/tmp",
-		"PWD=/src",
-		"TMPDIR=/tmp",
-		"IFS= \t\n",
-		"PATH=/usr/bin:/bin",
-		"KEFKA=1",
-		"OBJGIT_REPO="+repoPath,
-		"OBJGIT_SERVICE="+service,
-		"OBJGIT_REF="+u.Name.String(),
-		"OBJGIT_BRANCH="+u.Name.Short(),
-		"OBJGIT_OLD_SHA="+u.Old.String(),
-		"OBJGIT_NEW_SHA="+u.New.String(),
-	)
-	// Mirror git's post-receive stdin: "<old> <new> <ref>\n".
-	stdin := strings.NewReader(u.Old.String() + " " + u.New.String() + " " + u.Name.String() + "\n")
-
-	var sh *interp.Runner
-	middleware := func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
-		return func(ctx context.Context, args []string) error {
-			return reg.Exec(ctx, fsys, sh, args)
-		}
-	}
-	sh, err = interp.New(
-		interp.Env(env),
-		interp.StdIO(stdin, stdout, stderr),
-		interp.ExecHandlers(middleware),
-		interp.CallHandler(kefkash.CallHandler(reg, fsys, stdout, stderr)),
-		interp.StatHandler(kefkash.FsysStatHandler(reg, fsys)),
-		interp.OpenHandler(kefkash.FsysOpenHandler(reg, fsys)),
-		interp.ReadDirHandler2(kefkash.FsysReadDirHandler(reg, fsys)),
-	)
+	stdin := strings.NewReader(hookStdin(u))
+	sh, err := newHookShell(tree, changes, hookEnv(repoPath, service, u, changes), stdin, stdout, stderr)
 	if err != nil {
 		log.Error("hook: build shell", "err", err)
 		return
@@ -274,6 +194,123 @@ func (d *daemon) runHook(repoPath, service string, st storage.Storer, u refUpdat
 		return
 	}
 	log.Info("hook: finished", attrs...)
+}
+
+// hookChangesFile is where a hook finds the JSON object of its file changes.
+const hookChangesFile = "/tmp/objgit-changes.json"
+
+// hookChanges holds the net file changes of one update, encoded the way a hook
+// reads them. Paths can contain whitespace or newlines, so JSON is the only
+// unambiguous form in environment variables.
+type hookChanges struct {
+	added, changed, deleted []byte // JSON arrays, for the environment
+	file                    []byte // JSON object, for hookChangesFile
+}
+
+// loadHookChanges diffs u.Old against u.New. A zero Old diffs against the
+// empty tree, so every file of a new branch is added.
+func loadHookChanges(ctx context.Context, st storage.Storer, u refUpdate) (hookChanges, error) {
+	changes, err := pushevents.Diff(ctx, st, u.Old, u.New)
+	if err != nil {
+		return hookChanges{}, err
+	}
+	// Keep empty lists as JSON arrays, not null.
+	lists := struct {
+		Added   []string `json:"added"`
+		Changed []string `json:"changed"`
+		Deleted []string `json:"deleted"`
+	}{
+		append([]string{}, changes.GetAdded()...),
+		append([]string{}, changes.GetChanged()...),
+		append([]string{}, changes.GetDeleted()...),
+	}
+	var c hookChanges
+	for _, enc := range []struct {
+		dst *[]byte
+		v   any
+	}{
+		{&c.added, lists.Added},
+		{&c.changed, lists.Changed},
+		{&c.deleted, lists.Deleted},
+		{&c.file, lists},
+	} {
+		if *enc.dst, err = json.Marshal(enc.v); err != nil {
+			return hookChanges{}, fmt.Errorf("encode changed files: %w", err)
+		}
+	}
+	return c, nil
+}
+
+// hookEnv returns the environment a hook sees for update u, as KEY=value
+// pairs.
+func hookEnv(repoPath, service string, u refUpdate, c hookChanges) []string {
+	return []string{
+		"HOME=/tmp",
+		"PWD=/src",
+		"TMPDIR=/tmp",
+		"IFS= \t\n",
+		"PATH=/usr/bin:/bin",
+		"KEFKA=1",
+		"OBJGIT_REPO=" + repoPath,
+		"OBJGIT_SERVICE=" + service,
+		"OBJGIT_REF=" + u.Name.String(),
+		"OBJGIT_BRANCH=" + u.Name.Short(),
+		"OBJGIT_OLD_SHA=" + u.Old.String(),
+		"OBJGIT_NEW_SHA=" + u.New.String(),
+		"OBJGIT_ADDED_FILES_JSON=" + string(c.added),
+		"OBJGIT_CHANGED_FILES_JSON=" + string(c.changed),
+		"OBJGIT_DELETED_FILES_JSON=" + string(c.deleted),
+		"OBJGIT_CHANGES_FILE=" + hookChangesFile,
+	}
+}
+
+// hookStdin mirrors git's post-receive stdin for update u: "<old> <new> <ref>\n".
+func hookStdin(u refUpdate) string {
+	return u.Old.String() + " " + u.New.String() + " " + u.Name.String() + "\n"
+}
+
+// newHookShell builds the kefka sandbox a hook runs in: /src is a lazy
+// read-only view of tree, /tmp is writable scratch that holds hookChangesFile,
+// and the shell starts in /src with env. Both push hooks and the SSH sh command
+// use it, so the two environments cannot drift apart.
+func newHookShell(tree *object.Tree, changes hookChanges, env []string, stdin io.Reader, stdout, stderr io.Writer) (*interp.Runner, error) {
+	fsys := mountfs.New(map[string]billy.Filesystem{
+		"src": treefs.New(tree),
+		"tmp": memfs.New(),
+	})
+	if err := util.WriteFile(fsys, hookChangesFile, changes.file, 0o644); err != nil {
+		return nil, fmt.Errorf("write changes file: %w", err)
+	}
+
+	reg := registry.New()
+	coreutils.Register(reg)
+	if err := reg.Chdir(fsys, "/src"); err != nil {
+		return nil, fmt.Errorf("chdir /src: %w", err)
+	}
+
+	var sh *interp.Runner
+	middleware := func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+		return func(ctx context.Context, args []string) error {
+			return reg.Exec(ctx, fsys, sh, args)
+		}
+	}
+	sh, err := interp.New(
+		interp.Env(expand.ListEnviron(env...)),
+		interp.StdIO(stdin, stdout, stderr),
+		interp.ExecHandlers(middleware),
+		interp.CallHandler(kefkash.CallHandler(reg, fsys, stdout, stderr)),
+		interp.StatHandler(kefkash.FsysStatHandler(reg, fsys)),
+		interp.OpenHandler(kefkash.FsysOpenHandler(reg, fsys)),
+		interp.ReadDirHandler2(kefkash.FsysReadDirHandler(reg, fsys)),
+	)
+	if err != nil {
+		return nil, err
+	}
+	// interp seeds $PWD from Dir, which defaults to the daemon's host working
+	// directory. interp.Dir would stat the host, so set the field directly. The
+	// handlers above resolve paths through reg, so nothing else reads Dir.
+	sh.Dir = "/src"
+	return sh, nil
 }
 
 // hookStatus classifies a hook run for metrics: "timeout" when the hook's
