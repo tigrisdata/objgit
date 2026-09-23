@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -18,6 +19,7 @@ import (
 	"github.com/tigrisdata/objgit/internal/kefkash"
 	"github.com/tigrisdata/objgit/internal/metrics"
 	"github.com/tigrisdata/objgit/internal/mountfs"
+	"github.com/tigrisdata/objgit/internal/pushevents"
 	"github.com/tigrisdata/objgit/internal/treefs"
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
@@ -77,48 +79,38 @@ func diffRefs(before, after map[plumbing.ReferenceName]plumbing.Hash) []refUpdat
 	return updates
 }
 
-// receivePack runs the receive-pack service and, when hooks are enabled, fires
-// the repository's receive-pack hook for each updated branch once the push
-// succeeds — synchronously, streaming hook output to the client over the
-// sideband progress channel (rendered as "remote: " lines) before the response
-// stream is closed. st is both what the service writes through and the storer
-// used for ref snapshots and hook checkouts — all three transports now share the
-// same Scanner-bounded PackfileWriter path (see writePack), so no transport needs
-// a capability-hiding wrapper.
+// receivePack runs the receive-pack service and dispatches post-receive work
+// for the commands whose ref updates succeeded. Hook output streams to the
+// client before the response closes. Webhook delivery also finishes before the
+// response closes, but cannot reject an already accepted push.
 //
 // This is also the one place every push funnels through — smart HTTP and SSH
 // both land here, and git:// never serves receive-pack at all — so it is where
 // the push concurrency cap is applied, via the d.pushes.admit seam.
 func (d *daemon) receivePack(ctx context.Context, st storage.Storer, repoPath string, r io.ReadCloser, w io.WriteCloser, req *transport.ReceivePackRequest) error {
-	if !d.allowHooks {
+	if !d.allowHooks && (d.webhooks == nil || !d.webhooks.Enabled(repoPath)) {
 		err := receivePackStreaming(ctx, st, r, w, req, d.pushes.admit, nil)
 		d.healHEADAfterPush(err, st, repoPath)
 		return err
 	}
 
-	before, err := snapshotRefs(st)
-	if err != nil {
-		slog.Warn("hook: ref snapshot before push failed", "path", repoPath, "err", err)
+	// The callback runs after refs change and report-status is attempted. The
+	// updates are taken from this request's successful commands, so another
+	// concurrent push cannot be attributed to this one.
+	onUpdated := func(progress io.Writer, updates []refUpdate, acceptedAt time.Time) {
+		if d.allowHooks {
+			var branches []refUpdate
+			for _, u := range updates {
+				if u.Name.IsBranch() {
+					branches = append(branches, u)
+				}
+			}
+			d.runHooks(repoPath, "receive-pack", st, branches, progress)
+		}
+		d.emitPushWebhooks(ctx, st, repoPath, updates, acceptedAt)
 	}
 
-	// onUpdated runs after refs are updated and report-status is sent, but
-	// before the response stream closes, so hook output reaches the client live.
-	// progress is the sideband band-2 writer, or nil when the client did not
-	// negotiate sideband (hooks then fall back to logging only).
-	onUpdated := func(progress io.Writer) {
-		after, err := snapshotRefs(st)
-		if err != nil {
-			slog.Error("hook: ref snapshot after push failed", "path", repoPath, "err", err)
-			return
-		}
-		updates := diffRefs(before, after)
-		if len(updates) == 0 {
-			return
-		}
-		d.runHooks(repoPath, "receive-pack", st, updates, progress)
-	}
-
-	err = receivePackStreaming(ctx, st, r, w, req, d.pushes.admit, onUpdated)
+	err := receivePackStreaming(ctx, st, r, w, req, d.pushes.admit, onUpdated)
 	d.healHEADAfterPush(err, st, repoPath)
 	return err
 }
@@ -185,6 +177,52 @@ func (d *daemon) runHook(repoPath, service string, st storage.Storer, u refUpdat
 
 	ctx, cancel := context.WithTimeout(context.Background(), d.hookTimeout)
 	defer cancel()
+	changes, err := pushevents.Diff(ctx, st, u.Old, u.New)
+	if err != nil {
+		log.Error("hook: diff changed files", "err", err)
+		return
+	}
+	// Keep empty lists as JSON arrays. Paths can contain whitespace or newlines,
+	// so JSON is the only unambiguous representation in environment variables.
+	added := append([]string{}, changes.GetAdded()...)
+	changed := append([]string{}, changes.GetChanged()...)
+	deleted := append([]string{}, changes.GetDeleted()...)
+	addedJSON, err := json.Marshal(added)
+	if err != nil {
+		log.Error("hook: encode added files", "err", err)
+		return
+	}
+	changedJSON, err := json.Marshal(changed)
+	if err != nil {
+		log.Error("hook: encode changed files", "err", err)
+		return
+	}
+	deletedJSON, err := json.Marshal(deleted)
+	if err != nil {
+		log.Error("hook: encode deleted files", "err", err)
+		return
+	}
+	metadata, err := json.Marshal(struct {
+		Added   []string `json:"added"`
+		Changed []string `json:"changed"`
+		Deleted []string `json:"deleted"`
+	}{added, changed, deleted})
+	if err != nil {
+		log.Error("hook: encode changed files", "err", err)
+		return
+	}
+	const changesFile = "/tmp/objgit-changes.json"
+	f, err := fsys.Create(changesFile)
+	if err != nil {
+		log.Error("hook: create changes file", "err", err)
+		return
+	}
+	_, writeErr := io.Copy(f, bytes.NewReader(metadata))
+	closeErr := f.Close()
+	if err := errors.Join(writeErr, closeErr); err != nil {
+		log.Error("hook: write changes file", "err", err)
+		return
+	}
 
 	// When the client negotiated sideband, stream stdout+stderr straight to it
 	// ("remote: " lines); otherwise buffer for the log. git does not distinguish
@@ -216,6 +254,10 @@ func (d *daemon) runHook(repoPath, service string, st storage.Storer, u refUpdat
 		"OBJGIT_BRANCH="+u.Name.Short(),
 		"OBJGIT_OLD_SHA="+u.Old.String(),
 		"OBJGIT_NEW_SHA="+u.New.String(),
+		"OBJGIT_ADDED_FILES_JSON="+string(addedJSON),
+		"OBJGIT_CHANGED_FILES_JSON="+string(changedJSON),
+		"OBJGIT_DELETED_FILES_JSON="+string(deletedJSON),
+		"OBJGIT_CHANGES_FILE="+changesFile,
 	)
 	// Mirror git's post-receive stdin: "<old> <new> <ref>\n".
 	stdin := strings.NewReader(u.Old.String() + " " + u.New.String() + " " + u.Name.String() + "\n")

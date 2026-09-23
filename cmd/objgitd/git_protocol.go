@@ -15,6 +15,7 @@ import (
 	"github.com/tigrisdata/objgit/internal/auth"
 	"github.com/tigrisdata/objgit/internal/metrics"
 	"github.com/tigrisdata/objgit/internal/repofs"
+	"github.com/tigrisdata/objgit/internal/webhook"
 )
 
 // handshakeTimeout bounds how long a client has to send its git-proto-request.
@@ -53,6 +54,7 @@ type daemon struct {
 	// allowHooks gates running .objgit/hooks/receive-pack after a push.
 	allowHooks  bool
 	hookTimeout time.Duration
+	webhooks    *webhook.Client
 
 	// pushes bounds how many pushes unpack a packfile at once, which is the
 	// only thing that bounds the daemon's resident set under concurrent pushes.

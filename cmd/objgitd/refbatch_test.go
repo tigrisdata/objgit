@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http/httptest"
 	"os/exec"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -25,11 +26,13 @@ type batchingStorer struct {
 	// mu guards the recorded fields. The end-to-end test in this file reads
 	// them from the test goroutine while a server goroutine may still be
 	// unwinding, which -race notices without it.
-	mu      sync.Mutex
-	calls   int
-	sets    []*plumbing.Reference
-	removes []plumbing.ReferenceName
-	err     error
+	mu             sync.Mutex
+	calls          int
+	sets           []*plumbing.Reference
+	removes        []plumbing.ReferenceName
+	err            error
+	afterCommitErr bool
+	shadow         map[plumbing.ReferenceName]plumbing.Hash
 }
 
 // record reports what the storer has seen: batch calls, total sets, total
@@ -48,7 +51,7 @@ func (b *batchingStorer) UpdateReferences(sets []*plumbing.Reference, removes []
 	failWith := b.err
 	b.mu.Unlock()
 
-	if failWith != nil {
+	if failWith != nil && !b.afterCommitErr {
 		return failWith
 	}
 	for _, r := range sets {
@@ -61,8 +64,17 @@ func (b *batchingStorer) UpdateReferences(sets []*plumbing.Reference, removes []
 			return err
 		}
 	}
-	return nil
+	for name, hash := range b.shadow {
+		if err := b.Storer.SetReference(plumbing.NewHashReference(name, hash)); err != nil {
+			return err
+		}
+	}
+	return failWith
 }
+
+type committedTestError struct{ error }
+
+func (committedTestError) RefUpdateCommitted() bool { return true }
 
 // batchBase is memBase with a batch ref-update surface on every repository, so
 // an end-to-end push takes the refUpdater path. memBase itself hands out a bare
@@ -107,6 +119,48 @@ func hashOf(t *testing.T, hex string) plumbing.Hash {
 		t.Fatalf("bad hex fixture %q", hex)
 	}
 	return h
+}
+
+func TestSuccessfulRefUpdates(t *testing.T) {
+	old := plumbing.NewHash("1111111111111111111111111111111111111111")
+	newHash := plumbing.NewHash("2222222222222222222222222222222222222222")
+	commands := []*packp.Command{
+		{Name: "refs/heads/main", Old: old, New: newHash},
+		{Name: "refs/heads/rejected", Old: old, New: newHash},
+		{Name: "refs/heads/unknown", Old: old, New: newHash},
+		{Name: "refs/heads/unchanged", Old: old, New: old},
+		{Name: "refs/tags/v1", Old: plumbing.ZeroHash, New: newHash},
+	}
+	for _, tt := range []struct {
+		name   string
+		status map[plumbing.ReferenceName]error
+		want   []refUpdate
+	}{
+		{
+			name: "successful commands only, in request order",
+			status: map[plumbing.ReferenceName]error{
+				"refs/heads/main":      nil,
+				"refs/heads/rejected":  errors.New("rejected"),
+				"refs/heads/unchanged": nil,
+				"refs/tags/v1":         nil,
+			},
+			want: []refUpdate{
+				{Name: "refs/heads/main", Old: old, New: newHash},
+				{Name: "refs/tags/v1", Old: plumbing.ZeroHash, New: newHash},
+			},
+		},
+		{
+			name:   "no accepted commands",
+			status: map[plumbing.ReferenceName]error{},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			updates := successfulRefUpdates(&packp.UpdateRequests{Commands: commands}, tt.status)
+			if !slices.Equal(updates, tt.want) {
+				t.Errorf("updates = %v, want %v", updates, tt.want)
+			}
+		})
+	}
 }
 
 func TestUpdateReferencesBatchesWhenTheStorerCan(t *testing.T) {
@@ -194,6 +248,14 @@ func TestUpdateReferencesBatchesWhenTheStorerCan(t *testing.T) {
 			wantCalls:  0,
 			wantStatus: map[string]error{"refs/heads/main": transport.ErrUpdateReference},
 		},
+		{
+			name: "stale advertised old hash is rejected",
+			seed: map[string]string{"refs/heads/main": hexA},
+			commands: []*packp.Command{
+				{Name: "refs/heads/main", Old: hashOf(t, hexB), New: hashOf(t, hexA)},
+			},
+			wantStatus: map[string]error{"refs/heads/main": transport.ErrUpdateReference},
+		},
 	}
 
 	for _, tt := range tests {
@@ -239,6 +301,40 @@ func TestUpdateReferencesBatchesWhenTheStorerCan(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPostCommitCleanupDispatchesVisibleRefs(t *testing.T) {
+	old := plumbing.NewHash("1111111111111111111111111111111111111111")
+	newHash := plumbing.NewHash("2222222222222222222222222222222222222222")
+	mem := memory.NewStorage()
+	if err := mem.SetReference(plumbing.NewHashReference("refs/heads/main", old)); err != nil {
+		t.Fatal(err)
+	}
+	cleanupErr := committedTestError{errors.New("loose-ref cleanup failed")}
+	st := &batchingStorer{
+		Storer: mem, err: cleanupErr, afterCommitErr: true,
+		shadow: map[plumbing.ReferenceName]plumbing.Hash{"refs/heads/main": old},
+	}
+	req := &packp.UpdateRequests{Commands: []*packp.Command{
+		{Name: "refs/heads/topic", Old: plumbing.ZeroHash, New: newHash},
+		{Name: "refs/heads/main", Old: old, New: newHash},
+	}}
+	status := map[plumbing.ReferenceName]error{}
+	var firstErr error
+	updateReferences(st, req, status, &firstErr)
+	if status["refs/heads/topic"] != nil {
+		t.Errorf("visible new ref was rejected: %v", status["refs/heads/topic"])
+	}
+	if !errors.Is(status["refs/heads/main"], cleanupErr) {
+		t.Errorf("shadowed update status = %v, want cleanup error", status["refs/heads/main"])
+	}
+	if !errors.Is(firstErr, cleanupErr) {
+		t.Errorf("first error = %v, want cleanup error", firstErr)
+	}
+	updates := successfulRefUpdates(req, status)
+	if !slices.Equal(updates, []refUpdate{{Name: "refs/heads/topic", Old: plumbing.ZeroHash, New: newHash}}) {
+		t.Errorf("dispatched updates = %v", updates)
 	}
 }
 

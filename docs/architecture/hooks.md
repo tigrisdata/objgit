@@ -21,8 +21,8 @@ Live streaming needs a seam that go-git does not expose.
 the closing flush-pkt before it returns.
 
 `cmd/objgitd/receivepack.go` holds a small fork, `receivePackStreaming`. The
-fork adds one callback, `onUpdated(progress io.Writer)`, which runs after
-report-status and before that final flush.
+fork adds one callback, `onUpdated(progress io.Writer, updates []refUpdate, acceptedAt time.Time)`,
+which runs after report-status is attempted and before that final flush.
 
 `progress` writes to the sideband `ProgressMessage` channel, which is band 2,
 when the client negotiated sideband. Otherwise `progress` is `nil`. Hook
@@ -34,10 +34,15 @@ exit status goes to `slog` in both cases.
 All three transports call `d.receivePack` in `hooks.go`, which drives the
 fork.
 
-`transport.ReceivePack` does not report which refs it changed. `onUpdated`
-therefore snapshots the branch refs before and after the push, then diffs
-them with `snapshotRefs` and `diffRefs`. Each hook then runs synchronously and
-streams through `progress`.
+`transport.ReceivePack` does not report which refs it changed. The fork passes
+the successful ref commands from the current request to `onUpdated`, with a
+timestamp captured immediately after the ref update. Packed-ref writes check
+each advertised old hash at the atomic commit point, including after a CAS
+retry. If legacy loose-ref cleanup fails after the packed write, receive-pack
+checks which updates are visible before dispatch. Shell hooks
+run for updated branches, and push webhooks run for every updated ref with a
+configured destination. Both run synchronously after the ref update and cannot
+reject it. See [../usage/webhooks.md](../usage/webhooks.md) for delivery details.
 
 HTTP needs one extra piece. It wraps its `ResponseWriter` in `flushWriter`
 (`http.go`), a flush-on-write writer, so `net/http` buffering does not hold
