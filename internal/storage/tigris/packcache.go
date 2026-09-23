@@ -43,9 +43,16 @@ import (
 //
 // A nil *PackCache is not usable; Storers without one fall back to a private
 // unlinked temp file per instance. See Storer.fetchWholePack.
+//
+// The same type also serves erofs snapshot images, through NewSnapshotCache
+// and GetChecked: a snapshot id is not a content digest, so those callers
+// supply the digest a download must have instead of reusing the id.
 type PackCache struct {
 	dir      string
 	maxBytes int64
+	suffix   string             // file name suffix of a cached entry; binSuffix for packs
+	observe  func(event string) // optional; see NewSnapshotCache
+	now      func() time.Time   // wall clock for EvictIdle; a field so tests can move it
 
 	mu      sync.Mutex
 	entries map[string]*cacheEntry
@@ -57,12 +64,13 @@ type PackCache struct {
 // download runs, so a second caller for the same id waits on ready instead of
 // starting a duplicate download.
 type cacheEntry struct {
-	id    string
-	path  string
-	size  int64  // 0 until the download settles; also marks an entry unevictable
-	used  uint64 // LRU stamp, higher is more recent
-	ready chan struct{}
-	err   error // download outcome; read only after ready closes
+	id     string
+	path   string
+	size   int64     // 0 until the download settles; also marks an entry unevictable
+	used   uint64    // LRU stamp, higher is more recent
+	usedAt time.Time // wall-clock time of the last claim; EvictIdle reads it
+	ready  chan struct{}
+	err    error // download outcome; read only after ready closes
 
 	// stream is the in-progress view of this entry's download: set once the
 	// staging file exists, cleared when the download settles either way. It
@@ -77,15 +85,48 @@ type cacheEntry struct {
 // maxBytes of zero or less means no budget and therefore no eviction, which
 // only makes sense for tests.
 func NewPackCache(parent string, maxBytes int64) (*PackCache, error) {
-	dir, err := os.MkdirTemp(parent, "objgit-packs-*")
+	return newFileCache(parent, "objgit-packs-*", binSuffix, maxBytes, nil)
+}
+
+// NewSnapshotCache creates a cache for snapshot images, in a fresh
+// objgit-snapshots-* directory under parent. It is the same cache as
+// NewPackCache, with its own directory and budget. Snapshot ids are not
+// content digests, so callers use GetChecked, not Get. observe, when not
+// nil, receives "hit", "miss", "evict_budget", and "evict_idle".
+func NewSnapshotCache(parent string, maxBytes int64, observe func(event string)) (*PackCache, error) {
+	return newFileCache(parent, "objgit-snapshots-*", ".erofs", maxBytes, observe)
+}
+
+// newFileCache is the shared constructor behind NewPackCache and
+// NewSnapshotCache. pattern names the temp directory (os.MkdirTemp's
+// pattern), and suffix names the file extension a settled entry gets on
+// disk.
+func newFileCache(parent, pattern, suffix string, maxBytes int64, observe func(string)) (*PackCache, error) {
+	dir, err := os.MkdirTemp(parent, pattern)
 	if err != nil {
-		return nil, fmt.Errorf("tigris: create pack cache directory: %w", err)
+		return nil, fmt.Errorf("tigris: create cache directory: %w", err)
 	}
 	return &PackCache{
 		dir:      dir,
 		maxBytes: maxBytes,
 		entries:  make(map[string]*cacheEntry),
+		suffix:   suffix,
+		observe:  observe,
+		now:      time.Now,
 	}, nil
+}
+
+// emit reports event to the observer n times, when one is installed. Callers
+// must call it outside c.mu: the observer is arbitrary caller code, and
+// running it under the lock would let a slow or reentrant callback stall
+// every other claim, forget, or fill in the process.
+func (c *PackCache) emit(event string, n int) {
+	if c.observe == nil {
+		return
+	}
+	for range n {
+		c.observe(event)
+	}
 }
 
 // Cleanup removes the cache directory and everything in it. Call it once at
@@ -105,18 +146,35 @@ func (c *PackCache) Cleanup() error {
 //
 // The caller owns the returned descriptor and must close it.
 func (c *PackCache) Get(id string, fetch func(io.Writer) error) (*os.File, error) {
-	// Bounded, because a pack can in principle be evicted by competing
+	return c.GetChecked(id, expectID(id, fetch))
+}
+
+// expectID adapts a pack fetch, whose digest is its own id, to the shape
+// GetChecked wants.
+func expectID(id string, fetch func(io.Writer) error) func(io.Writer) (string, error) {
+	return func(w io.Writer) (string, error) { return id, fetch(w) }
+}
+
+// GetChecked is Get for ids that are not content digests, such as a snapshot
+// id (see NewSnapshotCache): fetch writes the body and reports the SHA-256 it
+// must have. A body whose digest disagrees is refused and not cached.
+//
+// The caller owns the returned descriptor and must close it.
+func (c *PackCache) GetChecked(id string, fetch func(w io.Writer) (wantSHA256 string, err error)) (*os.File, error) {
+	// Bounded, because an entry can in principle be evicted by competing
 	// downloads between the fill and the open. Exhausting the budget returns an
 	// error, and packindex.go's bulk tier degrades to ranged GETs on one.
 	for try := 0; try < 3; try++ {
 		e, mine := c.claim(id)
 		if mine {
-			slog.Debug("pack not cached, downloading", "pack", id, "try", try)
+			c.emit("miss", 1)
+			slog.Debug("cache entry not cached, downloading", "id", id, "try", try)
 			c.fill(e, fetch)
 		} else {
+			c.emit("hit", 1)
 			// Either a settled entry or a download another caller is already
 			// running; both mean this caller downloads nothing.
-			slog.Debug("pack served from cache", "pack", id, "path", e.path)
+			slog.Debug("cache entry served from cache", "id", id, "path", e.path)
 		}
 		<-e.ready
 		if e.err != nil {
@@ -130,13 +188,13 @@ func (c *PackCache) Get(id string, fetch func(io.Writer) error) (*os.File, error
 		case errors.Is(err, os.ErrNotExist):
 			// Evicted between the lookup and the open. Forget this entry and
 			// go round again, which re-downloads it.
-			slog.Debug("cached pack vanished before it could be opened, retrying", "pack", id, "try", try)
+			slog.Debug("cached entry vanished before it could be opened, retrying", "id", id, "try", try)
 			c.forget(e)
 		default:
-			return nil, fmt.Errorf("tigris: open cached pack %s: %w", id, err)
+			return nil, fmt.Errorf("tigris: open cached entry %s: %w", id, err)
 		}
 	}
-	return nil, fmt.Errorf("tigris: cached pack %s was evicted faster than it could be read", id)
+	return nil, fmt.Errorf("tigris: cached entry %s was evicted faster than it could be read", id)
 }
 
 // partial reports the in-progress view of id's download, or nil when no
@@ -167,13 +225,15 @@ func (c *PackCache) claim(id string) (*cacheEntry, bool) {
 	c.seq++
 	if e, ok := c.entries[id]; ok {
 		e.used = c.seq
+		e.usedAt = c.now()
 		return e, false
 	}
 	e := &cacheEntry{
-		id:    id,
-		path:  filepath.Join(c.dir, id+binSuffix),
-		used:  c.seq,
-		ready: make(chan struct{}),
+		id:     id,
+		path:   filepath.Join(c.dir, id+c.suffix),
+		used:   c.seq,
+		usedAt: c.now(),
+		ready:  make(chan struct{}),
 	}
 	c.entries[id] = e
 	return e, true
@@ -201,7 +261,7 @@ func (c *PackCache) forget(e *cacheEntry) {
 // e.stream, so readers of this pack never have to wait for the whole container
 // — see packindex.go's watermark tier. The stream is torn down before ready
 // closes, so nothing can be served out of a body that failed its checksum.
-func (c *PackCache) fill(e *cacheEntry, fetch func(io.Writer) error) {
+func (c *PackCache) fill(e *cacheEntry, fetch func(io.Writer) (string, error)) {
 	defer close(e.ready)
 
 	start := time.Now()
@@ -252,28 +312,31 @@ func (c *PackCache) fill(e *cacheEntry, fetch func(io.Writer) error) {
 	c.mu.Lock()
 	e.size = size
 	c.cur += size
-	slog.Debug("pack cached",
-		"pack", e.id,
+	slog.Debug("cache entry filled",
+		"id", e.id,
 		"bytes", size,
 		"dur", time.Since(start),
 		"cache_bytes", c.cur,
 		"cache_max_bytes", c.maxBytes,
-		"cache_packs", len(c.entries))
-	c.evictLocked(e.id)
+		"cache_entries", len(c.entries))
+	n := c.evictLocked(e.id)
 	c.mu.Unlock()
+	c.emit("evict_budget", n)
 }
 
-// evictLocked unlinks least-recently-used packs until the budget is met,
+// evictLocked unlinks least-recently-used entries until the budget is met,
 // never touching keep (the entry being admitted) or an entry whose download
-// has not settled. An in-flight download's bytes are therefore uncounted, so
-// several concurrent downloads can overshoot the budget until they land.
+// has not settled, and reports how many it removed. An in-flight download's
+// bytes are therefore uncounted, so several concurrent downloads can overshoot
+// the budget until they land.
 //
-// A single pack larger than the whole budget is admitted anyway — the read has
-// to work — and simply evicts everything else.
-func (c *PackCache) evictLocked(keep string) {
+// A single entry larger than the whole budget is admitted anyway — the read
+// has to work — and simply evicts everything else.
+func (c *PackCache) evictLocked(keep string) int {
 	if c.maxBytes <= 0 {
-		return
+		return 0
 	}
+	n := 0
 	for c.cur > c.maxBytes {
 		var victim *cacheEntry
 		for _, e := range c.entries {
@@ -286,38 +349,68 @@ func (c *PackCache) evictLocked(keep string) {
 		}
 		if victim == nil {
 			// nothing evictable left; the survivors are all in use
-			slog.Debug("pack cache over budget with nothing evictable",
-				"cache_bytes", c.cur, "cache_max_bytes", c.maxBytes, "cache_packs", len(c.entries))
-			return
+			slog.Debug("cache over budget with nothing evictable",
+				"cache_bytes", c.cur, "cache_max_bytes", c.maxBytes, "cache_entries", len(c.entries))
+			return n
 		}
 		delete(c.entries, victim.id)
 		c.cur -= victim.size
 		// Open descriptors survive the unlink and keep serving reads; the disk
 		// space comes back when the last one closes.
 		os.Remove(victim.path)
-		slog.Debug("pack uncached",
-			"pack", victim.id,
+		n++
+		slog.Debug("cache entry over budget, uncached",
+			"id", victim.id,
 			"bytes", victim.size,
 			"admitted", keep,
 			"cache_bytes", c.cur,
 			"cache_max_bytes", c.maxBytes,
-			"cache_packs", len(c.entries))
+			"cache_entries", len(c.entries))
 	}
+	return n
+}
+
+// EvictIdle unlinks every settled entry that no caller claimed in the last
+// maxIdle, and reports how many it removed. It never touches a download that
+// has not settled. Open descriptors keep working, as with budget eviction.
+func (c *PackCache) EvictIdle(maxIdle time.Duration) int {
+	c.mu.Lock()
+	cutoff := c.now().Add(-maxIdle)
+	n := 0
+	for id, e := range c.entries {
+		if e.size == 0 || !e.usedAt.Before(cutoff) {
+			continue
+		}
+		delete(c.entries, id)
+		c.cur -= e.size
+		os.Remove(e.path)
+		n++
+		slog.Debug("cache entry idle, uncached", "id", id, "bytes", e.size, "idle_since", e.usedAt)
+	}
+	c.mu.Unlock()
+	c.emit("evict_idle", n)
+	return n
 }
 
 // verifiedCopy runs fetch into w, hashing as it goes, and rejects a body whose
-// SHA-256 disagrees with the pack id. It reports how many bytes landed.
+// SHA-256 disagrees with the digest fetch itself reports. It reports how many
+// bytes landed.
+//
+// id is not the value being verified against — it names the cache entry, for
+// the error message only. For a pack, whose id is its own digest, expectID
+// makes the two the same string.
 //
 // progress, when non-nil, is the watermark a concurrent reader polls: it is
 // bumped after every write, so a byte counted there is already in w.
-func verifiedCopy(w io.Writer, id string, fetch func(io.Writer) error, progress *atomic.Int64) (int64, error) {
+func verifiedCopy(w io.Writer, id string, fetch func(io.Writer) (string, error), progress *atomic.Int64) (int64, error) {
 	h := sha256.New()
 	cnt := &countingWriter{w: io.MultiWriter(w, h), progress: progress}
-	if err := fetch(cnt); err != nil {
+	want, err := fetch(cnt)
+	if err != nil {
 		return 0, err
 	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != id {
-		return 0, fmt.Errorf("tigris: downloaded pack %s failed checksum (got %s)", id, got)
+	if got := hex.EncodeToString(h.Sum(nil)); got != want {
+		return 0, fmt.Errorf("tigris: downloaded entry %s failed checksum (got %s, want %s)", id, got, want)
 	}
 	return cnt.n, nil
 }
