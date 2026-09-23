@@ -135,13 +135,13 @@ func parseReceivedBytes(out string) int64 {
 // mirrorClone copies a source repository once. Every push in the run reads from
 // this immutable copy, so the harness never writes to whatever it was pointed
 // at and every repetition sends byte-identical history.
+//
+// It goes through runGit for the -mirror-timeout limit: a hung fetch from a
+// forge would otherwise block the whole run on the bare signal context, with
+// nothing in the output to say which step stopped.
 func mirrorClone(ctx context.Context, src, dst string) error {
-	cmd := exec.CommandContext(ctx, "git", "clone", "--mirror", src, dst)
-	cmd.Env = append(cmd.Environ(), gitEnv...)
-
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("formatbench: can't mirror %s: %w: %s", src, err, strings.TrimSpace(string(out)))
+	if _, _, err := runGit(ctx, *mirrorTimeout, "", "clone", "--mirror", src, dst); err != nil {
+		return fmt.Errorf("formatbench: can't mirror %s: %w", src, err)
 	}
 
 	return nil

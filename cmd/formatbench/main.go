@@ -8,7 +8,13 @@
 // stores packs/<id>.bin plus packs/<id>.cue containers through
 // internal/storage/tigris. Both builds report the same Prometheus counter,
 // objgit_s3_requests_total, with the same operation labels, so the request
-// count that each format costs is directly comparable and no proxy is needed.
+// count that each format costs is comparable and no proxy is needed.
+//
+// Comparable, but not free: the counter is per process, not per request, so
+// anything the daemon does in the background lands in it too. The older build
+// re-lists hot prefixes on a wall-clock timer, which would charge it for how
+// long an operation took rather than for what the operation did. quiesceArgs
+// turns that off, and a build only gets a flag its own source defines.
 //
 // Every measurement gets a fresh repository prefix, a fresh pack cache
 // directory, and a fresh daemon process, so nothing is ever measured warm by
@@ -21,6 +27,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -33,6 +40,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -71,6 +79,17 @@ type buildSpec struct {
 	Ref  string `json:"ref"`
 
 	Bin string `json:"bin"`
+
+	// Commit is the SHA the binary was built from, with "-dirty" appended when
+	// the source carried uncommitted changes. Ref pins nothing on its own:
+	// "after" is whatever the checkout happened to hold, and a branch named
+	// through <name>=<ref> moves between runs. Without this a result cannot be
+	// checked after the fact.
+	Commit string `json:"commit,omitempty"`
+
+	// Args are the extra daemon flags this build's own source defines. See
+	// quiesceArgs.
+	Args []string `json:"args,omitempty"`
 }
 
 var (
@@ -89,7 +108,11 @@ var (
 
 	pushTimeout  = flag.Duration("push-timeout", 45*time.Minute, "time limit for one push; a push that hits it is recorded as DNF")
 	cloneTimeout = flag.Duration("clone-timeout", 30*time.Minute, "time limit for one clone; a clone that hits it is recorded as DNF")
-	verify       = flag.Bool("verify", true, "compare each clone against its mirror and mark the cell INVALID when they differ")
+	// An hour, longer than the two above, because those cover a transfer
+	// against a daemon on localhost while this one pulls a whole repository
+	// from a forge. It is the slowest single git call the harness makes.
+	mirrorTimeout = flag.Duration("mirror-timeout", 60*time.Minute, "time limit for the one-time mirror clone of a source repository")
+	verify        = flag.Bool("verify", true, "compare each clone against its mirror and mark the cell INVALID when they differ")
 
 	httpBind    = flag.String("http-bind", "127.0.0.1:8080", "address the daemon under test serves smart HTTP on")
 	metricsBind = flag.String("metrics-bind", "127.0.0.1:9090", "address the daemon under test serves /metrics on")
@@ -290,11 +313,25 @@ func runCell(ctx context.Context, bc *bucketClient, runDir string, sides []build
 
 	// A push that never finished still left keys behind, and how far it got is
 	// the interesting part of a DNF. Measure the bucket either way.
+	//
+	// usage returns whatever it summed before it failed, so a listing throttled
+	// partway through the tens of thousands of loose-object keys the old format
+	// writes comes back short and renders as a complete figure. That
+	// understates the older build, which is the direction that would turn the
+	// comparison around, so a failed listing invalidates the cell instead. The
+	// push timing goes with it: cell has one validity flag, and printing a
+	// timing beside a key count nobody can stand behind is what this is trying
+	// to avoid.
 	usage, err := bc.usage(ctx, c.Prefix)
 	if err != nil {
-		slog.Warn("can't measure bucket usage", "prefix", c.Prefix, "err", err)
+		slog.Error("can't measure bucket usage", "prefix", c.Prefix, "err", err)
+		c.Usage = bucketUsage{}
+		if c.Push.Err == "" {
+			c.Push.Err = fmt.Sprintf("the push finished but the bucket listing did not: %v", err)
+		}
+	} else {
+		c.Usage = usage
 	}
-	c.Usage = usage
 
 	if !c.Push.ok() {
 		slog.Warn("skipping clone because the push did not finish", "build", c.Build, "repo", c.Repo, "dnf", c.Push.DNF, "err", c.Push.Err)
@@ -342,6 +379,12 @@ func measure(ctx context.Context, root, runDir string, side buildSpec, tag strin
 		"-allow-push",
 		"-pack-cache-dir", packCache,
 	}
+	args = append(args, side.Args...)
+
+	if err := ensureNoDaemon(ctx, *metricsBind); err != nil {
+		out.Err = err.Error()
+		return out
+	}
 
 	daemon, err := startDaemon(root, side.Bin, filepath.Join(runDir, "daemon-"+tag+".log"), args)
 	if err != nil {
@@ -350,7 +393,7 @@ func measure(ctx context.Context, root, runDir string, side buildSpec, tag strin
 	}
 	defer stopDaemon(daemon)
 
-	if err := waitReady(ctx, *metricsBind, *readyWait); err != nil {
+	if err := waitReady(ctx, daemon, *metricsBind, *readyWait); err != nil {
 		out.Err = err.Error()
 		return out
 	}
@@ -363,20 +406,28 @@ func measure(ctx context.Context, root, runDir string, side buildSpec, tag strin
 
 	wall, wire, dnf, opErr := op(ctx)
 
-	after, err := scrapeS3(ctx, *metricsBind)
-	if err != nil {
-		slog.Warn("can't scrape metrics after the operation", "tag", tag, "err", err)
-		after = before
-	}
-
 	out.Wall = wall
 	out.WallStr = wall.Round(time.Millisecond).String()
-	out.S3 = after.sub(before)
 	out.WireBytes = wire
 	out.DNF = dnf
 	if opErr != nil {
 		out.Err = opErr.Error()
 	}
+
+	// The closing reading is what turns two counter values into a request
+	// count; without it there is no count. Leaving out.S3 at its zero value
+	// would file a measurement of no S3 traffic at all, and ok() and valid()
+	// would both stay true, so it would sit in the median with nothing in the
+	// report marking it. A scrape that did not answer fails the measurement.
+	after, err := scrapeS3(ctx, *metricsBind)
+	if err != nil {
+		slog.Error("dropping the measurement: can't scrape metrics after the operation", "tag", tag, "err", err)
+		if out.Err == "" {
+			out.Err = err.Error()
+		}
+		return out
+	}
+	out.S3 = after.sub(before)
 
 	slog.Info("measured", "tag", tag,
 		"wall", out.WallStr,
@@ -401,6 +452,8 @@ func buildSide(ctx context.Context, root, runDir string, side *buildSpec) error 
 	}
 
 	side.Bin = filepath.Join(runDir, "objgitd-"+side.Name)
+	side.Commit = resolveCommit(ctx, src)
+	side.Args = quiesceArgs(src)
 
 	cmd := exec.CommandContext(ctx, "go", "build", "-o", side.Bin, "./cmd/objgitd")
 	cmd.Dir = src
@@ -410,17 +463,106 @@ func buildSide(ctx context.Context, root, runDir string, side *buildSpec) error 
 			side.Name, src, err, strings.TrimSpace(string(out)))
 	}
 
-	slog.Info("built daemon", "side", side.Name, "ref", side.Ref, "src", src, "bin", side.Bin)
+	slog.Info("built daemon", "side", side.Name, "ref", side.Ref, "commit", side.Commit,
+		"src", src, "bin", side.Bin, "args", strings.Join(side.Args, " "))
 	return nil
 }
 
-// ensureWorktree checks a ref out beside the working tree, once. A worktree is
-// used rather than a detached checkout so the operator's own tree is never
-// touched and the build can run in parallel with editing.
+// quiesceArgs returns the flags that stop the daemon built from src doing S3
+// work on a wall-clock timer.
+//
+// v1.0.2 runs a listing-cache warmer that re-lists every hot prefix each
+// -s3-cache-refresh, 30 seconds by default, and those listings land in
+// objgit_s3_requests_total, the vector measure brackets. A 45 minute push
+// absorbs about ninety warmer cycles the current build never pays, and the
+// inflation grows with wall time, which is the axis the report ranks builds on.
+//
+// Only the warmer is switched off. -s3-cache-ttl is left at its default,
+// because the listing cache answered every request that release served: turning
+// it off would measure a daemon nobody ran and would charge the old format for
+// listings it did not make.
+//
+// The source is read rather than the ref name matched, because objgitd exits on
+// an unknown flag and the current checkout has no -s3-cache-refresh. A build
+// only gets a flag its own source defines.
+func quiesceArgs(src string) []string {
+	if !definesFlag(src, "s3-cache-refresh") {
+		return nil
+	}
+	return []string{"-s3-cache-refresh=0"}
+}
+
+// definesFlag reports whether the daemon's source under src declares the named
+// flag.
+func definesFlag(src, name string) bool {
+	dir := filepath.Join(src, "cmd", "objgitd")
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		slog.Warn("can't read the daemon's source; assuming it defines no extra flags", "dir", dir, "err", err)
+		return false
+	}
+
+	needle := []byte(strconv.Quote(name))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") {
+			continue
+		}
+
+		raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			slog.Warn("can't read a daemon source file", "path", filepath.Join(dir, e.Name()), "err", err)
+			continue
+		}
+		if bytes.Contains(raw, needle) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// resolveCommit records which commit a build was compiled from, so a number in
+// the report can be traced back to a binary months later. It never fails the
+// run: a missing SHA makes a result harder to check, but a wrong one would be
+// worse and there is no way to produce one here.
+func resolveCommit(ctx context.Context, src string) string {
+	sha, _, err := runGit(ctx, 30*time.Second, src, "rev-parse", "HEAD")
+	if err != nil {
+		slog.Warn("can't resolve the commit a build was made from", "src", src, "err", err)
+		return "unknown"
+	}
+	out := strings.TrimSpace(sha)
+
+	// A dirty tree is the normal case for the current checkout, and it means
+	// the SHA alone does not describe what was built.
+	status, _, err := runGit(ctx, 30*time.Second, src, "status", "--porcelain")
+	if err != nil {
+		slog.Warn("can't tell whether a build's source was dirty", "src", src, "err", err)
+		return out
+	}
+	if strings.TrimSpace(status) != "" {
+		out += "-dirty"
+	}
+
+	return out
+}
+
+// ensureWorktree checks a ref out beside the working tree. A worktree is used
+// rather than a detached checkout so the operator's own tree is never touched
+// and the build can run in parallel with editing.
+//
+// An existing worktree is moved to ref rather than trusted to already be there.
+// The <name>=<ref> spelling exists to benchmark a candidate fix, and a fix
+// lives on a branch: rerunning after pushing new commits would otherwise build
+// the old checkout and print the branch name over it.
 func ensureWorktree(ctx context.Context, root, ref string) (string, error) {
 	dir := filepath.Join(srcDir(root), worktreeName(ref))
 
-	if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+		if _, _, err := runGit(ctx, 10*time.Minute, dir, "checkout", "--detach", "--force", ref); err != nil {
+			return "", fmt.Errorf("formatbench: can't move the worktree at %s to %s: %w", dir, ref, err)
+		}
 		slog.Info("reusing worktree", "ref", ref, "path", dir)
 		return dir, nil
 	}
@@ -526,11 +668,43 @@ func runCleanup(ctx context.Context, listPath string) error {
 	return failed
 }
 
+// daemonProc is one objgitd under test: the process, the log file it writes to,
+// and a channel carrying the single result of waiting on it. The channel is
+// what lets waitReady notice a daemon that died instead of polling an address
+// something else might answer.
+type daemonProc struct {
+	cmd     *exec.Cmd
+	log     *os.File
+	logPath string
+
+	// wait carries cmd.Wait's result once and is then closed, so every later
+	// receive returns immediately whether or not the value was taken.
+	wait chan error
+}
+
+// ensureNoDaemon fails when something already answers on the metrics address.
+//
+// A daemon left behind by an interrupted run keeps the metrics and HTTP ports.
+// The one started next dies on bind within milliseconds, and every request the
+// harness makes after that goes to the old process: the wrong binary, with a
+// warm pack cache, whose counters sub() quietly absorbs. Nothing downstream
+// looks wrong, so it has to be caught before the measurement starts.
+func ensureNoDaemon(ctx context.Context, metricsAddr string) error {
+	probe, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	if _, err := scrapeS3(probe, metricsAddr); err == nil {
+		return fmt.Errorf("formatbench: something already answers http://%s/metrics; stop it before benchmarking", metricsAddr)
+	}
+
+	return nil
+}
+
 // startDaemon runs objgitd with its working directory set to the module root,
 // because objgitd loads its credentials from the .env file there. The context
 // is deliberately not attached: shutdown goes through stopDaemon so the daemon
 // gets the same SIGINT it would in production.
-func startDaemon(root, bin, logPath string, args []string) (*exec.Cmd, error) {
+func startDaemon(root, bin, logPath string, args []string) (*daemonProc, error) {
 	log, err := os.Create(logPath)
 	if err != nil {
 		return nil, fmt.Errorf("formatbench: can't create %s: %w", logPath, err)
@@ -546,31 +720,54 @@ func startDaemon(root, bin, logPath string, args []string) (*exec.Cmd, error) {
 		return nil, fmt.Errorf("formatbench: can't start %s: %w", bin, err)
 	}
 
-	return cmd, nil
+	p := &daemonProc{cmd: cmd, log: log, logPath: logPath, wait: make(chan error, 1)}
+	go func() {
+		p.wait <- cmd.Wait()
+		close(p.wait)
+	}()
+
+	return p, nil
 }
 
-func stopDaemon(cmd *exec.Cmd) {
-	if cmd.Process == nil {
+// stopDaemon ends the daemon and closes its log. Closing here is what bounds
+// the descriptors: measure runs twice per cell, and the file is only flushed
+// when it is closed, so a log left open is both a leak and an unreadable log.
+func stopDaemon(p *daemonProc) {
+	defer p.log.Close()
+
+	if p.cmd.Process == nil {
 		return
 	}
 
-	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+	// A daemon that already died, or that waitReady found dead, has nothing
+	// left to signal.
+	select {
+	case <-p.wait:
+		return
+	default:
+	}
+
+	if err := p.cmd.Process.Signal(os.Interrupt); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		slog.Warn("can't interrupt daemon", "err", err)
 	}
 
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-
 	select {
-	case <-done:
+	case <-p.wait:
 	case <-time.After(30 * time.Second):
 		slog.Warn("daemon did not exit on SIGINT, killing it")
-		_ = cmd.Process.Kill()
-		<-done
+		_ = p.cmd.Process.Kill()
+		<-p.wait
 	}
 }
 
-func waitReady(ctx context.Context, metricsAddr string, limit time.Duration) error {
+// waitReady polls /metrics until the daemon answers, and gives up early if the
+// daemon it was given is no longer running.
+//
+// Watching the child is the point. A 200 from the metrics address only says
+// that some process holds that port, and objgitd exits on a bind failure, so
+// without this a daemon that lost the port would be measured as if it had won
+// it.
+func waitReady(ctx context.Context, p *daemonProc, metricsAddr string, limit time.Duration) error {
 	url := "http://" + metricsAddr + "/metrics"
 	client := &http.Client{Timeout: 2 * time.Second}
 	deadline := time.Now().Add(limit)
@@ -578,6 +775,15 @@ func waitReady(ctx context.Context, metricsAddr string, limit time.Duration) err
 	for time.Now().Before(deadline) {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+
+		select {
+		case err := <-p.wait:
+			if err == nil {
+				err = errors.New("it exited without an error")
+			}
+			return fmt.Errorf("formatbench: the daemon stopped before it answered %s: %w; see %s", url, err, p.logPath)
+		default:
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)

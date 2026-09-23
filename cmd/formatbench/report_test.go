@@ -152,8 +152,8 @@ func TestRenderReport(t *testing.T) {
 		FinishedAt: time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC),
 		Host:       "laptop",
 		Builds: []buildSpec{
-			{Name: "before", Ref: "v1.0.2"},
-			{Name: "after"},
+			{Name: "before", Ref: "v1.0.2", Commit: "a1b2c3d"},
+			{Name: "after", Commit: "e4f5a6b-dirty"},
 		},
 		Repos: []repoSpec{{Name: "objgit", URL: "https://example.invalid/objgit", Commits: "1200", Pack: 15 << 20}},
 	}
@@ -167,8 +167,11 @@ func TestRenderReport(t *testing.T) {
 	for _, want := range []string{
 		"## Push",
 		"## Clone",
-		"| Build \"before\" | v1.0.2 |",
-		"| Build \"after\" | current checkout |",
+		// The commit is what makes a number checkable after the fact, and
+		// "-dirty" is the normal case for the side built from the live
+		// checkout, so both belong in the conditions table.
+		"| Build \"before\" | v1.0.2 (a1b2c3d) |",
+		"| Build \"after\" | current checkout (e4f5a6b-dirty) |",
 		"## Cells that produced no number",
 		"push DNF at 45m0s",
 		"Oh yeah, this was with my corporate laptop on wifi.",
