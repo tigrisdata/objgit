@@ -3,14 +3,14 @@
 ## Context
 
 `objgitd` pins kefka to a May 2026 commit and registers only its Go
-coreutils. The current upstream `main` commit (August 23, 2026) moves common
+coreutils. Upstream `v0.0.6` (August 23, 2026) moves common
 coreutils to a WASM-backed uutils registry and exposes WASM programs through
 `wasmprog`. Hooks and SSH `sh` share
 `newHookShell`, so that function is the registration point for both.
 
 ## Changes
 
-1. Pin kefka to the current `main` commit and update the module sums.
+1. Pin kefka to `v0.0.6` and update the module sums.
 2. Register wasmprog and uutils after coreutils, following kefka's own CLI.
    The uutils registry provides commands such as `cat` and `ls` and adds
    `base32`; wasmprog provides `jq`, `python3`, `qjs`, and `rg`.
@@ -24,8 +24,7 @@ coreutils to a WASM-backed uutils registry and exposes WASM programs through
 
 Run `go build ./...`, the hook and SSH protocol tests, then `go test ./...`.
 
-The upstream August commit is not on the public Go module proxy yet. At the
-time of this update, the proxy returned 404, and a direct all-refs fetch from
-Tangled failed because its `Xe/uutils` ref could not be fetched. The module
-was downloaded from a local clone of upstream `main` with the same commit
-hash. A clean builder needs the proxy or the upstream fetch to recover.
+The tag points to commit `0592fe1f17775d60fd533cdbf06e4b716b3243c8`.
+The public Go module proxy initially returned 404, but Go's normal direct
+fallback fetched the tag. `go mod download` passed with an empty module cache
+and the `v0.0.6` checksums in `go.sum`.
