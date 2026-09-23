@@ -1,3 +1,9 @@
+# [1.9.0](https://github.com/tigrisdata/objgit/compare/v1.8.0...v1.9.0) (2026-09-23)
+
+### Features
+
+- erofs snapshots of pushed trees, stored next to the repo ([#15](https://github.com/tigrisdata/objgit/issues/15)) ([2a31f82](https://github.com/tigrisdata/objgit/commit/2a31f82e8c21af67ba81f23112b53779ab7eb3ef))
+
 # [1.8.0](https://github.com/tigrisdata/objgit/compare/v1.7.0...v1.8.0) (2026-09-23)
 
 ### Features
