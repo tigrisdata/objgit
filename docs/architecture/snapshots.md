@@ -5,8 +5,9 @@ each updated branch and tag. It stores the image in the bucket, under the
 prefix of the repository. A later reader, such as a web UI, opens the image
 and reads files from it with no git object walk.
 
-The `-erofs-snapshots` flag turns this on. It is off by default. The images
-come from `github.com/Xe/erofs`, and they use Zstandard compression.
+The `-erofs-snapshots` flag controls this. It is on by default, and
+`-erofs-snapshots=false` turns it off. The images come from
+`github.com/Xe/erofs`, and they use Zstandard compression.
 
 The design is in
 [../superpowers/specs/2026-09-23-erofs-snapshots-design.md](../superpowers/specs/2026-09-23-erofs-snapshots-design.md).
@@ -149,7 +150,7 @@ storer without the methods skips snapshots.
 
 | Flag                       | Default | Meaning                                                  |
 | -------------------------- | ------- | -------------------------------------------------------- |
-| `-erofs-snapshots`         | `false` | Build an image for each updated ref tip after a push.    |
+| `-erofs-snapshots`         | `true`  | Build an image for each updated ref tip after a push.    |
 | `-snapshot-timeout`        | `2m`    | Wall-clock limit for the snapshots of one push.          |
 | `-snapshot-cache-bytes`    | `2 GiB` | Disk budget for the snapshot cache. `0` disables the cache. |
 | `-snapshot-cache-max-idle` | `1h`    | The cache deletes an image that nobody opened for this long. `0` disables the sweep. |

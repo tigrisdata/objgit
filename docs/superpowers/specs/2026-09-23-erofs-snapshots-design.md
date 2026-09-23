@@ -309,7 +309,7 @@ snapshot cache, next to the call for the pack cache.
 
 | Flag                       | Default | Environment               | Meaning                          |
 | -------------------------- | ------- | ------------------------- | -------------------------------- |
-| `-erofs-snapshots`         | `false` | `EROFS_SNAPSHOTS`         | Build an image for each updated ref tip after a push. |
+| `-erofs-snapshots`         | `true`  | `EROFS_SNAPSHOTS`         | Build an image for each updated ref tip after a push. |
 | `-snapshot-timeout`        | `2m`    | `SNAPSHOT_TIMEOUT`        | Wall-clock limit for the snapshots of one push. |
 | `-snapshot-cache-bytes`    | `2 GiB` | `SNAPSHOT_CACHE_BYTES`    | Disk budget for the local snapshot cache. `0` disables the cache. |
 | `-snapshot-cache-max-idle` | `1h`    | `SNAPSHOT_CACHE_MAX_IDLE` | The cache deletes an image that nobody opened for this long. `0` disables the idle sweep. |
@@ -451,8 +451,7 @@ map-backed `Store`:
   commit, with `-erofs-snapshots` on. Exactly one image exists. A file reads
   back through `snapshot.Open`. The client output contains the `remote:
   objgit: snapshot` lines.
-- `TestPushSnapshotsOffByDefault`: no image exists after a push with the flag
-  off.
+- `TestPushSnapshotsOff`: no image exists after a push with the flag off.
 - `TestHooksIgnoreTags`: a pushed tag does not run the hook, now that
   `snapshotRefs` returns tags.
 

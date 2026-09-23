@@ -112,6 +112,7 @@ go tool pprof -http=: <run>/heap-peak-<largest>.pb.gz
 | `-peak-cooldown`        | `2s`                 | Minimum time between two peak captures.                                  |
 | `-daemon-binary`        | build it             | Prebuilt `objgitd` to test instead of building `./cmd/objgitd`.          |
 | `-daemon-allow-hooks`   | `false`              | Off so hook cost is not mistaken for push cost.                          |
+| `-daemon-erofs-snapshots` | `false`            | Off so snapshot cost is not mistaken for push cost.                      |
 
 All flags take an environment fallback through `flagenv`, in UPPER_SNAKE. The
 daemon-facing flags are prefixed `-daemon-` so they do not collide with

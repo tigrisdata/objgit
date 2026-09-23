@@ -46,7 +46,7 @@ var (
 	packCacheDir   = flag.String("pack-cache-dir", "", "parent directory for the local pack cache; empty uses the OS temp directory")
 	packCacheBytes = flag.Int64("pack-cache-bytes", 2<<30, "disk budget for the local pack cache, least-recently-used eviction; 0 disables caching")
 
-	erofsSnapshots       = flag.Bool("erofs-snapshots", false, "build a zstd-compressed erofs image of the tree at each updated branch and tag tip after a push, and store it next to the repository")
+	erofsSnapshots       = flag.Bool("erofs-snapshots", true, "build a zstd-compressed erofs image of the tree at each updated branch and tag tip after a push, and store it next to the repository; the push waits for the build")
 	snapshotTimeout      = flag.Duration("snapshot-timeout", 2*time.Minute, "wall-clock limit for the erofs snapshots of one push")
 	snapshotCacheBytes   = flag.Int64("snapshot-cache-bytes", 2<<30, "disk budget for the local erofs snapshot cache, least-recently-used eviction; 0 disables caching")
 	snapshotCacheMaxIdle = flag.Duration("snapshot-cache-max-idle", time.Hour, "evict a cached erofs snapshot that nobody opened for this long; 0 disables the idle sweep")

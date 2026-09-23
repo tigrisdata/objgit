@@ -116,7 +116,7 @@ func TestSmartHTTPPushSnapshots(t *testing.T) {
 	}
 }
 
-func TestPushSnapshotsOffByDefault(t *testing.T) {
+func TestPushSnapshotsOff(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
 	}

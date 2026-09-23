@@ -62,6 +62,7 @@ var (
 	daemonHTTPBind   = flag.String("daemon-http-bind", "127.0.0.1:8080", "address the daemon under test serves smart HTTP on")
 	daemonMetrics    = flag.String("daemon-metrics-bind", "127.0.0.1:9090", "address the daemon under test serves /metrics and /debug/pprof on")
 	daemonAllowHooks = flag.Bool("daemon-allow-hooks", false, "run push hooks in the daemon under test; off by default so hook cost is not mistaken for push cost")
+	daemonSnapshots  = flag.Bool("daemon-erofs-snapshots", false, "build erofs snapshots in the daemon under test; off by default so snapshot cost is not mistaken for push cost")
 	daemonReadyWait  = flag.Duration("daemon-ready-wait", 60*time.Second, "how long to wait for the daemon to answer /metrics before giving up")
 
 	slogLevel = flag.String("slog-level", "INFO", "log level (DEBUG, INFO, WARN, ERROR)")
@@ -137,6 +138,7 @@ func run(ctx context.Context) error {
 		"-ssh-bind=",
 		"-allow-push",
 		fmt.Sprintf("-allow-hooks=%t", *daemonAllowHooks),
+		fmt.Sprintf("-erofs-snapshots=%t", *daemonSnapshots),
 		"-pack-cache-dir", packCache,
 	}
 
