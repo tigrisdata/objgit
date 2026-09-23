@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -22,14 +24,23 @@ import (
 // the whole feature reads as a 404 from outside. That is the answer both
 // git-lfs and the locking specification expect from a server without LFS.
 type lfsService struct {
-	store    *lfs.Store
-	ttl      time.Duration
+	store *lfs.Store
+	// ttl answers how long a presigned URL minted right now may live. It is a
+	// function and not a value because the answer depends on the credential the
+	// daemon holds at that moment, which the SDK refreshes while the process
+	// runs. See lfsURLTTLFunc in main.go.
+	ttl      func(context.Context) time.Duration
 	maxSize  int64
 	maxBatch int
 	// externalURL is the public base URL, used to build the verify action and
 	// the git-lfs-authenticate response.
 	externalURL string
 	allowLocks  bool
+}
+
+// urlTTL is the presigned-URL lifetime for one request.
+func (s *lfsService) urlTTL(ctx context.Context) time.Duration {
+	return s.ttl(ctx)
 }
 
 // maxBodyBytes is the largest LFS request body the daemon reads.
@@ -48,6 +59,24 @@ func (s *lfsService) maxBodyBytes() int64 {
 	}
 	return floor
 }
+
+// Limits on what one repository's lock document may grow to hold.
+//
+// The document is read whole, decoded, and re-encoded on every lock call, and
+// git-lfs calls locks/verify on every push. Nothing else in the LFS surface
+// stores caller-supplied text, so these two bounds are what keep one anonymous
+// request from permanently slowing every later push to that repository.
+const (
+	// maxLockPathBytes caps the path a lock may name. 4096 is PATH_MAX on
+	// Linux, so it is above anything git can put in a working tree, and no
+	// real lock is refused by it.
+	maxLockPathBytes = 4096
+	// maxLocksPerRepo caps how many locks one repository holds at once. File
+	// locking coordinates a team on a handful of binary assets, so a thousand
+	// is far above real use while holding the document to a few megabytes even
+	// when every path is at the cap above.
+	maxLocksPerRepo = 1000
+)
 
 // registerLFS adds the LFS routes. It is a no-op when LFS is off.
 //
@@ -149,10 +178,40 @@ func writeLFSJSON(w http.ResponseWriter, status int, body any) {
 	}
 }
 
-// decodeLFSBody reads a JSON request body, answering 422 on anything malformed.
+// capLFSBody bounds a request body before anything reads it.
+//
+// Every LFS route takes its body from an unauthenticated connection, so none of
+// them may buffer an arbitrary amount of JSON. This runs on all of them, and
+// not only on the routes that decode before authorizing.
+func (d *daemon) capLFSBody(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, d.lfs.maxBodyBytes())
+}
+
+// decodeLFSBody reads a JSON request body, answering 422 on anything malformed
+// and 413 on a body past the cap.
 func decodeLFSBody(w http.ResponseWriter, r *http.Request, into any) bool {
-	if err := json.NewDecoder(r.Body).Decode(into); err != nil {
-		writeLFSError(w, http.StatusUnprocessableEntity, "malformed request body")
+	err := json.NewDecoder(r.Body).Decode(into)
+	if err == nil {
+		return true
+	}
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		writeLFSError(w, http.StatusRequestEntityTooLarge, "request body is too large")
+		return false
+	}
+	writeLFSError(w, http.StatusUnprocessableEntity, "malformed request body")
+	return false
+}
+
+// decodeOptionalLFSBody decodes a body the protocol lets a client leave empty.
+//
+// Only an oversized body is fatal here. Anything else decodes into the zero
+// value, which is what an absent body means on these routes.
+func decodeOptionalLFSBody(w http.ResponseWriter, r *http.Request, into any) bool {
+	err := json.NewDecoder(r.Body).Decode(into)
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		writeLFSError(w, http.StatusRequestEntityTooLarge, "request body is too large")
 		return false
 	}
 	return true
@@ -193,10 +252,10 @@ func (d *daemon) handleLFSBatch(w http.ResponseWriter, r *http.Request) {
 	var req lfs.BatchRequest
 	// The operation decides the access needed, so the body is read before
 	// authorization rather than after. That puts an allocation ahead of the
-	// authorizer, so the body is capped first: an unauthenticated caller must
+	// authorizer, so the cap matters most here: an unauthenticated caller must
 	// not be able to make the daemon hold an arbitrary amount of JSON before it
 	// is turned away.
-	r.Body = http.MaxBytesReader(w, r.Body, d.lfs.maxBodyBytes())
+	d.capLFSBody(w, r)
 	if !decodeLFSBody(w, r, &req) {
 		metrics.ObserveLFSBatch("unknown", "invalid", start)
 		return
@@ -215,7 +274,7 @@ func (d *daemon) handleLFSBatch(w http.ResponseWriter, r *http.Request) {
 	resp, err := d.lfs.store.Batch(r.Context(), &req, lfs.BatchOptions{
 		Repo:      ref.Path(),
 		VerifyURL: d.verifyURL(r, ref),
-		TTL:       d.lfs.ttl,
+		TTL:       d.lfs.urlTTL(r.Context()),
 		MaxSize:   d.lfs.maxSize,
 		MaxBatch:  d.lfs.maxBatch,
 	})
@@ -287,6 +346,7 @@ func (d *daemon) handleLFSVerify(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var p lfs.Pointer
+	d.capLFSBody(w, r)
 	if !decodeLFSBody(w, r, &p) {
 		return
 	}
@@ -336,7 +396,16 @@ func (d *daemon) handleLFSLockCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req lockRequest
+	d.capLFSBody(w, r)
 	if !decodeLFSBody(w, r, &req) {
+		return
+	}
+	if len(req.Path) > maxLockPathBytes {
+		metrics.ObserveLFSLock("create", "invalid")
+		writeLFSError(w, http.StatusUnprocessableEntity, "lock path is too long")
+		return
+	}
+	if !d.lockRoomLeft(w, r, ref, req.Path) {
 		return
 	}
 
@@ -355,6 +424,36 @@ func (d *daemon) handleLFSLockCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	metrics.ObserveLFSLock("create", "ok")
 	writeLFSJSON(w, http.StatusCreated, lockResponse{Lock: lock})
+}
+
+// lockRoomLeft reports whether repository ref may take another lock on path,
+// writing the refusal itself when it may not. A lock that already holds path is
+// always allowed through, so a repeated `git lfs lock` at the cap still gets the
+// 409 that names the holder rather than a confusing refusal.
+//
+// This costs one extra read of the lock document per create, which is cheap
+// next to how rare a lock is. It is a soft cap: two creates racing can both
+// pass it. That is enough, because the point is to bound growth, not to make
+// the thousandth lock exact.
+func (d *daemon) lockRoomLeft(w http.ResponseWriter, r *http.Request, ref repofs.RepoRef, path string) bool {
+	locks, _, err := d.lfs.store.ListLocks(r.Context(), ref.Path(), lfs.LockFilter{})
+	if err != nil {
+		d.writeLockError(w, ref, "create", err)
+		return false
+	}
+	if len(locks) < maxLocksPerRepo {
+		return true
+	}
+	if slices.ContainsFunc(locks, func(l lfs.Lock) bool { return l.Path == path }) {
+		return true
+	}
+
+	slog.Warn("lfs lock refused: repository is at the lock cap",
+		"repo", ref.Path(), "locks", len(locks), "cap", maxLocksPerRepo)
+	metrics.ObserveLFSLock("create", "too_many")
+	writeLFSError(w, http.StatusRequestEntityTooLarge,
+		fmt.Sprintf("this repository already holds the most locks allowed (%d)", maxLocksPerRepo))
+	return false
 }
 
 // lockListResponse is the body of a lock listing.
@@ -412,7 +511,10 @@ func (d *daemon) handleLFSLockVerify(w http.ResponseWriter, r *http.Request) {
 
 	var req lockVerifyRequest
 	// An empty body is legal here, so a decode failure is not fatal.
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	d.capLFSBody(w, r)
+	if !decodeOptionalLFSBody(w, r, &req) {
+		return
+	}
 
 	locks, next, err := d.lfs.store.ListLocks(r.Context(), ref.Path(), lfs.LockFilter{
 		Cursor: req.Cursor,
@@ -445,7 +547,11 @@ func (d *daemon) handleLFSUnlock(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req unlockRequest
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	// An empty body is legal here too: `force` is the only field.
+	d.capLFSBody(w, r)
+	if !decodeOptionalLFSBody(w, r, &req) {
+		return
+	}
 
 	lock, err := d.lfs.store.DeleteLock(r.Context(), ref.Path(), r.PathValue("id"), lfsOwner(r), req.Force)
 	if err != nil {
@@ -574,7 +680,7 @@ func (d *daemon) handleLFSAuthenticate(s ssh.Session, cmd []string) {
 		Href: fmt.Sprintf("%s/%s/%s.git/info/lfs",
 			strings.TrimSuffix(d.lfs.externalURL, "/"), ref.OrgID, ref.Name),
 		Header:    map[string]string{},
-		ExpiresIn: int(d.lfs.ttl.Seconds()),
+		ExpiresIn: int(d.lfs.urlTTL(s.Context()).Seconds()),
 	}
 	if err := json.NewEncoder(s).Encode(resp); err != nil {
 		slog.Error("writing lfs authenticate response", "repo", ref.Path(), "err", err)

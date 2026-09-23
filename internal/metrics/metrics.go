@@ -471,7 +471,8 @@ func ObserveLFSVerify(status string) {
 }
 
 // ObserveLFSLock records a Git LFS locking API call. action is "create",
-// "list", "verify", or "unlock".
+// "list", "verify", or "unlock". status is "ok", "invalid", "conflict",
+// "too_many", "not_found", "forbidden", "contended", or "error".
 func ObserveLFSLock(action, status string) {
 	lfsLockRequests.WithLabelValues(action, status).Inc()
 }

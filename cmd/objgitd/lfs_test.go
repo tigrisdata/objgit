@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -21,6 +22,7 @@ import (
 	"github.com/tigrisdata/objgit/internal/auth"
 	"github.com/tigrisdata/objgit/internal/lfs"
 	"github.com/tigrisdata/objgit/internal/repofs"
+	tstorage "github.com/tigrisdata/storage-go"
 )
 
 const (
@@ -144,6 +146,13 @@ var errPreconditionFailed = &smithy.GenericAPIError{
 	Message: "At least one of the pre-conditions you specified did not hold",
 }
 
+// staticLFSTTL is the per-request URL lifetime for a test: a fixed value, with
+// no credential to inspect. The daemon builds this from the live credential
+// instead (lfsURLTTLFunc).
+func staticLFSTTL(d time.Duration) func(context.Context) time.Duration {
+	return func(context.Context) time.Duration { return d }
+}
+
 // newLFSServer starts an httptest server whose daemon has LFS enabled over an
 // in-memory bucket.
 func newLFSServer(t *testing.T, allowPush, allowLocks bool) (*httptest.Server, *lfs.Store, *memBucket) {
@@ -164,7 +173,7 @@ func newLFSServer(t *testing.T, allowPush, allowLocks bool) (*httptest.Server, *
 		authz:    auth.AllowAnonymous{AllowWrite: allowPush},
 		lfs: &lfsService{
 			store:      store,
-			ttl:        15 * time.Minute,
+			ttl:        staticLFSTTL(15 * time.Minute),
 			maxSize:    1 << 30,
 			maxBatch:   100,
 			allowLocks: allowLocks,
@@ -701,4 +710,177 @@ func TestLFSBatchCapsTheRequestBody(t *testing.T) {
 	if resp.StatusCode == http.StatusOK {
 		t.Fatal("an oversized body was accepted")
 	}
+}
+
+// postRawLFS sends a body verbatim. The shared helpers encode a Go value, which
+// cannot express a body that is deliberately too large to decode.
+func postRawLFS(t *testing.T, ts *httptest.Server, path, body string) int {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+path, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("building request: %v", err)
+	}
+	req.Header.Set("Accept", lfs.MediaType)
+	req.Header.Set("Content-Type", lfs.MediaType)
+
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("POST %s: %v", path, err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode
+}
+
+// TestLFSHandlersCapTheRequestBody covers every LFS route that reads a body.
+// The batch route capped its own from the start; the rest read theirs whole,
+// which let an anonymous caller hand the daemon as much JSON as it liked.
+func TestLFSHandlersCapTheRequestBody(t *testing.T) {
+	ts, _, _ := newLFSServer(t, true, true)
+
+	// Just past the cap for the batch size newLFSServer configures. Kept small
+	// on purpose: a body large enough to fill the socket buffer would race the
+	// server's early response against the client still writing.
+	svc := &lfsService{maxBatch: 100}
+	filler := strings.Repeat("a", int(svc.maxBodyBytes())+4096)
+
+	for _, tt := range []struct {
+		name string
+		path string
+		body string
+	}{
+		{
+			name: "batch",
+			path: "/acme/test.git/info/lfs/objects/batch",
+			body: `{"operation":"download","padding":"` + filler + `","objects":[]}`,
+		},
+		{
+			name: "verify",
+			path: "/acme/test.git/info/lfs/objects/verify",
+			body: `{"oid":"` + testOID + `","size":4,"padding":"` + filler + `"}`,
+		},
+		{
+			name: "lock create",
+			path: "/acme/test.git/info/lfs/locks",
+			body: `{"path":"` + filler + `"}`,
+		},
+		{
+			name: "lock verify",
+			path: "/acme/test.git/info/lfs/locks/verify",
+			body: `{"cursor":"` + filler + `"}`,
+		},
+		{
+			name: "unlock",
+			path: "/acme/test.git/info/lfs/locks/deadbeef/unlock",
+			body: `{"force":true,"padding":"` + filler + `"}`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if status := postRawLFS(t, ts, tt.path, tt.body); status != http.StatusRequestEntityTooLarge {
+				t.Fatalf("status = %d, want 413", status)
+			}
+		})
+	}
+}
+
+// TestLFSLockRejectsAnOversizedPath keeps an unbounded string out of the lock
+// document. The path is stored verbatim and the document is read whole on every
+// push, so one accepted giant path would slow every later push to the
+// repository for good.
+func TestLFSLockRejectsAnOversizedPath(t *testing.T) {
+	ts, _, _ := newLFSServer(t, true, true)
+
+	status, _ := postLFS(t, ts, "/acme/test.git/info/lfs/locks", map[string]any{
+		"path": strings.Repeat("a", maxLockPathBytes+1),
+	})
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", status)
+	}
+
+	// And nothing was written.
+	_, body := requestLFS(t, ts, http.MethodGet, "/acme/test.git/info/lfs/locks", nil)
+	if locks, _ := body["locks"].([]any); len(locks) != 0 {
+		t.Fatalf("listed %d locks, want 0", len(locks))
+	}
+}
+
+// TestLFSLockRejectsPastTheRepositoryCap bounds how many locks one repository
+// can accumulate, for the same reason: every push reads the whole document.
+func TestLFSLockRejectsPastTheRepositoryCap(t *testing.T) {
+	ts, _, bucket := newLFSServer(t, true, true)
+	seedLocks(t, bucket, maxLocksPerRepo)
+
+	status, _ := postLFS(t, ts, "/acme/test.git/info/lfs/locks", map[string]any{
+		"path": "one-too-many.bin",
+	})
+	if status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", status)
+	}
+
+	// A path that is already locked still answers with the conflict that names
+	// its holder, rather than the cap.
+	status, body := postLFS(t, ts, "/acme/test.git/info/lfs/locks", map[string]any{
+		"path": "seeded/0.bin",
+	})
+	if status != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (body %v)", status, body)
+	}
+}
+
+// TestLFSURLTTLFollowsTheCredential pins that the presigned-URL lifetime is
+// answered per request and not frozen at startup. A daemon that happens to
+// start while a temporary credential is nearly expired would otherwise sign
+// every URL for its whole life against the one-minute floor, long after the SDK
+// replaced that credential.
+func TestLFSURLTTLFollowsTheCredential(t *testing.T) {
+	const want = 15 * time.Minute
+
+	expires := time.Now().Add(30 * time.Second)
+	client := &tstorage.Client{Client: s3.New(s3.Options{
+		Region: "auto",
+		Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+			return aws.Credentials{
+				AccessKeyID:     "AKIAEXAMPLEEXAMPLE",
+				SecretAccessKey: "secretsecretsecret",
+				CanExpire:       true,
+				Expires:         expires,
+			}, nil
+		}),
+	})}
+
+	ttl := lfsURLTTLFunc(client, want)
+	if got := ttl(t.Context()); got != time.Minute {
+		t.Fatalf("ttl on a nearly expired credential = %s, want the 1m floor", got)
+	}
+
+	// The SDK refreshes the credential. The next request has to see that.
+	expires = time.Now().Add(time.Hour)
+	if got := ttl(t.Context()); got != want {
+		t.Fatalf("ttl after the credential was refreshed = %s, want %s", got, want)
+	}
+}
+
+// seedLocks writes a lock document holding n locks straight into the bucket.
+// Creating them one request at a time would re-encode a growing document a
+// thousand times over.
+func seedLocks(t *testing.T, bucket *memBucket, n int) {
+	t.Helper()
+
+	doc := struct {
+		Locks []lfs.Lock `json:"locks"`
+	}{Locks: make([]lfs.Lock, n)}
+	for i := range doc.Locks {
+		doc.Locks[i] = lfs.Lock{
+			ID:       fmt.Sprintf("%032x", i),
+			Path:     fmt.Sprintf("seeded/%d.bin", i),
+			LockedAt: time.Now().UTC(),
+			Owner:    lfs.Owner{Name: lfs.AnonymousOwner},
+		}
+	}
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("encoding seeded lock document: %v", err)
+	}
+	bucket.put(lfs.LocksKey(testRepo), raw)
 }
