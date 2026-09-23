@@ -46,6 +46,11 @@ var (
 	packCacheDir   = flag.String("pack-cache-dir", "", "parent directory for the local pack cache; empty uses the OS temp directory")
 	packCacheBytes = flag.Int64("pack-cache-bytes", 2<<30, "disk budget for the local pack cache, least-recently-used eviction; 0 disables caching")
 
+	erofsSnapshots       = flag.Bool("erofs-snapshots", false, "build a zstd-compressed erofs image of the tree at each updated branch and tag tip after a push, and store it next to the repository")
+	snapshotTimeout      = flag.Duration("snapshot-timeout", 2*time.Minute, "wall-clock limit for the erofs snapshots of one push")
+	snapshotCacheBytes   = flag.Int64("snapshot-cache-bytes", 2<<30, "disk budget for the local erofs snapshot cache, least-recently-used eviction; 0 disables caching")
+	snapshotCacheMaxIdle = flag.Duration("snapshot-cache-max-idle", time.Hour, "evict a cached erofs snapshot that nobody opened for this long; 0 disables the idle sweep")
+
 	packCompression = flag.Bool("pack-compression", true, "store zstd-compressed payloads in newly written pack containers; reading compressed containers is always enabled, so this is safe to turn off for one release before a rollback")
 	packedRefs      = flag.Bool("packed-refs", true, "write every ref into one packed-refs object under a compare-and-swap, instead of one object per ref; reading packed refs is always enabled, so this is safe to turn off for one release before a rollback")
 
@@ -131,6 +136,18 @@ func main() {
 		storerOpts = append(storerOpts, tigris.WithPackCache(packCache))
 	}
 
+	// The snapshot cache sits next to the pack cache, under the same parent,
+	// with its own budget. snapshot.Open downloads whole images into it.
+	var snapCache *tigris.PackCache
+	if *snapshotCacheBytes > 0 {
+		snapCache, err = tigris.NewSnapshotCache(*packCacheDir, *snapshotCacheBytes, metrics.ObserveSnapshotCache)
+		if err != nil {
+			slog.Error("can't create snapshot cache", "pack_cache_dir", *packCacheDir, "err", err)
+			os.Exit(1)
+		}
+		storerOpts = append(storerOpts, tigris.WithSnapshotCache(snapCache))
+	}
+
 	// Every repository lives in the same bucket as daemon system state, keyed
 	// by an "orgID/name" prefix (repofs.BucketResolver via tigrisBase.Scoped).
 	base, err := tigris.New(ctx, *bucket, storerOpts...)
@@ -146,6 +163,10 @@ func main() {
 		allowHooks:  *allowHooks,
 		hookTimeout: *hookTimeout,
 		pushes:      newPushLimiter(*maxConcurrentPushes, *pushQueueTimeout),
+
+		snapshots:       *erofsSnapshots,
+		snapshotTimeout: *snapshotTimeout,
+		snapshotTmpDir:  *packCacheDir,
 	}
 
 	slog.Info("objgitd listening",
@@ -157,11 +178,32 @@ func main() {
 		"allow_push", *allowPush,
 		"allow_hooks", *allowHooks,
 		"pack_cache_bytes", *packCacheBytes,
+		"erofs_snapshots", *erofsSnapshots,
+		"snapshot_cache_bytes", *snapshotCacheBytes,
 		"max_concurrent_pushes", *maxConcurrentPushes,
 		"push_queue_timeout", *pushQueueTimeout,
 	)
 
 	g, gCtx := errgroup.WithContext(ctx)
+
+	// The budget alone only evicts when a new image arrives. This sweep also
+	// cycles out images that nobody opened for a while.
+	if snapCache != nil && *snapshotCacheMaxIdle > 0 {
+		g.Go(func() error {
+			tick := time.NewTicker(*snapshotCacheMaxIdle / 4)
+			defer tick.Stop()
+			for {
+				select {
+				case <-gCtx.Done():
+					return nil
+				case <-tick.C:
+					if n := snapCache.EvictIdle(*snapshotCacheMaxIdle); n > 0 {
+						slog.Debug("evicted idle snapshots", "count", n)
+					}
+				}
+			}
+		})
+	}
 
 	if *metricsBind != "" {
 		ln, err := net.Listen("tcp", *metricsBind)
@@ -239,6 +281,9 @@ func main() {
 	// handed out keep working, so this is safe even mid-request.
 	if cerr := packCache.Cleanup(); cerr != nil {
 		slog.Warn("can't remove the pack cache directory", "err", cerr)
+	}
+	if cerr := snapCache.Cleanup(); cerr != nil {
+		slog.Warn("can't remove the snapshot cache directory", "err", cerr)
 	}
 
 	if err != nil {
