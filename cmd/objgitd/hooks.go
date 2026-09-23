@@ -29,55 +29,12 @@ import (
 	"tangled.org/xeiaso.net/kefka/command/registry/coreutils"
 )
 
-// refUpdate records a single branch ref change observed across a receive-pack.
+// refUpdate records a single branch ref change applied by a receive-pack.
 // A zero Old means the branch was created; a zero New means it was deleted.
 type refUpdate struct {
 	Name plumbing.ReferenceName
 	Old  plumbing.Hash
 	New  plumbing.Hash
-}
-
-// snapshotRefs returns the current hash of every branch ref in st. go-git's
-// transport.ReceivePack does not report which refs it changed, so we diff a
-// snapshot taken before the push against one taken after.
-func snapshotRefs(st storage.Storer) (map[plumbing.ReferenceName]plumbing.Hash, error) {
-	it, err := st.IterReferences()
-	if err != nil {
-		return nil, err
-	}
-	defer it.Close()
-
-	out := map[plumbing.ReferenceName]plumbing.Hash{}
-	err = it.ForEach(func(r *plumbing.Reference) error {
-		if r.Type() == plumbing.HashReference && r.Name().IsBranch() {
-			out[r.Name()] = r.Hash()
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-// diffRefs computes the branch ref changes between two snapshots.
-func diffRefs(before, after map[plumbing.ReferenceName]plumbing.Hash) []refUpdate {
-	var updates []refUpdate
-	for name, newHash := range after {
-		oldHash, ok := before[name]
-		switch {
-		case !ok:
-			updates = append(updates, refUpdate{Name: name, Old: plumbing.ZeroHash, New: newHash})
-		case oldHash != newHash:
-			updates = append(updates, refUpdate{Name: name, Old: oldHash, New: newHash})
-		}
-	}
-	for name, oldHash := range before {
-		if _, ok := after[name]; !ok {
-			updates = append(updates, refUpdate{Name: name, Old: oldHash, New: plumbing.ZeroHash})
-		}
-	}
-	return updates
 }
 
 // receivePack runs the receive-pack service and dispatches post-receive work

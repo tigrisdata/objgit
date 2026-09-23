@@ -16,63 +16,9 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v6/memfs"
-	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/tigrisdata/objgit/internal/auth"
 	"github.com/tigrisdata/objgit/internal/repofs"
 )
-
-func TestDiffRefs(t *testing.T) {
-	main := plumbing.NewBranchReferenceName("main")
-	dev := plumbing.NewBranchReferenceName("dev")
-	h1 := plumbing.NewHash("1111111111111111111111111111111111111111")
-	h2 := plumbing.NewHash("2222222222222222222222222222222222222222")
-
-	tests := []struct {
-		name   string
-		before map[plumbing.ReferenceName]plumbing.Hash
-		after  map[plumbing.ReferenceName]plumbing.Hash
-		want   []refUpdate
-	}{
-		{
-			name:   "created",
-			before: map[plumbing.ReferenceName]plumbing.Hash{},
-			after:  map[plumbing.ReferenceName]plumbing.Hash{main: h1},
-			want:   []refUpdate{{Name: main, Old: plumbing.ZeroHash, New: h1}},
-		},
-		{
-			name:   "updated",
-			before: map[plumbing.ReferenceName]plumbing.Hash{main: h1},
-			after:  map[plumbing.ReferenceName]plumbing.Hash{main: h2},
-			want:   []refUpdate{{Name: main, Old: h1, New: h2}},
-		},
-		{
-			name:   "deleted",
-			before: map[plumbing.ReferenceName]plumbing.Hash{main: h1, dev: h2},
-			after:  map[plumbing.ReferenceName]plumbing.Hash{main: h1},
-			want:   []refUpdate{{Name: dev, Old: h2, New: plumbing.ZeroHash}},
-		},
-		{
-			name:   "unchanged",
-			before: map[plumbing.ReferenceName]plumbing.Hash{main: h1},
-			after:  map[plumbing.ReferenceName]plumbing.Hash{main: h1},
-			want:   nil,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := diffRefs(tt.before, tt.after)
-			if len(got) != len(tt.want) {
-				t.Fatalf("diffRefs = %v, want %v", got, tt.want)
-			}
-			for i, u := range got {
-				if u != tt.want[i] {
-					t.Errorf("update[%d] = %+v, want %+v", i, u, tt.want[i])
-				}
-			}
-		})
-	}
-}
 
 // syncBuffer is a goroutine-safe buffer for capturing slog output while the
 // server handles a push on another goroutine.
