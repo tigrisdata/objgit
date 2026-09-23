@@ -1,0 +1,78 @@
+# Kustomize deployment for objgitd, the objgit daemon.
+#
+# 1. CI builds an image on every commit and publishes it to
+#    ghcr.io/tigrisdata/objgit. Use those tags, or build the repo Dockerfile
+#    and push it to a registry you control. Then update the image reference
+#    in deployment.yaml.
+# 2. Set BUCKET in the configMapGenerator below.
+# 3. Set the Tigris credentials in the secretGenerator below. For IRSA or
+#    workload identity, see docs/usage/kubernetes.md.
+# 4. kubectl apply -k manifest/
+#
+# See docs/usage/kubernetes.md for the full walkthrough.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: objgit
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - pvc.yaml
+  - deployment.yaml
+  - service.yaml
+  - service-metrics.yaml
+
+# Pin an immutable image tag for a fixed deployment. The Deployment references
+# :latest, which Kubernetes pulls on every pod start. Uncomment and set the
+# tag to a specific commit:
+#
+# images:
+#   - name: ghcr.io/tigrisdata/objgit
+#     newTag: sha-a1b2c3d
+
+configMapGenerator:
+  # Daemon configuration. flagenv maps every flag to UPPER_SNAKE_CASE, and
+  # environment variables override the flag defaults (README "Setup
+  # instructions").
+  - name: objgitd-config
+    literals:
+      # Required: the Tigris bucket that holds every repository and the SSH
+      # host key. objgitd does not start when this value is empty.
+      - BUCKET=replace-me
+      # Transports. HTTP and git:// are on by default. SSH needs a bind value
+      # to turn on. Every bind is a pod port named below.
+      - HTTP_BIND=:8080
+      - GIT_BIND=:9418
+      - SSH_BIND=:2222
+      # Prometheus /metrics (and pprof), exposed on the objgit-metrics
+      # Service. The probes in deployment.yaml read /healthz on this
+      # listener. An empty value therefore breaks every probe, because it
+      # disables the listener.
+      - METRICS_BIND=:9090
+      # The pack cache lives on the objgitd-pack-cache PVC. 14 GiB (15032385536
+      # bytes) leaves headroom under the 16Gi claim.
+      - PACK_CACHE_DIR=/var/cache/objgit
+      - PACK_CACHE_BYTES=15032385536
+      # Anonymous pushes over every transport. Set false for a read-only
+      # mirror. There is no other authentication yet (README "Notable
+      # features"). Keep the Service cluster-internal, or put your own
+      # authentication in front.
+      - ALLOW_PUSH=true
+      # Run .objgit/hooks/receive-pack from the repository after a push. See
+      # docs/usage/hooks.md.
+      - ALLOW_HOOKS=false
+      - SLOG_LEVEL=INFO
+
+secretGenerator:
+  # Static Tigris credentials. The storage-go client prefers these over the
+  # AWS SDK default chain. Replace the placeholder values before you apply.
+  #
+  # To avoid a long-lived keypair: delete this generator and the secretRef in
+  # deployment.yaml (it is optional). Then annotate the objgitd
+  # ServiceAccount for IRSA or workload identity. The default chain finds
+  # the role on its own.
+  - name: objgitd-tigris
+    literals:
+      - TIGRIS_STORAGE_ACCESS_KEY_ID=replace-me
+      - TIGRIS_STORAGE_SECRET_ACCESS_KEY=replace-me

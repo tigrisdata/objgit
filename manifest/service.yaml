@@ -1,0 +1,25 @@
+# The git transports: smart HTTP, git://, and SSH. Metrics is deliberately
+# absent. It lives on the objgit-metrics Service, so a scrape ACL or a
+# NetworkPolicy can gate it separately from git traffic.
+apiVersion: v1
+kind: Service
+metadata:
+  name: objgit
+  labels:
+    app.kubernetes.io/name: objgitd
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: objgit
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: objgitd
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+    - name: git
+      port: 9418
+      targetPort: git
+    - name: ssh
+      port: 22
+      targetPort: ssh

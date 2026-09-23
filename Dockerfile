@@ -1,7 +1,14 @@
 # syntax=docker/dockerfile:1
 
 # --- build stage -------------------------------------------------------------
-FROM golang:1.26 AS build
+# Pin the build stage to the platform of the runner ($BUILDPLATFORM) and
+# cross-compile through TARGETOS and TARGETARCH. One native runner then
+# builds every target platform, and no emulation is necessary. A plain
+# `docker build` sets these values to the host platform, which keeps the
+# previous behavior.
+FROM --platform=$BUILDPLATFORM golang:1.26 AS build
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /src
 
@@ -16,7 +23,8 @@ COPY . .
 # protocol natively (no `git` binary at runtime).
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w" \
     -o /objgitd ./cmd/objgitd
 
 # --- runtime stage -----------------------------------------------------------
