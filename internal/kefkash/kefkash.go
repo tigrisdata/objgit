@@ -1,8 +1,8 @@
 // Package kefkash wires a billy.Filesystem into an mvdan.cc/sh interpreter the
-// way the kefka virtual shell does. The handler constructors are vendored from
-// kefka's internal/billysh (github.com/Xe/kefka), which is not importable
-// because it lives under internal/. They depend only on kefka's public
-// command/registry package.
+// way the kefka virtual shell does. The handler constructors mirror kefka's
+// billysh package (github.com/Xe/kefka/billysh), which was internal when this
+// package was first vendored. It stays a local fork for the deviation below;
+// importing upstream billysh directly would break /tmp redirections.
 //
 // One deliberate deviation from upstream: FsysOpenHandler permits write opens
 // and delegates them to the filesystem's OpenFile. objgit hands the sandbox a
