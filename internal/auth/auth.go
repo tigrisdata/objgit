@@ -87,10 +87,13 @@ type Authorizer interface {
 	Authorize(ctx context.Context, req Request) Decision
 }
 
-// AllowAnonymous is the permissive default: read for everyone, write only when
-// AllowWrite is set. "Dangerously allow everything the server is configured to
-// allow" — never more open than the -allow-push gate. It ignores the credential
-// entirely and never returns Unauthenticated.
+// AllowAnonymous is the permissive default: read and admin for everyone, write
+// only when AllowWrite is set. It ignores the credential entirely and never
+// returns Unauthenticated.
+//
+// TODO: Admin is granted to everyone as a temporary measure. This exposes
+// every repository's webhook signing secret to any client. Replace it with an
+// ACL-backed authorizer.
 type AllowAnonymous struct{ AllowWrite bool }
 
 func (a AllowAnonymous) Authorize(_ context.Context, req Request) Decision {
@@ -102,6 +105,8 @@ func (a AllowAnonymous) Authorize(_ context.Context, req Request) Decision {
 			return Allow
 		}
 		return Deny
+	case Admin:
+		return Allow
 	default:
 		return Deny
 	}

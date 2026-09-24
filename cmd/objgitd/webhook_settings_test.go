@@ -9,12 +9,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/go-git/go-billy/v6/memfs"
+	"github.com/go-git/go-billy/v6/util"
+	settingsv1 "github.com/tigrisdata/objgit/gen/tigrisdata/objgit/webhooks/v1"
 	"github.com/tigrisdata/objgit/internal/auth"
 	"github.com/tigrisdata/objgit/internal/webhook"
 	gossh "golang.org/x/crypto/ssh"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 type authorizeFunc func(context.Context, auth.Request) auth.Decision
@@ -52,7 +57,7 @@ func TestSSHWebhookSettingsAuthorization(t *testing.T) {
 		authz      auth.Authorizer
 		wantSecret bool
 	}{
-		{"default denies", auth.AllowAnonymous{AllowWrite: true}, false},
+		{"default allows", auth.AllowAnonymous{AllowWrite: true}, true},
 		{"authorizer allows", authz, true},
 	}
 	for _, tt := range tests {
@@ -113,8 +118,8 @@ func TestHTTPWebhookSettingsAuthorization(t *testing.T) {
 		wantStatus     int
 		wantSecret     bool
 	}{
-		{"anonymous default", auth.AllowAnonymous{AllowWrite: true}, "", "", "/_objgit/webhooks/acme/widgets/settings", http.StatusForbidden, false},
-		{"basic default", auth.AllowAnonymous{AllowWrite: true}, "operator", "admin-password", "/_objgit/webhooks/acme/widgets/settings", http.StatusForbidden, false},
+		{"anonymous default", auth.AllowAnonymous{AllowWrite: true}, "", "", "/_objgit/webhooks/acme/widgets/settings", http.StatusOK, true},
+		{"basic default", auth.AllowAnonymous{AllowWrite: true}, "operator", "admin-password", "/_objgit/webhooks/acme/widgets/settings", http.StatusOK, true},
 		{"wrong credential", allowed, "operator", "wrong", "/_objgit/webhooks/acme/widgets/settings", http.StatusUnauthorized, false},
 		{"admin credential", allowed, "operator", "admin-password", "/_objgit/webhooks/acme/widgets/settings", http.StatusOK, true},
 		{"missing settings", allowed, "operator", "admin-password", "/_objgit/webhooks/acme/missing/settings", http.StatusNotFound, false},
@@ -136,6 +141,92 @@ func TestHTTPWebhookSettingsAuthorization(t *testing.T) {
 			}
 			if got := bytes.Contains(w.Body.Bytes(), []byte("test-secret")); got != tt.wantSecret {
 				t.Errorf("secret present = %v, want %v", got, tt.wantSecret)
+			}
+		})
+	}
+}
+
+func TestSSHWebhookSet(t *testing.T) {
+	checkSSHBinaries(t)
+	deny := authorizeFunc(func(context.Context, auth.Request) auth.Decision { return auth.Deny })
+	tests := []struct {
+		name       string
+		existing   string // "", "valid", or "corrupt"
+		authz      auth.Authorizer
+		args       []string
+		wantErr    string // stderr substring; empty means success
+		wantURL    string
+		keepSecret bool
+	}{
+		{name: "create", args: []string{"acme/widgets", "-url", "https://example.com/new"}, wantURL: "https://example.com/new"},
+		{name: "change URL keeps secret", existing: "valid", args: []string{"acme/widgets", "-url", "https://example.com/new"}, wantURL: "https://example.com/new", keepSecret: true},
+		{name: "rotate keeps URL", existing: "valid", args: []string{"acme/widgets", "-rotate-secret"}, wantURL: "https://example.com/events"},
+		{name: "replace unreadable", existing: "corrupt", args: []string{"acme/widgets", "-url", "https://example.com/new", "-rotate-secret"}, wantURL: "https://example.com/new"},
+		{name: "partial update of unreadable", existing: "corrupt", args: []string{"acme/widgets", "-url", "https://example.com/new"}, wantErr: "cannot read webhook settings"},
+		{name: "no URL", args: []string{"acme/widgets"}, wantErr: "no webhook URL"},
+		{name: "plain HTTP", existing: "valid", args: []string{"acme/widgets", "-url", "http://example.com/new"}, wantErr: "must use HTTPS"},
+		{name: "unknown flag", existing: "valid", args: []string{"acme/widgets", "-secret", "x"}, wantErr: "flag provided but not defined"},
+		{name: "extra argument", existing: "valid", args: []string{"acme/widgets", "-url", "https://example.com/new", "extra"}, wantErr: "usage:"},
+		{name: "no repository", args: []string{"-url", "https://example.com/new"}, wantErr: "usage:"},
+		{name: "invalid repository", args: []string{"../widgets", "-url", "https://example.com/new"}, wantErr: "invalid repository"},
+		{name: "denied", existing: "valid", authz: deny, args: []string{"acme/widgets", "-url", "https://example.com/new"}, wantErr: "admin access denied"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := memfs.New()
+			switch tt.existing {
+			case "valid":
+				writeWebhookSettings(t, fs, "acme/widgets", "https://example.com/events")
+			case "corrupt":
+				settingsPath, _ := webhook.SettingsPath("acme/widgets")
+				if err := util.WriteFile(fs, settingsPath, []byte("{not json"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, _ := util.ReadFile(fs, ".objgit/webhooks/acme/widgets/settings.json")
+			addr, _ := startSSHServer(t, false, false, func(d *daemon) {
+				d.sysFS = fs
+				if tt.authz != nil {
+					d.authz = tt.authz
+				}
+			})
+
+			stdout, stderr, code := runSSHCommand(t, addr, append([]string{"objgit-webhook-set"}, tt.args...)...)
+			if tt.wantErr != "" {
+				if code == 0 {
+					t.Fatalf("command succeeded, want error %q\nstdout: %s", tt.wantErr, stdout)
+				}
+				if !strings.Contains(stderr, tt.wantErr) {
+					t.Errorf("stderr = %q, want substring %q", stderr, tt.wantErr)
+				}
+				if after, _ := util.ReadFile(fs, ".objgit/webhooks/acme/widgets/settings.json"); !bytes.Equal(before, after) {
+					t.Errorf("failed command changed stored settings to %q", after)
+				}
+				return
+			}
+			if code != 0 {
+				t.Fatalf("exit %d\nstderr: %s", code, stderr)
+			}
+
+			var printed settingsv1.Settings
+			if err := protojson.Unmarshal([]byte(stdout), &printed); err != nil {
+				t.Fatalf("stdout is not settings JSON: %v\n%s", err, stdout)
+			}
+			stored, err := webhook.ReadSettings(fs, "acme/widgets")
+			if err != nil || stored == nil {
+				t.Fatalf("ReadSettings = %v, %v", stored, err)
+			}
+			if !proto.Equal(&printed, stored) {
+				t.Errorf("printed %v, stored %v", &printed, stored)
+			}
+			if stored.GetUrl() != tt.wantURL {
+				t.Errorf("url = %q, want %q", stored.GetUrl(), tt.wantURL)
+			}
+			if gotKept := stored.GetSecret() == "test-secret"; gotKept != tt.keepSecret {
+				t.Errorf("secret = %q, keepSecret = %v", stored.GetSecret(), tt.keepSecret)
+			}
+			if !tt.keepSecret && len(stored.GetSecret()) != 64 {
+				t.Errorf("new secret %q is not 32 hex-encoded bytes", stored.GetSecret())
 			}
 		})
 	}

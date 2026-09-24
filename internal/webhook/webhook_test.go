@@ -19,6 +19,7 @@ import (
 	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/memfs"
 	pushv1 "github.com/tigrisdata/objgit/gen/tigrisdata/objgit/events/push/v1"
+	settingsv1 "github.com/tigrisdata/objgit/gen/tigrisdata/objgit/webhooks/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
@@ -287,5 +288,72 @@ func TestDeliverDoesNotExposeURLQuery(t *testing.T) {
 	}
 	if strings.Contains(fmt.Sprint(err), "hidden-token") {
 		t.Errorf("error exposed URL query: %v", err)
+	}
+}
+
+func TestWriteSettings(t *testing.T) {
+	tests := []struct {
+		name      string
+		repo      string
+		url       string
+		secret    string
+		wantError string
+	}{
+		{name: "public HTTPS", url: "https://example.com/hook", secret: "key"},
+		{name: "loopback HTTP", url: "http://127.0.0.1:1234/hook", secret: "key"},
+		{name: "bad repository", repo: "../widgets", url: "https://example.com/hook", secret: "key", wantError: "invalid repository"},
+		{name: "missing secret", url: "https://example.com/hook", wantError: "no secret"},
+		{name: "plain HTTP", url: "http://example.com/hook", secret: "key", wantError: "must use HTTPS"},
+		{name: "private IP", url: "https://10.0.0.1/hook", secret: "key", wantError: "nonpublic IP"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := tt.repo
+			if repo == "" {
+				repo = "acme/widgets"
+			}
+			fs := memfs.New()
+			want := &settingsv1.Settings{Url: tt.url, Secret: tt.secret}
+			err := WriteSettings(fs, repo, want)
+			if tt.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("error = %v, want substring %q", err, tt.wantError)
+				}
+				if _, statErr := fs.Stat(".objgit/webhooks/acme/widgets/settings.json"); statErr == nil {
+					t.Error("rejected settings were written")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := ReadSettings(fs, repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !proto.Equal(got, want) {
+				t.Errorf("ReadSettings = %v, want %v", got, want)
+			}
+			c, err := Load(fs, repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !c.Enabled(repo) {
+				t.Error("written settings did not enable delivery")
+			}
+		})
+	}
+}
+
+func TestNewSecret(t *testing.T) {
+	a, b := NewSecret(), NewSecret()
+	if len(a) != 64 {
+		t.Errorf("len(NewSecret()) = %d, want 64", len(a))
+	}
+	if _, err := hex.DecodeString(a); err != nil {
+		t.Errorf("NewSecret() = %q is not hex: %v", a, err)
+	}
+	if a == b {
+		t.Error("two secrets are equal")
 	}
 }

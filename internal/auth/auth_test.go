@@ -16,7 +16,8 @@ func TestAllowAnonymousAuthorize(t *testing.T) {
 		{name: "no-write/write", allowWrite: false, op: Write, want: Deny},
 		{name: "allow-write/read", allowWrite: true, op: Read, want: Allow},
 		{name: "allow-write/write", allowWrite: true, op: Write, want: Allow},
-		{name: "allow-write/admin", allowWrite: true, op: Admin, want: Deny},
+		{name: "no-write/admin", allowWrite: false, op: Admin, want: Allow},
+		{name: "allow-write/admin", allowWrite: true, op: Admin, want: Allow},
 	}
 
 	for _, tt := range tests {

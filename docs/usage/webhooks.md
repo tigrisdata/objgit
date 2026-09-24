@@ -23,8 +23,8 @@ logged and the push continues without webhook delivery.
 
 ## Query settings
 
-The Git HTTP and SSH listeners expose admin-only queries for the raw settings,
-including the signing secret:
+The Git HTTP and SSH listeners expose admin-only queries for the raw settings.
+The output includes the signing secret:
 
 ```sh
 curl --user 'operator:<admin-password>' \
@@ -38,11 +38,40 @@ absent; the SSH command exits with an error. Use HTTPS for the HTTP query
 because it carries a credential and a raw secret.
 
 Both queries ask the configured `internal/auth.Authorizer` for the `Admin`
-operation on that repository. The default `AllowAnonymous` authorizer denies
-`Admin`, even when `-allow-push` is set. Deploy an authorizer that checks your
-admin ACL and grants `Admin` only to eligible HTTP or SSH credentials before
-using these queries. Ordinary repository read or write permission does not
-grant access to the secret.
+operation on that repository. For now, the default `AllowAnonymous` authorizer
+allows `Admin` for all clients. Thus, any client that can reach the daemon can
+read the signing secret. To restrict access, deploy an authorizer that grants
+`Admin` only to the credentials in your admin ACL.
+
+## Change settings
+
+To change the settings of a repository, use the `objgit-webhook-set` SSH
+command:
+
+```sh
+ssh git@git.example.com objgit-webhook-set acme/widgets -url https://events.example.com/objgit
+```
+
+The command has these flags:
+
+| Flag             | Function                                                          |
+| ---------------- | ----------------------------------------------------------------- |
+| `-url`           | Sets the destination URL. The same URL rules as above apply.      |
+| `-rotate-secret` | Replaces the signing secret with a new random secret of 32 bytes. |
+
+Put the repository first, then the flags. If you do not give a flag, the
+command keeps the current value of that setting. If the repository has no
+settings, you must give `-url`. If no secret exists, the command generates
+one.
+
+The command writes the settings object and then prints it as ProtoJSON. The
+output includes the signing secret. Give this secret to the webhook receiver.
+The next push uses the new settings.
+
+If the current settings object is not valid, the command cannot keep its
+values. To replace such an object, give both `-url` and `-rotate-secret`.
+
+The command asks the `Authorizer` for the `Admin` operation, as the queries do.
 
 The settings schema is
 [settings.proto](../../proto/tigrisdata/objgit/webhooks/v1/settings.proto),
