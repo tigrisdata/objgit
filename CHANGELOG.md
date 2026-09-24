@@ -4,6 +4,12 @@
 
 - **webhooks:** add objgit-webhook-set SSH command ([#19](https://github.com/tigrisdata/objgit/issues/19)) ([6d1f575](https://github.com/tigrisdata/objgit/commit/6d1f575cafc50ebc82f947f7b9f16e7d2c5e8e76))
 
+# [1.12.0](https://github.com/tigrisdata/objgit/compare/v1.11.0...v1.12.0) (2026-09-24)
+
+### Features
+
+- **webhooks:** add objgit-webhook-set SSH command ([#19](https://github.com/tigrisdata/objgit/issues/19)) ([6d1f575](https://github.com/tigrisdata/objgit/commit/6d1f575cafc50ebc82f947f7b9f16e7d2c5e8e76))
+
 # [1.11.0](https://github.com/tigrisdata/objgit/compare/v1.10.0...v1.11.0) (2026-09-23)
 
 ### Features
