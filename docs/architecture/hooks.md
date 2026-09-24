@@ -68,9 +68,10 @@ The sandbox filesystem is an `internal/mountfs` composite of two mounts:
 
 A write outside `/tmp` fails, and a redirect into `/src` aborts the script.
 
-`internal/kefkash` vendors the unexported `billysh` handler wiring from kefka.
-Its `OpenHandler` is adapted to permit writes, so `/tmp` redirections work.
-The filesystem is what enforces the read-only `/src`.
+`internal/kefkash` mirrors kefka's `billysh` handler wiring, which was
+internal when it was vendored. Its `OpenHandler` is adapted to permit writes,
+so `/tmp` redirections work. The filesystem is what enforces the read-only
+`/src`.
 `internal/mountfs` also provides read-only directory handles for the WASI
 programs, which need to open `/` and directories below it to resolve paths.
 Open files report their full mounted path so WASI can stat them after open.
