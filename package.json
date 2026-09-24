@@ -1,6 +1,6 @@
 {
   "name": "@tigrisdata/objgit",
-  "version": "1.12.1",
+  "version": "1.13.0",
   "description": "Git backed by object storage!",
   "homepage": "https://github.com/tigrisdata/objgit#readme",
   "bugs": {

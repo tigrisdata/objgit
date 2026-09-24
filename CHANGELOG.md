@@ -1,3 +1,9 @@
+# [1.13.0](https://github.com/tigrisdata/objgit/compare/v1.12.1...v1.13.0) (2026-09-24)
+
+### Features
+
+- **ssh:** accept tags and commits for sh ([#21](https://github.com/tigrisdata/objgit/issues/21)) ([cc55047](https://github.com/tigrisdata/objgit/commit/cc55047571d15f6d3d889c6f994246125906bbf6))
+
 ## [1.12.1](https://github.com/tigrisdata/objgit/compare/v1.12.0...v1.12.1) (2026-09-24)
 
 # [1.12.0](https://github.com/tigrisdata/objgit/compare/v1.11.0...v1.12.0) (2026-09-24)
