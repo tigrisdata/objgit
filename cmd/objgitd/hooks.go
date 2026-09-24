@@ -11,6 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Xe/kefka/command/registry"
+	"github.com/Xe/kefka/command/registry/coreutils"
+	"github.com/Xe/kefka/command/registry/uutils"
+	"github.com/Xe/kefka/command/registry/wasmprog"
 	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/memfs"
 	"github.com/go-git/go-billy/v6/util"
@@ -27,10 +31,6 @@ import (
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
 	"mvdan.cc/sh/v3/syntax"
-	"tangled.org/xeiaso.net/kefka/command/registry"
-	"tangled.org/xeiaso.net/kefka/command/registry/coreutils"
-	"tangled.org/xeiaso.net/kefka/command/registry/uutils"
-	"tangled.org/xeiaso.net/kefka/command/registry/wasmprog"
 )
 
 // receivePackHook names the hook that a push runs, and so its script at

@@ -4,6 +4,7 @@ go 1.26.3
 
 require (
 	github.com/Xe/erofs v0.8.0
+	github.com/Xe/kefka v0.1.2
 	github.com/aws/aws-sdk-go-v2 v1.41.7
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.102.0
 	github.com/aws/smithy-go v1.26.0
@@ -19,7 +20,6 @@ require (
 	golang.org/x/sync v0.20.0
 	golang.org/x/term v0.43.0
 	mvdan.cc/sh/v3 v3.13.1
-	tangled.org/xeiaso.net/kefka v0.0.8
 )
 
 require (
