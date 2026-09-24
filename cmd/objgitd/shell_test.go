@@ -357,7 +357,7 @@ func TestSSHShell(t *testing.T) {
 			allowHooks: true,
 			forcePTY:   true,
 			wantCode:   1,
-			want:       []string{"usage: sh <repo> [branch]"},
+			want:       []string{"usage: sh <repo> [branch, tag, or commit]"},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

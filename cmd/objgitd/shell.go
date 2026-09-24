@@ -24,19 +24,20 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 )
 
-const shellUsage = "usage: sh <repo> [branch]"
+const shellUsage = "usage: sh <repo> [branch, tag, or commit]"
 
 // errShellInterrupt is what shellLines returns when Ctrl-C is pressed at the
 // prompt, so the parser drops the pending input.
 var errShellInterrupt = errors.New("interrupt")
 
-// shellTarget resolves the commit an sh session inspects: the tip of branch, or
-// of HEAD's branch when branch is empty. The returned update describes that
-// commit as if it had just been pushed: Old is its first parent, or the zero
-// hash for a root commit.
-func shellTarget(st storage.Storer, branch string) (refUpdate, *object.Tree, error) {
-	name := plumbing.NewBranchReferenceName(branch)
-	if branch == "" {
+// shellTarget resolves the commit an sh session inspects: a branch, tag, or
+// commit hash, or the tip of HEAD's branch when revision is empty. The
+// returned update describes that commit as if it had just been pushed: Old is
+// its first parent, or the zero hash for a root commit.
+func shellTarget(st storage.Storer, revision string) (refUpdate, *object.Tree, error) {
+	var name plumbing.ReferenceName
+	var hash plumbing.Hash
+	if revision == "" {
 		head, err := st.Reference(plumbing.HEAD)
 		if err != nil {
 			return refUpdate{}, nil, fmt.Errorf("reading HEAD: %w", err)
@@ -45,19 +46,45 @@ func shellTarget(st storage.Storer, branch string) (refUpdate, *object.Tree, err
 			return refUpdate{}, nil, errors.New("HEAD is detached; name a branch: " + shellUsage)
 		}
 		name = head.Target()
+	} else if strings.HasPrefix(revision, "refs/") {
+		name = plumbing.ReferenceName(revision)
+	} else {
+		for _, candidate := range []plumbing.ReferenceName{
+			plumbing.NewBranchReferenceName(revision),
+			plumbing.NewTagReferenceName(revision),
+		} {
+			ref, err := st.Reference(candidate)
+			if err == nil {
+				name, hash = ref.Name(), ref.Hash()
+				break
+			}
+			if !errors.Is(err, plumbing.ErrReferenceNotFound) {
+				return refUpdate{}, nil, fmt.Errorf("reading %s: %w", candidate, err)
+			}
+		}
+		if hash.IsZero() {
+			if !plumbing.IsHash(revision) {
+				return refUpdate{}, nil, fmt.Errorf("branch %q not found", revision)
+			}
+			hash = plumbing.NewHash(revision)
+			name = plumbing.ReferenceName("refs/commits/" + revision)
+		}
 	}
 
-	ref, err := st.Reference(name)
-	if errors.Is(err, plumbing.ErrReferenceNotFound) {
-		return refUpdate{}, nil, fmt.Errorf("branch %q not found", name.Short())
-	}
-	if err != nil {
-		return refUpdate{}, nil, fmt.Errorf("reading %s: %w", name, err)
+	if hash.IsZero() {
+		ref, err := st.Reference(name)
+		if errors.Is(err, plumbing.ErrReferenceNotFound) {
+			return refUpdate{}, nil, fmt.Errorf("revision %q not found", revision)
+		}
+		if err != nil {
+			return refUpdate{}, nil, fmt.Errorf("reading %s: %w", name, err)
+		}
+		hash = ref.Hash()
 	}
 
-	commit, err := object.GetCommit(st, ref.Hash())
+	commit, err := shellCommit(st, hash)
 	if err != nil {
-		return refUpdate{}, nil, fmt.Errorf("loading commit %s: %w", ref.Hash(), err)
+		return refUpdate{}, nil, fmt.Errorf("loading commit %s: %w", hash, err)
 	}
 	tree, err := commit.Tree()
 	if err != nil {
@@ -71,9 +98,34 @@ func shellTarget(st storage.Storer, branch string) (refUpdate, *object.Tree, err
 	return u, tree, nil
 }
 
-// handleShell services "sh <repo> [branch]": an interactive kefka shell with
+// shellCommit peels annotated tags until it reaches a commit. Git tags can
+// point to other tags or to non-commit objects, neither of which is a usable
+// shell checkout.
+func shellCommit(st storage.Storer, hash plumbing.Hash) (*object.Commit, error) {
+	for range 16 {
+		obj, err := st.EncodedObject(plumbing.AnyObject, hash)
+		if err != nil {
+			return nil, err
+		}
+		switch obj.Type() {
+		case plumbing.CommitObject:
+			return object.DecodeCommit(st, obj)
+		case plumbing.TagObject:
+			tag, err := object.DecodeTag(st, obj)
+			if err != nil {
+				return nil, err
+			}
+			hash = tag.Target
+		default:
+			return nil, fmt.Errorf("object %s is not a commit or tag", hash)
+		}
+	}
+	return nil, errors.New("tag chain is too deep")
+}
+
+// handleShell services "sh <repo> [revision]": an interactive kefka shell with
 // the sandbox and environment a receive-pack hook gets, filled in from the
-// branch's tip commit. It needs -allow-hooks, a PTY, and write access to the
+// selected revision's commit. It needs -allow-hooks, a PTY, and write access to the
 // repository, because only a pusher can trigger a hook.
 func (d *daemon) handleShell(s ssh.Session, args []string) {
 	fail := func(format string, a ...any) {
@@ -100,9 +152,9 @@ func (d *daemon) handleShell(s ssh.Session, args []string) {
 		fail("%v", err)
 		return
 	}
-	var branch string
+	var revision string
 	if len(args) == 2 {
-		branch = args[1]
+		revision = args[1]
 	}
 
 	var cred auth.Credential = auth.Anonymous{}
@@ -132,7 +184,7 @@ func (d *daemon) handleShell(s ssh.Session, args []string) {
 		fail("repository %q not found", ref.Path())
 		return
 	}
-	u, tree, err := shellTarget(st, branch)
+	u, tree, err := shellTarget(st, revision)
 	if err != nil {
 		metrics.ObserveGitOp("ssh", "sh", "error", start)
 		fail("%v", err)
