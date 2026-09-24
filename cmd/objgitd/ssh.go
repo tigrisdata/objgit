@@ -135,7 +135,7 @@ func (d *daemon) handleSSH(s ssh.Session) {
 	if len(cmd) < 2 {
 		fmt.Fprintln(s.Stderr(), "objgitd: this is a git SSH endpoint; interactive shells are not supported")
 		if d.allowHooks {
-			fmt.Fprintln(s.Stderr(), "objgitd: to explore the hook sandbox, run: ssh -t <host> sh <repo> [branch]")
+			fmt.Fprintln(s.Stderr(), "objgitd: to explore the hook sandbox, run: ssh -t <host> sh <repo> [revision]")
 		}
 		_ = s.Exit(1)
 		return
