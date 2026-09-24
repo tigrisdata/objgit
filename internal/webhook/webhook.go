@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -122,6 +123,47 @@ func ReadSettings(fs billy.Filesystem, repo string) (*settingsv1.Settings, error
 		return nil, fmt.Errorf("decode webhook settings %s: %w", settingsPath, err)
 	}
 	return &settings, nil
+}
+
+// NewSecret returns a random signing secret: 32 bytes, hex encoded.
+func NewSecret() string {
+	b := make([]byte, 32)
+	_, _ = rand.Read(b) // crypto/rand.Read never returns an error.
+	return hex.EncodeToString(b)
+}
+
+// WriteSettings validates settings and stores them as repo's ProtoJSON
+// settings object, replacing any earlier one. The next push reads them.
+func WriteSettings(fs billy.Filesystem, repo string, settings *settingsv1.Settings) error {
+	settingsPath, err := SettingsPath(repo)
+	if err != nil {
+		return err
+	}
+	if settings.GetSecret() == "" {
+		return errors.New("webhook settings have no secret")
+	}
+	if _, _, err := validateURL(settings.GetUrl()); err != nil {
+		return err
+	}
+	body, err := protojson.Marshal(settings)
+	if err != nil {
+		return fmt.Errorf("encode webhook settings: %w", err)
+	}
+	if err := fs.MkdirAll(path.Dir(settingsPath), 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("create webhook settings directory: %w", err)
+	}
+	f, err := fs.Create(settingsPath)
+	if err != nil {
+		return fmt.Errorf("create webhook settings %s: %w", settingsPath, err)
+	}
+	if _, err := f.Write(body); err != nil {
+		f.Close()
+		return fmt.Errorf("write webhook settings %s: %w", settingsPath, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("write webhook settings %s: %w", settingsPath, err)
+	}
+	return nil
 }
 
 // Enabled reports whether repo has a configured webhook destination.

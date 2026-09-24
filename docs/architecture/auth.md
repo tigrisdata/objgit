@@ -61,9 +61,11 @@ and stderr plus a non-zero exit status for SSH.
 ## The one implementation today
 
 `auth.AllowAnonymous{AllowWrite}` allows read for everyone. It allows write
-only when `AllowWrite` is set. It always denies `Admin`. The webhook-settings
-queries over HTTP and SSH request `Admin`; an ACL-backed authorizer must
-explicitly grant it before they reveal the raw signing secret.
+only when `AllowWrite` is set. For now, it also allows `Admin` for everyone.
+The webhook-settings commands request `Admin`: the queries over HTTP and SSH,
+and `objgit-webhook-set` over SSH. Thus, any client can read the raw signing
+secret of every repository, and change its settings. This is a
+temporary measure until an ACL-backed authorizer replaces it.
 
 `main.go` wires it as `AllowAnonymous{AllowWrite: *allowPush}`. The
 `-allow-push` flag is therefore configuration for this default, and not a
