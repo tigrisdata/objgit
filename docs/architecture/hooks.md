@@ -55,7 +55,7 @@ The script is read from the tree of the pushed commit. A branch therefore
 carries its own hook.
 
 The script runs in a **kefka** virtual shell
-(`tangled.org/xeiaso.net/kefka`). kefka is _not_ an OS sandbox. It is an
+(`github.com/Xe/kefka`). kefka is _not_ an OS sandbox. It is an
 `mvdan.cc/sh` interpreter wired to a `billy.Filesystem`, plus a fixed registry
 of Go coreutils, WASM programs, and WASM-backed uutils.
 

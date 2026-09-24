@@ -1,8 +1,8 @@
 // Package kefkash wires a billy.Filesystem into an mvdan.cc/sh interpreter the
 // way the kefka virtual shell does. The handler constructors are vendored from
-// kefka's internal/billysh (tangled.org/xeiaso.net/kefka), which is not
-// importable because it lives under internal/. They depend only on kefka's
-// public command/registry package.
+// kefka's internal/billysh (github.com/Xe/kefka), which is not importable
+// because it lives under internal/. They depend only on kefka's public
+// command/registry package.
 //
 // One deliberate deviation from upstream: FsysOpenHandler permits write opens
 // and delegates them to the filesystem's OpenFile. objgit hands the sandbox a
@@ -19,9 +19,9 @@ import (
 	"io/fs"
 	"os"
 
+	"github.com/Xe/kefka/command/registry"
 	"github.com/go-git/go-billy/v6"
 	"mvdan.cc/sh/v3/interp"
-	"tangled.org/xeiaso.net/kefka/command/registry"
 )
 
 // FsysStatHandler resolves stat calls against fsys, honouring followSymlinks
