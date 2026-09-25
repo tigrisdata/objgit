@@ -637,17 +637,12 @@ type packFixture struct {
 	byHash map[plumbing.Hash]fixtureObj
 }
 
-// gitOutput runs git in dir with an isolated config, feeding stdin if
-// non-nil, and fails the test on any error.
+// gitOutput runs git in dir, feeding stdin if non-nil, and fails the test on
+// any error. TestMain isolates git from the caller's config.
 func gitOutput(t *testing.T, dir string, stdin []byte, args ...string) []byte {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(),
-		"GIT_CONFIG_GLOBAL=/dev/null",
-		"GIT_CONFIG_SYSTEM=/dev/null",
-		"GIT_TERMINAL_PROMPT=0",
-	)
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
