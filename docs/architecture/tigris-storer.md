@@ -339,25 +339,46 @@ caps below set how much one container holds.
 It does not store the git pack format. Git packs use delta compression, so one
 read would have to resolve a chain of deltas.
 
-`PackfileWriter` instead writes the incoming pack to a scratch
-`storage/filesystem.Storage` on a local temp directory. That storage decodes
-the pack for us, so this package holds no pack-parsing code.
+`PackfileWriter` decodes the pack itself, in `indexpack.go`. That file is a
+small version of `git index-pack`. Its memory does not grow with the size of
+the history or with the size of one object. See
+[the plan](../plans/push-memory.md) for the measurements.
 
-The writer makes two passes. The first reads the hash, type, size, and delta
-base of every object, then orders them so a base always precedes the delta
-that needs it — `IterEncodedObjects` returns hash order, which gives no such
-guarantee. The second pass copies each payload into a flat `packs/<id>.bin`
-and adds one record to `packs/<id>.cue`. A record holds the hash, the type,
-the payload codec, the offset, the stored length, the raw size, and the base
-hash. `<id>` is the hex SHA-256 of the `.bin`, so the name doubles as a
-checksum. Both files upload through the same uploader as loose objects, so the
-existing `SetReference` flush covers them.
+The writer makes two passes:
+
+1. `scanPack` reads the pack as it arrives. It stages the bytes in a temp
+   file, verifies the trailer checksum, and keeps a small index entry for each
+   object: the offset, the size, the type, and the base of a delta. It keeps
+   no body.
+2. The resolver walks each delta tree depth first, from its base, so a base
+   always goes into a container before its deltas. It copies each payload into
+   a flat `packs/<id>.bin` and adds one record to `packs/<id>.cue`.
+
+A record holds the hash, the type, the payload codec, the offset, the stored
+length, the raw size, and the base hash. `<id>` is the hex SHA-256 of the
+`.bin`, so the name is also a checksum. Both files upload through the same
+uploader as loose objects, so the existing `SetReference` flush covers them.
+
+A body stays in memory only while a delta below it needs it as a base. A
+body goes to a temp file when it is larger than `bodyMemLimit` (8 MiB), or when
+the bodies in memory would pass `bodyMemBudget` (64 MiB). The delta applier
+reads its base through `io.ReaderAt`, so a base on disk is never loaded whole.
+
+`cmd/objgitd`'s `writePack` calls `ReadPack` when the writer has it. `ReadPack`
+finds the end of the pack in the same pass that stages it. `packScanner` is an
+`io.ByteReader`, so zlib never reads past the pack. On git:// and SSH the
+client keeps the connection open after the pack, so a read past the pack
+blocks.
 
 A payload is the object, or the delta the pushing client already computed for
 it. Keeping that delta is what stops every later clone from deriving one
 again: `Storer` implements `storer.DeltaObjectStorer`, so go-git's packer
 reuses the stored delta instead of running its rolling-hash search. See
 [the backend reference](../reference/tigris-backend.md#how-a-read-rebuilds-a-delta).
+
+A read walks at most `maxDeltaDepth` (50) delta links, and a client can send
+chains of up to 4095 links. The writer therefore stores an object whole when
+its stored chain is already 50 links long.
 
 A delta is only kept when its base lands in the same container. When a
 container seals between the two, the writer stores the whole object instead.

@@ -95,23 +95,24 @@ the bytes against the name.
 
 ### The write path for packs
 
-`PackfileWriter` writes the incoming pack to a scratch
-`storage/filesystem.Storage` on a local temporary directory. That storer
-decodes the pack. This package writes no pack-parsing code of its own.
+`PackfileWriter` decodes the incoming pack itself, in `indexpack.go`.
 
-The writer makes two passes over the scratch objects. The first pass
-reads the hash, the type, the size, and the delta base of each object.
-It then puts the objects in an order where a base always comes before
-the delta that needs it. This order is necessary because
-`IterEncodedObjects` returns objects in hash order.
+The first pass reads the pack as it arrives. It stages the bytes in a
+temporary file and verifies the trailer checksum. It keeps a small index
+entry for each object, and it keeps no body.
 
-The second pass copies each payload into the `.bin` and adds one record
-to the `.cue`. The writer keeps the delta of the client when the base of
-that delta is already in the container under construction. If the base
-is not in that container, the writer stores the whole object instead.
-This rule keeps every container complete on its own.
+The second pass walks each delta tree depth first, from its base. A base
+therefore always comes before the deltas that need it. The pass copies
+each payload into the `.bin` and adds one record to the `.cue`. The writer
+keeps the delta of the client when the base of that delta is already in
+the container under construction. If the base is not in that container,
+the writer stores the whole object instead. This rule keeps every
+container complete on its own.
 
-The writer then deletes the scratch directory. The two files upload
+The writer also stores the whole object when the stored chain is already
+`maxDeltaDepth` (50) links long. A read walks no more links than that.
+
+The writer then deletes its temporary files. The two files upload
 asynchronously. `SetReference` waits for those uploads, so a ref never
 points to a pack that the bucket does not hold.
 
