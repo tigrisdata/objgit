@@ -20,6 +20,7 @@ require (
 	golang.org/x/sync v0.20.0
 	golang.org/x/term v0.43.0
 	mvdan.cc/sh/v3 v3.13.1
+	sigs.k8s.io/yaml v1.6.0
 )
 
 require (
