@@ -1,0 +1,14 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: x-m-
+  namespace: ci
+
+spec:
+  params:
+    - name: commit
+      value: master
+    - name: branch
+      value: master
+  pipelineRef:
+    name: xe-x-build-test
