@@ -24,6 +24,9 @@ jobs:
         with:
           persist-credentials: false
           fetch-tags: true
+          # internal/kustomize/kustomize.wasm is a Git LFS object. Without
+          # it, the build embeds the pointer file.
+          lfs: true
 
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:

@@ -219,7 +219,7 @@ func (d *daemon) handleShell(s ssh.Session, args []string) {
 		}
 	}()
 
-	sh, err := newHookShell(tree, changes, hookEnv(ref.Path(), receivePackHook, u, changes), nil, t, t)
+	sh, err := newHookShell(tree, changes, hookEnv(ref.Path(), receivePackHook, u, changes), d.kube, hookOrigin(ref.Path(), u), nil, t, t)
 	if err != nil {
 		metrics.ObserveGitOp("ssh", "sh", "error", start)
 		log.Error("ssh shell: build shell", "err", err)

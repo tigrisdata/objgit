@@ -25,6 +25,7 @@ import (
 	"github.com/tigrisdata/objgit"
 	"github.com/tigrisdata/objgit/internal"
 	"github.com/tigrisdata/objgit/internal/auth"
+	"github.com/tigrisdata/objgit/internal/kube"
 	"github.com/tigrisdata/objgit/internal/lfs"
 	"github.com/tigrisdata/objgit/internal/metrics"
 	"github.com/tigrisdata/objgit/internal/repofs"
@@ -46,6 +47,8 @@ var (
 
 	allowHooks  = flag.Bool("allow-hooks", false, "run .objgit/hooks/receive-pack in a sandbox after a successful push")
 	hookTimeout = flag.Duration("hook-timeout", 60*time.Second, "wall-clock limit for a single hook run")
+
+	allowKubernetes = flag.Bool("allow-kubernetes", false, "enable the kube:apply and tekton:pipelinerun commands in hooks and the SSH sh command; they act with the pod's in-cluster ServiceAccount, so anybody who can push a hook gets its Kubernetes permissions. Needs -allow-hooks")
 
 	packCacheDir   = flag.String("pack-cache-dir", "", "parent directory for the local pack cache; empty uses the OS temp directory")
 	packCacheBytes = flag.Int64("pack-cache-bytes", 2<<30, "disk budget for the local pack cache, least-recently-used eviction; 0 disables caching")
@@ -114,6 +117,11 @@ func main() {
 			slog.Error("-allow-lfs with -ssh-bind needs -external-url; git-lfs-authenticate has to name a public HTTP URL")
 			os.Exit(1)
 		}
+	}
+
+	if *allowKubernetes && !*allowHooks {
+		slog.Error("-allow-kubernetes needs -allow-hooks; the Kubernetes commands only run in hooks and the SSH sh command")
+		os.Exit(1)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -198,6 +206,15 @@ func main() {
 		snapshotTmpDir:  *packCacheDir,
 	}
 
+	if *allowKubernetes {
+		kc, err := kube.InCluster()
+		if err != nil {
+			slog.Error("-allow-kubernetes needs an in-cluster ServiceAccount", "err", err)
+			os.Exit(1)
+		}
+		d.kube = kc
+	}
+
 	if *allowLFS {
 		// The store talks to the bucket, so it gets the hardened client like
 		// every other request path. rawClient survives only for the presigner:
@@ -222,6 +239,7 @@ func main() {
 		"bucket", *bucket,
 		"allow_push", *allowPush,
 		"allow_hooks", *allowHooks,
+		"allow_kubernetes", *allowKubernetes,
 		"allow_lfs", *allowLFS,
 		"external_url", *externalURL,
 		"pack_cache_bytes", *packCacheBytes,

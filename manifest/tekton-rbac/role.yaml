@@ -1,0 +1,39 @@
+# kube:apply uses Server-Side Apply. Kubernetes checks "create" when the
+# object does not exist yet, and "patch" when it does. tekton:pipelinerun
+# only creates new runs, so pipelineruns get "create" and nothing more.
+#
+# Other kinds or namespaces in a kube:apply stream need their own Role. The
+# API server refuses them with 403 Forbidden, and the hook prints that
+# message.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: objgitd-tekton
+  namespace: ci
+  labels:
+    app.kubernetes.io/name: objgitd
+    app.kubernetes.io/part-of: objgit
+rules:
+  - apiGroups: ["tekton.dev"]
+    resources: ["pipelines", "tasks"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["tekton.dev"]
+    resources: ["pipelineruns"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: objgitd-tekton
+  namespace: ci
+  labels:
+    app.kubernetes.io/name: objgitd
+    app.kubernetes.io/part-of: objgit
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: objgitd-tekton
+subjects:
+  - kind: ServiceAccount
+    name: objgitd
+    namespace: objgit

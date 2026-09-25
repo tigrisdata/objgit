@@ -23,6 +23,8 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/storage"
 	"github.com/tigrisdata/objgit/internal/kefkash"
+	"github.com/tigrisdata/objgit/internal/kube"
+	"github.com/tigrisdata/objgit/internal/kustomize"
 	"github.com/tigrisdata/objgit/internal/metrics"
 	"github.com/tigrisdata/objgit/internal/mountfs"
 	"github.com/tigrisdata/objgit/internal/pushevents"
@@ -164,7 +166,7 @@ func (d *daemon) runHook(repoPath, service string, st storage.Storer, u refUpdat
 	}
 
 	stdin := strings.NewReader(hookStdin(u))
-	sh, err := newHookShell(tree, changes, hookEnv(repoPath, service, u, changes), stdin, stdout, stderr)
+	sh, err := newHookShell(tree, changes, hookEnv(repoPath, service, u, changes), d.kube, hookOrigin(repoPath, u), stdin, stdout, stderr)
 	if err != nil {
 		log.Error("hook: build shell", "err", err)
 		return
@@ -266,6 +268,18 @@ func hookEnv(repoPath, service string, u refUpdate, c hookChanges) []string {
 	}
 }
 
+// hookOrigin describes update u to the Kubernetes commands. It carries the
+// same values as the OBJGIT_* variables, but a script cannot change it. The
+// SSH sh shell can target a tag or a commit, so Branch is set only for a
+// branch.
+func hookOrigin(repoPath string, u refUpdate) kube.Origin {
+	o := kube.Origin{Repo: repoPath, Ref: u.Name.String(), Commit: u.New.String()}
+	if u.Name.IsBranch() {
+		o.Branch = u.Name.Short()
+	}
+	return o
+}
+
 // hookStdin mirrors git's post-receive stdin for update u: "<old> <new> <ref>\n".
 func hookStdin(u refUpdate) string {
 	return u.Old.String() + " " + u.New.String() + " " + u.Name.String() + "\n"
@@ -274,8 +288,10 @@ func hookStdin(u refUpdate) string {
 // newHookShell builds the kefka sandbox a hook runs in: /src is a lazy
 // read-only view of tree, /tmp is writable scratch that holds hookChangesFile,
 // and the shell starts in /src with env. Both push hooks and the SSH sh command
-// use it, so the two environments cannot drift apart.
-func newHookShell(tree *object.Tree, changes hookChanges, env []string, stdin io.Reader, stdout, stderr io.Writer) (*interp.Runner, error) {
+// use it, so the two environments cannot drift apart. kc backs kube:apply and
+// tekton:pipelinerun, which act for origin; nil registers stubs that say how
+// to turn them on.
+func newHookShell(tree *object.Tree, changes hookChanges, env []string, kc *kube.Client, origin kube.Origin, stdin io.Reader, stdout, stderr io.Writer) (*interp.Runner, error) {
 	fsys := mountfs.New(map[string]billy.Filesystem{
 		"src": treefs.New(tree),
 		"tmp": memfs.New(),
@@ -288,6 +304,8 @@ func newHookShell(tree *object.Tree, changes hookChanges, env []string, stdin io
 	coreutils.Register(reg)
 	wasmprog.Register(reg)
 	uutils.Register(reg)
+	kustomize.Register(reg)
+	kube.Register(reg, kc, origin)
 	if err := reg.Chdir(fsys, "/src"); err != nil {
 		return nil, fmt.Errorf("chdir /src: %w", err)
 	}
