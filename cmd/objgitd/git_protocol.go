@@ -13,6 +13,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/storage"
 	"github.com/tigrisdata/objgit/internal/auth"
+	"github.com/tigrisdata/objgit/internal/kube"
 	"github.com/tigrisdata/objgit/internal/metrics"
 	"github.com/tigrisdata/objgit/internal/repofs"
 )
@@ -72,6 +73,11 @@ type daemon struct {
 	// registers no LFS route, so the feature reads as a 404 from outside
 	// instead of as a broken endpoint.
 	lfs *lfsService
+
+	// kube is the Kubernetes API client behind the kube:apply and
+	// tekton:pipelinerun hook commands, nil when -allow-kubernetes is unset.
+	// A nil kube registers stubs that name the flag.
+	kube *kube.Client
 }
 
 // storerFor reports whether a repository already exists at st, returning st
