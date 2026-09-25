@@ -1,0 +1,19 @@
+# Example RBAC for the kube:apply and tekton:pipelinerun hook commands
+# (objgitd -allow-kubernetes). It lets the objgitd ServiceAccount in the
+# objgit namespace manage Tekton Pipelines and Tasks, and create
+# PipelineRuns, in the ci namespace. Nothing else.
+#
+# Apply it separately from manifest/:
+#
+#   kubectl apply -k manifest/tekton-rbac/
+#
+# This directory has no namespace: field on purpose. The Role and the
+# RoleBinding go in ci, and the subject stays in objgit. The namespace:
+# objgit field of manifest/kustomization.yaml would move them all.
+#
+# See docs/usage/kubernetes-hooks.md.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - role.yaml

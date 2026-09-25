@@ -2,7 +2,8 @@
 // discovery for a fixed set of resources, stores objects in memory, and
 // answers Server-Side Apply, create, and get. It is not a conformant API
 // server: apply replaces the whole object, and a conflict is any apply over
-// an object that another field manager owns.
+// an object that another field manager owns. Its RBAC checks match a real
+// server's verbs, which internal/kube's TestCluster confirms.
 package kubetest
 
 import (
@@ -237,12 +238,10 @@ func (s *Server) apply(w http.ResponseWriter, r *http.Request, res Resource, ns,
 		status(w, http.StatusBadRequest, "BadRequest", "fieldManager is required for apply requests")
 		return
 	}
+	// Like a real API server: every apply needs patch, and an apply that
+	// creates the object needs create as well.
 	existing, exists := s.lookup(r.URL.Path)
-	verb := "patch"
-	if !exists {
-		verb = "create"
-	}
-	if s.forbidden(w, verb, res, ns, name) {
+	if s.forbidden(w, "patch", res, ns, name) || (!exists && s.forbidden(w, "create", res, ns, name)) {
 		return
 	}
 	if exists && existing.manager != manager && r.URL.Query().Get("force") != "true" {

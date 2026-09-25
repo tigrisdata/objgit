@@ -82,6 +82,15 @@ func TestApply(t *testing.T) {
 			wantCode: http.StatusForbidden,
 		},
 		{
+			// A real API server checks patch for every apply, and create as
+			// well when the object is new.
+			name:     "RBAC denial of patch on a new object",
+			setup:    func(s *kubetest.Server) { s.Deny("patch", "pipelines") },
+			obj:      obj("tekton.dev/v1", "Pipeline", "ci", "build"),
+			wantPath: "/apis/tekton.dev/v1/namespaces/ci/pipelines/build",
+			wantCode: http.StatusForbidden,
+		},
+		{
 			name:    "unknown kind",
 			obj:     obj("v1", "Widget", "", "w"),
 			wantErr: `no resource of kind "Widget" in v1`,
