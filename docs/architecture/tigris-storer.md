@@ -438,6 +438,41 @@ Reads check three tiers, in this order:
 The pack index is built once for each `Storer`, from the `packs/*.cue` files.
 Those files are small, and no `.bin` body is read to build it.
 
+### The pack index (`packtable.go`)
+
+The index is a list of sorted tables, and not a map. A table holds the hashes
+of its records in one `[]byte`, and a 40-byte `tableRec` for each record. That
+is about 60 bytes for each object with SHA-1. The map it replaced took about
+210 bytes. For golang/go, a cold build holds 40 MiB of tables, against about
+180 MiB of map.
+
+A `tableRec` holds a pack number and not a pack id, and the base of a delta as
+a record number and not a hash. A base in another table goes in the small
+`farBase` map. The writer keeps a base and its delta in one container, so that
+map is almost always empty.
+
+The cold build parses each `.cue` into a table and then drops its records. It
+then merges all of the tables into one. Each container that a push registers
+adds one table. When there are more than `maxPackTables` (16) tables, the index
+merges them into one, so a lookup does at most 16 binary searches. A lookup
+searches from the newest table to the oldest, so the newest record of a hash
+wins.
+
+A table never changes after it is built. A `packSnapshot` therefore shares the
+table list, the pack ids, and the dead set with the index, and costs no copy.
+The index never edits these in place. It only appends past the length that a
+snapshot sees, or it replaces the slice or the map.
+
+`deregister` takes only a pack id. It drops a table that holds only that pack.
+In a merged table it adds the pack to the dead set, a lookup skips the record,
+and the next merge drops it. `packJob` therefore keeps no `cueRecord`s while
+its upload runs.
+
+`IterEncodedObjects` walks `packSnapshot.order`, which costs 8 bytes for each
+object, in pack order and then offset order. It yields a hash only from the
+record that the lookup returns, so it needs no set of hashes that it has
+already yielded.
+
 A packed read is one ranged `GetObject` over the record's `stored` span. There
 is no delta chain to reconstruct. When the record names the zstd codec, the
 read decompresses one frame; otherwise the bytes are already the object.

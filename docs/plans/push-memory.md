@@ -105,7 +105,7 @@ Two changes correct this:
   the next object whole. In a chain of 197 links, this stores 10 of 803 objects
   whole.
 
-## Phase 2: make the pack index compact (next)
+## Phase 2: make the pack index compact (done)
 
 After phase 1, the memory that remains grows with the number of objects, at
 about 390 bytes for each live object. For golang/go that is about 275 MiB.
@@ -166,12 +166,59 @@ from a record, so callers do not change.
    parsed records.
 5. Measure the push and a cold index build of golang/go again.
 
+### Results of phase 2
+
+The tables work as the design says, with two changes:
+
+- The iterator does not copy the entries. It keeps an 8-byte reference to each
+  record, and yields a hash only from the record that the lookup returns. This
+  removes the `seen` map, which cost more than 48 bytes for each object.
+- A snapshot shares the table list, the ids, and the dead set with the index,
+  and does not copy them. A lookup takes a snapshot, so a copy there cost a
+  clone of every pack id on every lookup.
+
+| Measurement (golang/go)          | Phase 1 | Phase 2 |
+| -------------------------------- | ------: | ------: |
+| Cold index build, live heap      | 225 MiB | 113 MiB |
+| Of which, the index itself       | 180 MiB |  40 MiB |
+| Push, peak heap                  | 521 MiB | 364 MiB |
+| Push, live heap after the upload | 274 MiB | 114 MiB |
+
+The other 73 MiB of the cold build is fixed. 45 MiB is the buffers of the
+`.cue` zstd decoder, and 28 MiB is the bodies that the S3 fake keeps.
+
+The round-trip test passes for all 708,000 objects of golang/go, and for every
+other case of phase 1. The race detector finds no race in the package.
+
+### Two changes for push time
+
+A CPU profile of the push showed that system calls took about 80% of the
+time. Two causes were in this package:
+
+- `packSegment` wrote to its file with no buffer. Each object cost at least one
+  `write` call, which was 14.7 s of a 26 s push. The segment now writes
+  through a 1 MiB buffer and counts its bytes, so `copyCompressed` needs no
+  `Seek`.
+- Each inflate read its section through a 32 KiB buffer, so a small object
+  still read 32 KiB. A section of 64 KiB or less is now read with one `ReadAt`
+  of its own length.
+
+The wall time did not change by a measurable amount, at 25 s to 28 s on a
+laptop. One `pread` for each inflate, about 1.4 million calls, now takes most
+of the time. See phase 3.
+
 ## Phase 3: work to examine later
 
 - **Index size for very large repositories.** After phase 2, about 110 bytes
-  for each object remain during a push. For 10 million objects that is about
+  for each object remain during a push: the scan index and the tables. For 10 million objects that is about
   1.1 GB. A table can live in a memory-mapped temp file, and then the kernel
   can page it out.
+- **One `pread` for each inflate.** A memory map of the staged pack removes
+  these calls. The mapped pages count in the RSS of the process, but they are
+  file pages that the kernel can drop. A `pread` puts the same pages in the
+  page cache, and cgroup accounting counts them in both cases.
+- **The `.cue` zstd decoder.** It keeps about 45 MiB of buffers after its
+  first use. A lower decoder concurrency cuts that.
 - **The zstd encoder.** It keeps 64 MiB of history for each process.
   `EncodeAll` inputs are at most `inMemoryCap` (1 MiB), except `.cue` blocks.
   A 1 MiB window cuts that to about 8 MiB. This changes the compressed bytes,
