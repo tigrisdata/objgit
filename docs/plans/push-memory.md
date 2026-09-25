@@ -65,13 +65,13 @@ where the client keeps the connection open after the pack.
 The numbers come from a local harness. It feeds a real pack to
 `PackfileWriter` over an S3 fake that discards bodies.
 
-| Push                         | Before                   | After                     |
-| ---------------------------- | ------------------------ | ------------------------- |
-| golang/go, peak heap         | more than 21 GiB         | 521 MiB                   |
-| golang/go, time              | did not complete         | 23 s                      |
-| Xe/x, peak heap              | 516 MiB                  | about 165 MiB             |
-| Xe/x, time                   | 14.7 s                   | 1.3 s                     |
-| 266 MB blob and one delta    | both bodies in memory    | 35 MiB peak heap          |
+| Push                      | Before                | After            |
+| ------------------------- | --------------------- | ---------------- |
+| golang/go, peak heap      | more than 21 GiB      | 521 MiB          |
+| golang/go, time           | did not complete      | 23 s             |
+| Xe/x, peak heap           | 516 MiB               | about 165 MiB    |
+| Xe/x, time                | 14.7 s                | 1.3 s            |
+| 266 MB blob and one delta | both bodies in memory | 35 MiB peak heap |
 
 A second test reads every object back through a new `Storer` and verifies
 its hash. It passes for all 708,000 objects of golang/go. It also passes for a
@@ -113,7 +113,7 @@ For a repository of 10 million objects, it is about 4 GB.
 
 | Part                           | Bytes per object | golang/go |
 | ------------------------------ | ---------------: | --------: |
-| `packIndex.entries` map        |         about 210 |   149 MiB |
+| `packIndex.entries` map        |        about 210 |   149 MiB |
 | `cueRecord` slices of the push |         about 70 |    48 MiB |
 | push scan index                |         about 50 |    35 MiB |
 | zstd history (fixed)           |                – |    64 MiB |
