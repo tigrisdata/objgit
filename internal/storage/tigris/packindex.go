@@ -2,14 +2,16 @@ package tigris
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"runtime"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -360,34 +362,15 @@ type packEntry struct {
 	base plumbing.Hash
 }
 
-// indexRecords folds one pack's cue records into the entry map, returning the
-// .bin's total length. Shared by register (a pack this instance just staged)
-// and ensurePacksBuilt (a pack listed out of the bucket) so the two can never
-// disagree about what an entry means. Callers hold p.mu.
-func (p *packIndex) indexRecords(id string, recs []cueRecord) int64 {
+// packExtent is the length of a pack's .bin: the end of its last payload.
+func packExtent(recs []cueRecord) int64 {
 	var size int64
 	for _, r := range recs {
-		p.entries[r.hash] = packEntry{
-			id:     id,
-			typ:    r.typ,
-			codec:  r.codec,
-			offset: r.offset,
-			stored: r.stored,
-			raw:    r.raw,
-			base:   r.base,
-		}
 		if end := r.offset + r.stored; end > size {
 			size = end
 		}
 	}
 	return size
-}
-
-// packedEntry pairs a hash with its packEntry, for iteration (a map alone
-// loses the hash as a first-class value).
-type packedEntry struct {
-	hash plumbing.Hash
-	e    packEntry
 }
 
 // packStream is the in-progress view of a whole-pack download: a descriptor
@@ -433,21 +416,66 @@ type packAccess struct {
 // descendant's — gets its own packIndex, for the same isolation reasons as
 // its uploader: one repository's pack backlog, failures, or read history can
 // never affect another's.
+//
+// The entries live in packTables (packtable.go), about 60 bytes for each
+// object. A lookup searches the tables from the newest to the oldest, so the
+// newest record of a hash wins, and a push's own writes win over the cold
+// build.
 type packIndex struct {
-	mu      sync.Mutex
-	built   bool
-	entries map[plumbing.Hash]packEntry
-	sizes   map[string]int64  // packID -> total .bin length
-	local   map[string]string // packID -> staged local .bin path while its upload is pending
-	access  map[string]*packAccess
+	mu       sync.Mutex
+	built    bool
+	hashSize int
+
+	ids    []string          // pack number -> pack id
+	idNum  map[string]uint32 // pack id -> pack number
+	tables []*packTable      // oldest first; see maxPackTables
+	// dead holds the packs that deregister removed from a table that also
+	// holds other packs. A lookup skips their records, and the next merge
+	// drops them.
+	dead map[uint32]struct{}
+
+	sizes  map[string]int64  // packID -> total .bin length
+	local  map[string]string // packID -> staged local .bin path while its upload is pending
+	access map[string]*packAccess
 }
 
-func newPackIndex() *packIndex {
+// maxPackTables bounds how many tables a lookup searches. Each container a
+// push registers adds a table. When there are more than this, addTable merges
+// them all into one.
+const maxPackTables = 16
+
+func newPackIndex(hashSize int) *packIndex {
 	return &packIndex{
-		entries: make(map[plumbing.Hash]packEntry),
-		sizes:   make(map[string]int64),
-		local:   make(map[string]string),
-		access:  make(map[string]*packAccess),
+		hashSize: hashSize,
+		idNum:    make(map[string]uint32),
+		sizes:    make(map[string]int64),
+		local:    make(map[string]string),
+		access:   make(map[string]*packAccess),
+	}
+}
+
+// packNum returns the number of pack id, and gives it one if it has none.
+// Callers hold p.mu.
+func (p *packIndex) packNum(id string) uint32 {
+	if n, ok := p.idNum[id]; ok {
+		return n
+	}
+	n := uint32(len(p.ids))
+	p.ids = append(p.ids, id)
+	p.idNum[id] = n
+	return n
+}
+
+// addTable appends t as the newest table, and merges the tables when there
+// are too many. Callers hold p.mu.
+func (p *packIndex) addTable(t *packTable) {
+	if t.len() == 0 {
+		return
+	}
+	p.tables = append(p.tables, t)
+	if len(p.tables) > maxPackTables {
+		p.tables = []*packTable{mergeTables(p.hashSize, p.tables, p.dead)}
+		p.dead = nil
 	}
 }
 
@@ -456,10 +484,22 @@ func newPackIndex() *packIndex {
 // localPath). Call it before enqueueing the upload, mirroring writer.go's
 // "register pending before enqueue" rule: a read must never race ahead of
 // the write it depends on.
+//
+// The index keeps its own copy of what it needs, so the caller can drop
+// recs after this returns.
 func (p *packIndex) register(id string, recs []cueRecord, localBin string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.sizes[id] = p.indexRecords(id, recs)
+	num := p.packNum(id)
+	if _, ok := p.dead[num]; ok {
+		// A pack that failed once and is written again is live. The map is
+		// shared with snapshots, so replace it.
+		dead := maps.Clone(p.dead)
+		delete(dead, num)
+		p.dead = dead
+	}
+	p.addTable(newPackTable(p.hashSize, num, recs))
+	p.sizes[id] = packExtent(recs)
 	p.local[id] = localBin
 }
 
@@ -474,12 +514,31 @@ func (p *packIndex) markUploaded(id string) {
 
 // deregister removes a pack that failed to upload entirely: its entries must
 // not point at a pack S3 will never have.
-func (p *packIndex) deregister(id string, recs []cueRecord) {
+func (p *packIndex) deregister(id string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for _, r := range recs {
-		if e, ok := p.entries[r.hash]; ok && e.id == id {
-			delete(p.entries, r.hash)
+	if num, ok := p.idNum[id]; ok {
+		// A new slice and a new map, never edits in place: a packSnapshot
+		// shares both.
+		kept := make([]*packTable, 0, len(p.tables))
+		shared := false
+		for _, t := range p.tables {
+			switch {
+			case t.pack == int64(num):
+				continue // this table is only that pack
+			case t.pack < 0:
+				shared = true
+			}
+			kept = append(kept, t)
+		}
+		p.tables = kept
+		if shared {
+			dead := maps.Clone(p.dead)
+			if dead == nil {
+				dead = make(map[uint32]struct{})
+			}
+			dead[num] = struct{}{}
+			p.dead = dead
 		}
 	}
 	delete(p.sizes, id)
@@ -499,25 +558,77 @@ func (p *packIndex) binSize(id string) int64 {
 	return p.sizes[id]
 }
 
-// snapshotEntries lists every indexed object, ordered by pack and then by
-// offset within that pack. The order matters because a push above either
-// write-side cap lands as several containers (see packwriter.go): map order
-// would interleave them, so a full iteration would hold every container's bulk
-// download open at once. Draining one pack at a time keeps that to one.
-func (p *packIndex) snapshotEntries() []packedEntry {
+// packSnapshot is the index as it was at one moment. The tables do not
+// change, so it needs no lock.
+//
+// It shares its slices and map with the packIndex, so taking one costs no
+// copy. That is safe because the packIndex never edits them in place: tables
+// and ids only grow past the length a snapshot sees, and a change to the
+// table list or the dead set replaces the slice or the map.
+type packSnapshot struct {
+	tables []*packTable
+	ids    []string
+	dead   map[uint32]struct{}
+}
+
+func (p *packIndex) snapshot() packSnapshot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	out := make([]packedEntry, 0, len(p.entries))
-	for h, e := range p.entries {
-		out = append(out, packedEntry{hash: h, e: e})
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].e.id != out[j].e.id {
-			return out[i].e.id < out[j].e.id
+	return packSnapshot{tables: p.tables[:len(p.tables):len(p.tables)], ids: p.ids[:len(p.ids):len(p.ids)], dead: p.dead}
+}
+
+// lookup finds the record of h: in the newest table that has it, skipping
+// dead packs.
+func (sn packSnapshot) lookup(h []byte) (ti, i int, ok bool) {
+	for ti := len(sn.tables) - 1; ti >= 0; ti-- {
+		t := sn.tables[ti]
+		i := t.find(h)
+		if i < 0 {
+			continue
 		}
-		return out[i].e.offset < out[j].e.offset
+		if _, gone := sn.dead[t.recs[i].pack]; gone {
+			continue
+		}
+		return ti, i, true
+	}
+	return 0, 0, false
+}
+
+// packRef names one record of a packSnapshot.
+type packRef struct {
+	t uint32
+	i int32
+}
+
+// order lists every live record, ordered by pack and then by offset within
+// that pack. The order matters because a push above either write-side cap
+// lands as several containers (see packwriter.go): hash order would interleave
+// them, so a full iteration would hold every container's bulk download open at
+// once. Draining one pack at a time keeps that to one.
+//
+// A hash that is in more than one pack appears more than once here. The
+// iterator yields only the record that lookup returns.
+func (sn packSnapshot) order() []packRef {
+	var n int
+	for _, t := range sn.tables {
+		n += t.len()
+	}
+	refs := make([]packRef, 0, n)
+	for ti, t := range sn.tables {
+		for i, r := range t.recs {
+			if _, gone := sn.dead[r.pack]; !gone {
+				refs = append(refs, packRef{uint32(ti), int32(i)})
+			}
+		}
+	}
+	slices.SortFunc(refs, func(a, b packRef) int {
+		ra, rb := sn.tables[a.t].recs[a.i], sn.tables[b.t].recs[b.i]
+		if c := strings.Compare(sn.ids[ra.pack], sn.ids[rb.pack]); c != 0 {
+			return c
+		}
+		return cmp.Compare(ra.offset, rb.offset)
 	})
-	return out
+	return refs
 }
 
 func (p *packIndex) getAccess(id string) *packAccess {
@@ -563,8 +674,13 @@ func (s *Storer) ensurePacksBuilt() error {
 		return fmt.Errorf("tigris: list packs: %w", err)
 	}
 
+	// Parse each .cue into a table of its own, and drop its records at once,
+	// so the cold build never holds a whole repository of cueRecords.
 	hashLen := s.oh.Size()
-	byID := make(map[string][]cueRecord)
+	var (
+		tables []*packTable
+		sizes  = make(map[string]int64)
+	)
 	for _, k := range keys {
 		if !strings.HasSuffix(k, cueSuffix) {
 			continue
@@ -579,7 +695,15 @@ func (s *Storer) ensurePacksBuilt() error {
 		if err != nil {
 			return fmt.Errorf("tigris: parse cue %s: %w", k, err)
 		}
-		byID[id] = recs
+		s.packs.mu.Lock()
+		num := s.packs.packNum(id)
+		s.packs.mu.Unlock()
+		tables = append(tables, newPackTable(hashLen, num, recs))
+		sizes[id] = packExtent(recs)
+	}
+	// One table for the whole repository makes each lookup one binary search.
+	if len(tables) > 1 {
+		tables = []*packTable{mergeTables(hashLen, tables, nil)}
 	}
 
 	s.packs.mu.Lock()
@@ -587,8 +711,17 @@ func (s *Storer) ensurePacksBuilt() error {
 	if s.packs.built {
 		return nil // lost a race with a concurrent cold build on this instance
 	}
-	for id, recs := range byID {
-		s.packs.sizes[id] = s.packs.indexRecords(id, recs)
+	// The cold tables go first, which makes them the oldest. The packs this
+	// instance registered itself are newer, so their records win.
+	s.packs.tables = append(tables, s.packs.tables...)
+	for id, n := range sizes {
+		if _, ok := s.packs.sizes[id]; !ok {
+			s.packs.sizes[id] = n
+		}
+	}
+	if len(s.packs.tables) > maxPackTables {
+		s.packs.tables = []*packTable{mergeTables(hashLen, s.packs.tables, s.packs.dead)}
+		s.packs.dead = nil
 	}
 	s.packs.built = true
 	return nil
@@ -600,10 +733,12 @@ func (s *Storer) packLookup(h plumbing.Hash) (packEntry, bool, error) {
 	if err := s.ensurePacksBuilt(); err != nil {
 		return packEntry{}, false, err
 	}
-	s.packs.mu.Lock()
-	defer s.packs.mu.Unlock()
-	e, ok := s.packs.entries[h]
-	return e, ok, nil
+	sn := s.packs.snapshot()
+	ti, i, ok := sn.lookup(h.Bytes())
+	if !ok {
+		return packEntry{}, false, nil
+	}
+	return sn.tables[ti].entry(i, sn.ids), true, nil
 }
 
 // startPackFetch kicks off the whole-container download of packs/<id>.bin in

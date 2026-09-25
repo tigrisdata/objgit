@@ -458,14 +458,13 @@ func (w *packWriter) seal(seg *packSegment) error {
 	w.s.packs.register(id, seg.recs, seg.path)
 	job := &packJob{
 		id:      id,
-		recs:    seg.recs,
 		binPath: seg.path,
 		cuePath: cuePath,
 		binSize: seg.offset,
 		cueSize: int64(len(cueBytes)),
 	}
 	if err := w.s.up.enqueue(w.s.ctx, job); err != nil {
-		w.s.packs.deregister(id, seg.recs)
+		w.s.packs.deregister(id)
 		os.Remove(seg.path)
 		os.Remove(cuePath)
 		return err
@@ -478,9 +477,12 @@ func (w *packWriter) seal(seg *packSegment) error {
 // every .cue they list) through the same uploader/bundler the loose-object
 // path uses (see upload.go), so one SetReference-triggered flush() covers
 // both kinds of upload and surfaces either kind of failure.
+//
+// It holds no cueRecords: register copied what reads need, and a failed
+// upload deregisters by id alone. The records of a large push are therefore
+// freed as soon as each container seals.
 type packJob struct {
 	id      string
-	recs    []cueRecord
 	binPath string
 	cuePath string
 	binSize int64
@@ -518,7 +520,7 @@ func (j *packJob) putFile(ctx context.Context, s *Storer, localPath, key string)
 
 func (j *packJob) done(s *Storer, err error) {
 	if err != nil {
-		s.packs.deregister(j.id, j.recs)
+		s.packs.deregister(j.id)
 	} else {
 		s.packs.markUploaded(j.id)
 	}

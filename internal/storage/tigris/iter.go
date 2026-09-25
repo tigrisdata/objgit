@@ -48,8 +48,8 @@ func (s *Storer) listKeys(prefix string) ([]string, error) {
 }
 
 // objectIter walks packed objects first — one whole pack at a time, in offset
-// order, as snapshotEntries hands them over — then resolves loose keys one HEAD
-// at a time. Laziness buys the cost profile the spec asks for: type mismatches
+// order, as packSnapshot.order hands them over — then resolves loose keys one
+// HEAD at a time. Laziness buys the cost profile the spec asks for: type mismatches
 // cost a HEAD, never a body download.
 //
 // Offset order is also what makes this cheap for a whole pack. The first packed
@@ -60,40 +60,45 @@ func (s *Storer) listKeys(prefix string) ([]string, error) {
 type objectIter struct {
 	s      *Storer
 	want   plumbing.ObjectType
-	packed []packedEntry
+	// snap and packed replace a copy of every packEntry: packed costs 8
+	// bytes for each object. A hash in more than one pack is yielded once,
+	// from the record that snap.lookup returns, and the loose walk skips any
+	// hash that snap holds, so no set of seen hashes is needed.
+	snap   packSnapshot
+	packed []packRef
 	ppos   int
 	keys   []string
 	pos    int
-	seen   map[plumbing.Hash]struct{} // packed hashes already yielded, so the loose walk can skip duplicates
 }
 
 func (s *Storer) IterEncodedObjects(t plumbing.ObjectType) (storer.EncodedObjectIter, error) {
 	if err := s.ensurePacksBuilt(); err != nil {
 		return nil, err
 	}
-	packed := s.packs.snapshotEntries()
+	snap := s.packs.snapshot()
 
 	keys, err := s.listKeys(s.prefix + objectPrefix)
 	if err != nil {
 		return nil, err
 	}
-	return &objectIter{s: s, want: t, packed: packed, keys: keys, seen: make(map[plumbing.Hash]struct{}, len(packed))}, nil
+	return &objectIter{s: s, want: t, snap: snap, packed: snap.order(), keys: keys}, nil
 }
 
 func (it *objectIter) Next() (plumbing.EncodedObject, error) {
 	for it.ppos < len(it.packed) {
-		pe := it.packed[it.ppos]
+		ref := it.packed[it.ppos]
 		it.ppos++
 
-		if _, dup := it.seen[pe.hash]; dup {
+		t := it.snap.tables[ref.t]
+		hb := t.hashAt(int(ref.i))
+		if ti, i, _ := it.snap.lookup(hb); ti != int(ref.t) || i != int(ref.i) {
+			continue // another pack holds the record that wins for this hash
+		}
+		if it.want != plumbing.AnyObject && t.recs[ref.i].typ != it.want {
 			continue
 		}
-		it.seen[pe.hash] = struct{}{}
-
-		if it.want != plumbing.AnyObject && pe.e.typ != it.want {
-			continue
-		}
-		obj, err := it.s.packObject(it.want, pe.hash, pe.e)
+		h, _ := plumbing.FromBytes(hb)
+		obj, err := it.s.packObject(it.want, h, t.entry(int(ref.i), it.snap.ids))
 		if errors.Is(err, plumbing.ErrObjectNotFound) {
 			continue // pack vanished between the index build and this read: tolerate, like the loose race below
 		}
@@ -111,8 +116,8 @@ func (it *objectIter) Next() (plumbing.EncodedObject, error) {
 		if !ok {
 			continue // junk under objects/: skip, never poison the walk
 		}
-		if _, dup := it.seen[h]; dup {
-			continue // already yielded from a pack
+		if _, _, packed := it.snap.lookup(h.Bytes()); packed {
+			continue // a pack holds it, so the packed walk dealt with it
 		}
 
 		hs, herr := it.s.headInfo(h)
