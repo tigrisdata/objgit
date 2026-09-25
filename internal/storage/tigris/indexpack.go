@@ -406,25 +406,53 @@ func (p *incomingPack) open(i int32) (io.ReadCloser, error) {
 // object in a push is inflated at least twice and a fresh reader allocates a
 // 32 KiB window each time.
 type inflater struct {
-	br *bufio.Reader
-	zr io.ReadCloser
+	br    *bufio.Reader
+	small []byte        // a whole small section, read with one ReadAt
+	sr    bytes.Reader  // over small
+	zr    io.ReadCloser // nil until first use
 }
 
 var inflaterPool sync.Pool
 
+// smallSection is the largest compressed section that getInflater reads
+// whole. Most objects are far smaller than this. Reading exactly the section
+// costs one pread of its own length, where a 32 KiB buffer read 32 KiB for
+// every object, however small.
+const smallSection = 64 << 10
+
 // getInflater reads a zlib stream from r. A reader that is an io.ByteReader
-// is used as is, so the stream is not read past its end; any other reader
-// gets a buffer, which can read ahead.
+// is used as is, so the stream is not read past its end. A small section is
+// read whole. Any other reader gets a buffer, which can read ahead.
 func getInflater(r io.Reader) (*inflater, error) {
-	src := r
 	v, _ := inflaterPool.Get().(*inflater)
 	if v == nil {
 		v = &inflater{br: bufio.NewReaderSize(nil, 32<<10)}
 	}
-	if _, ok := r.(io.ByteReader); !ok {
+
+	var src io.Reader
+	switch rr := r.(type) {
+	case io.ByteReader:
+		src = r
+	case *io.SectionReader:
+		if n := rr.Size(); n <= smallSection {
+			if int64(cap(v.small)) < n {
+				v.small = make([]byte, smallSection)
+			}
+			v.small = v.small[:n]
+			if _, err := rr.ReadAt(v.small, 0); err != nil && !errors.Is(err, io.EOF) {
+				return nil, err
+			}
+			v.sr.Reset(v.small)
+			src = &v.sr
+			break
+		}
+		v.br.Reset(r)
+		src = v.br
+	default:
 		v.br.Reset(r)
 		src = v.br
 	}
+
 	if v.zr == nil {
 		zr, err := zlib.NewReader(src)
 		if err != nil {
@@ -445,6 +473,7 @@ func (in *inflater) Read(p []byte) (int, error) { return in.zr.Read(p) }
 func (in *inflater) Close() error {
 	err := in.zr.Close()
 	in.br.Reset(nil)
+	in.sr.Reset(nil)
 	inflaterPool.Put(in)
 	return err
 }

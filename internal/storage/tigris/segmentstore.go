@@ -260,6 +260,10 @@ func (ss *segmentStore) EncodedObject(t plumbing.ObjectType, h plumbing.Hash) (p
 		return nil, plumbing.ErrObjectNotFound
 	}
 
+	// The segment buffers its writes, so the bytes can still be in the buffer.
+	if err := ref.seg.out.Flush(); err != nil {
+		return nil, fmt.Errorf("tigris: flush staging for %s: %w", h.String(), err)
+	}
 	stored := make([]byte, ref.rec.stored)
 	if _, err := ref.seg.file.ReadAt(stored, ref.rec.offset); err != nil {
 		return nil, fmt.Errorf("tigris: read %s from staging: %w", h.String(), err)

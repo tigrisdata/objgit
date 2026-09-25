@@ -174,6 +174,13 @@ type packSegment struct {
 	path   string
 	recs   []cueRecord
 	offset int64
+
+	// out buffers writes to file. Most objects are a few kilobytes, so an
+	// unbuffered file cost one write system call for each object, which was
+	// more than half of the time of a large push. written counts every byte
+	// given to out, so no Seek is needed to measure a payload.
+	out     *bufio.Writer
+	written int64
 }
 
 func newPackSegment(s *Storer) (*packSegment, error) {
@@ -181,7 +188,21 @@ func newPackSegment(s *Storer) (*packSegment, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create pack staging file: %w", err)
 	}
-	return &packSegment{s: s, file: f, path: f.Name()}, nil
+	g := &packSegment{s: s, file: f, path: f.Name()}
+	g.out = bufio.NewWriterSize(segmentFile{g}, 1<<20)
+	return g, nil
+}
+
+// segmentFile is the file under a packSegment's buffer.
+type segmentFile struct{ g *packSegment }
+
+func (w segmentFile) Write(p []byte) (int, error) { return w.g.file.Write(p) }
+
+// Write adds p to the segment's .bin, through the buffer.
+func (g *packSegment) Write(p []byte) (int, error) {
+	n, err := g.out.Write(p)
+	g.written += int64(n)
+	return n, err
 }
 
 // add appends one object to the segment's .bin — compressed or not, per
@@ -254,7 +275,7 @@ func (g *packSegment) writePayload(obj plumbing.EncodedObject) (codec uint8, raw
 			return 0, 0, 0, fmt.Errorf("read %s: %w", obj.Hash(), err)
 		}
 		body, compressed := compressBlock(plain)
-		n, err := g.file.Write(body)
+		n, err := g.Write(body)
 		if err != nil {
 			return 0, 0, 0, fmt.Errorf("write %s: %w", obj.Hash(), err)
 		}
@@ -317,7 +338,7 @@ func (g *packSegment) copyRaw(obj plumbing.EncodedObject, rd io.Reader) (int64, 
 		defer fresh.Close()
 		rd = fresh
 	}
-	n, err := io.Copy(g.file, rd)
+	n, err := io.Copy(g, rd)
 	if err != nil {
 		return n, fmt.Errorf("copy %s: %w", obj.Hash(), err)
 	}
@@ -341,13 +362,10 @@ func (g *packSegment) copyRawWithHead(obj plumbing.EncodedObject, head []byte, r
 // repository's history can still hold enough of them that the allocation
 // adds up.
 func (g *packSegment) copyCompressed(obj plumbing.EncodedObject, head []byte, rd io.Reader) (int64, int64, error) {
-	before, err := g.file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return 0, 0, fmt.Errorf("locate %s in pack staging file: %w", obj.Hash(), err)
-	}
+	before := g.written
 
 	zw := streamEncPool.Get().(*zstd.Encoder)
-	zw.Reset(g.file)
+	zw.Reset(g)
 	rawN, copyErr := io.Copy(zw, io.MultiReader(bytes.NewReader(head), rd))
 	closeErr := zw.Close()
 	streamEncPool.Put(zw)
@@ -358,16 +376,16 @@ func (g *packSegment) copyCompressed(obj plumbing.EncodedObject, head []byte, rd
 		return 0, 0, fmt.Errorf("finish compressing %s: %w", obj.Hash(), closeErr)
 	}
 
-	after, err := g.file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return 0, 0, fmt.Errorf("measure %s in pack staging file: %w", obj.Hash(), err)
-	}
-	return rawN, after - before, nil
+	return rawN, g.written - before, nil
 }
 
 // rewind discards whatever the current object wrote, returning the staging
 // file to the end of the last successfully added object.
 func (g *packSegment) rewind() error {
+	if err := g.out.Flush(); err != nil {
+		return fmt.Errorf("flush pack staging file: %w", err)
+	}
+	g.written = g.offset
 	if err := g.file.Truncate(g.offset); err != nil {
 		return fmt.Errorf("truncate pack staging file: %w", err)
 	}
@@ -419,6 +437,11 @@ func (g *packSegment) discard() {
 // the sibling .cue, and queues both for upload. It takes ownership of the
 // segment's staging files, so every error path here removes them itself.
 func (w *packWriter) seal(seg *packSegment) error {
+	if err := seg.out.Flush(); err != nil {
+		seg.file.Close()
+		os.Remove(seg.path)
+		return fmt.Errorf("tigris: flush pack staging file: %w", err)
+	}
 	if err := seg.file.Close(); err != nil {
 		os.Remove(seg.path)
 		return fmt.Errorf("tigris: close pack staging file: %w", err)
