@@ -268,6 +268,17 @@ func writePack(st storage.Storer, rd io.Reader) error {
 		return err
 	}
 
+	// A writer that reads the pack itself finds its end in the same pass that
+	// stores it. The Scanner below cannot do that in bounded memory: over a
+	// reader that cannot seek, it buffers every object's whole inflated body.
+	if pr, ok := w.(packReader); ok {
+		if err := pr.ReadPack(rd); err != nil {
+			_ = w.Close()
+			return err
+		}
+		return w.Close()
+	}
+
 	sc := packfile.NewScanner(io.TeeReader(rd, w), sopts...)
 	for sc.Scan() {
 	}
@@ -276,6 +287,12 @@ func writePack(st storage.Storer, rd io.Reader) error {
 		return err
 	}
 	return w.Close()
+}
+
+// packReader is the optional PackfileWriter surface that reads exactly one
+// packfile from r and stops at its trailer. The tigris storer has one.
+type packReader interface {
+	ReadPack(r io.Reader) error
 }
 
 // sidebandProgress writes to the sideband progress channel (band 2), which the

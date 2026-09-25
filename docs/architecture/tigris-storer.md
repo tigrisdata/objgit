@@ -339,25 +339,46 @@ caps below set how much one container holds.
 It does not store the git pack format. Git packs use delta compression, so one
 read would have to resolve a chain of deltas.
 
-`PackfileWriter` instead writes the incoming pack to a scratch
-`storage/filesystem.Storage` on a local temp directory. That storage decodes
-the pack for us, so this package holds no pack-parsing code.
+`PackfileWriter` decodes the pack itself, in `indexpack.go`. That file is a
+small version of `git index-pack`. Its memory does not grow with the size of
+the history or with the size of one object. See
+[the plan](../plans/push-memory.md) for the measurements.
 
-The writer makes two passes. The first reads the hash, type, size, and delta
-base of every object, then orders them so a base always precedes the delta
-that needs it — `IterEncodedObjects` returns hash order, which gives no such
-guarantee. The second pass copies each payload into a flat `packs/<id>.bin`
-and adds one record to `packs/<id>.cue`. A record holds the hash, the type,
-the payload codec, the offset, the stored length, the raw size, and the base
-hash. `<id>` is the hex SHA-256 of the `.bin`, so the name doubles as a
-checksum. Both files upload through the same uploader as loose objects, so the
-existing `SetReference` flush covers them.
+The writer makes two passes:
+
+1. `scanPack` reads the pack as it arrives. It stages the bytes in a temp
+   file, verifies the trailer checksum, and keeps a small index entry for each
+   object: the offset, the size, the type, and the base of a delta. It keeps
+   no body.
+2. The resolver walks each delta tree depth first, from its base, so a base
+   always goes into a container before its deltas. It copies each payload into
+   a flat `packs/<id>.bin` and adds one record to `packs/<id>.cue`.
+
+A record holds the hash, the type, the payload codec, the offset, the stored
+length, the raw size, and the base hash. `<id>` is the hex SHA-256 of the
+`.bin`, so the name is also a checksum. Both files upload through the same
+uploader as loose objects, so the existing `SetReference` flush covers them.
+
+A body stays in memory only while a delta below it needs it as a base. A
+body goes to a temp file when it is larger than `bodyMemLimit` (8 MiB), or when
+the bodies in memory would pass `bodyMemBudget` (64 MiB). The delta applier
+reads its base through `io.ReaderAt`, so a base on disk is never loaded whole.
+
+`cmd/objgitd`'s `writePack` calls `ReadPack` when the writer has it. `ReadPack`
+finds the end of the pack in the same pass that stages it. `packScanner` is an
+`io.ByteReader`, so zlib never reads past the pack. On git:// and SSH the
+client keeps the connection open after the pack, so a read past the pack
+blocks.
 
 A payload is the object, or the delta the pushing client already computed for
 it. Keeping that delta is what stops every later clone from deriving one
 again: `Storer` implements `storer.DeltaObjectStorer`, so go-git's packer
 reuses the stored delta instead of running its rolling-hash search. See
 [the backend reference](../reference/tigris-backend.md#how-a-read-rebuilds-a-delta).
+
+A read walks at most `maxDeltaDepth` (50) delta links, and a client can send
+chains of up to 4095 links. The writer therefore stores an object whole when
+its stored chain is already 50 links long.
 
 A delta is only kept when its base lands in the same container. When a
 container seals between the two, the writer stores the whole object instead.
@@ -416,6 +437,41 @@ Reads check three tiers, in this order:
 
 The pack index is built once for each `Storer`, from the `packs/*.cue` files.
 Those files are small, and no `.bin` body is read to build it.
+
+### The pack index (`packtable.go`)
+
+The index is a list of sorted tables, and not a map. A table holds the hashes
+of its records in one `[]byte`, and a 40-byte `tableRec` for each record. That
+is about 60 bytes for each object with SHA-1. The map it replaced took about
+210 bytes. For golang/go, a cold build holds 40 MiB of tables, against about
+180 MiB of map.
+
+A `tableRec` holds a pack number and not a pack id, and the base of a delta as
+a record number and not a hash. A base in another table goes in the small
+`farBase` map. The writer keeps a base and its delta in one container, so that
+map is almost always empty.
+
+The cold build parses each `.cue` into a table and then drops its records. It
+then merges all of the tables into one. Each container that a push registers
+adds one table. When there are more than `maxPackTables` (16) tables, the index
+merges them into one, so a lookup does at most 16 binary searches. A lookup
+searches from the newest table to the oldest, so the newest record of a hash
+wins.
+
+A table never changes after it is built. A `packSnapshot` therefore shares the
+table list, the pack ids, and the dead set with the index, and costs no copy.
+The index never edits these in place. It only appends past the length that a
+snapshot sees, or it replaces the slice or the map.
+
+`deregister` takes only a pack id. It drops a table that holds only that pack.
+In a merged table it adds the pack to the dead set, a lookup skips the record,
+and the next merge drops it. `packJob` therefore keeps no `cueRecord`s while
+its upload runs.
+
+`IterEncodedObjects` walks `packSnapshot.order`, which costs 8 bytes for each
+object, in pack order and then offset order. It yields a hash only from the
+record that the lookup returns, so it needs no set of hashes that it has
+already yielded.
 
 A packed read is one ranged `GetObject` over the record's `stored` span. There
 is no delta chain to reconstruct. When the record names the zstd codec, the

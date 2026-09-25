@@ -100,8 +100,8 @@ var (
 // and every internal encoder state allocates its own match-history buffer (tens
 // of megabytes, never released), so the default puts a permanent floor under
 // retained heap that scales with core count and not with real demand. The value
-// that matters is "expected simultaneous pushes", not "core count"; 4 matches
-// deltaScanWorkers in spirit — a bound picked for resource reasons. Revisit it
+// that matters is "expected simultaneous pushes", not "core count"; 4 is a
+// bound picked for resource reasons. Revisit it
 // alongside the push cap that actually bounds demand.
 //
 // A package-level variable with a setter, not a Storer option: the encoder is a
