@@ -1,6 +1,7 @@
 package tigris
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -14,67 +15,92 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/go-git/go-billy/v6/osfs"
 	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/cache"
-	"github.com/go-git/go-git/v6/storage/filesystem"
 	"github.com/klauspost/compress/zstd"
-	"golang.org/x/sync/errgroup"
 )
 
-// PackfileWriter accepts an incoming git packfile — already exactly
-// delimited by the caller (see cmd/objgitd/receivepack.go's writePack,
-// which needs no changes: its own st.(storer.PackfileWriter) type assertion
-// just starts succeeding once this method exists). Rather than storing git's
-// own delta-compressed pack format, it decodes the pack (by handing it to a
-// scratch go-git filesystem.Storage, which does all the actual pack/delta
-// work — see docs/reference/tigris-backend.md) and re-encodes every object,
-// fully resolved, into this package's own flat bin/cue container.
+// PackfileWriter accepts an incoming git packfile, already delimited by the
+// caller (see writePack in cmd/objgitd/receivepack.go). It does not store
+// git's own delta-compressed pack format. Write stages the pack in a local
+// temp file, and Close resolves every object and re-encodes it into this
+// package's own flat bin/cue containers. See indexpack.go for how.
 func (s *Storer) PackfileWriter() (io.WriteCloser, error) {
-	dir, err := os.MkdirTemp("", "objgit-tigris-scratch-*")
+	f, err := os.CreateTemp("", "objgit-tigris-incoming-*")
 	if err != nil {
-		return nil, fmt.Errorf("tigris: create scratch dir: %w", err)
+		return nil, fmt.Errorf("tigris: create incoming pack staging file: %w", err)
 	}
-
-	// A real temp dir, not memfs: incoming packs can be large.
-	scratch := filesystem.NewStorageWithOptions(
-		osfs.New(dir),
-		cache.NewObjectLRUDefault(),
-		filesystem.Options{ObjectFormat: s.of},
-	)
-	inner, err := scratch.PackfileWriter()
-	if err != nil {
-		os.RemoveAll(dir)
-		return nil, fmt.Errorf("tigris: open scratch packfile writer: %w", err)
-	}
-	return &packWriter{s: s, dir: dir, scratch: scratch, inner: inner}, nil
+	return &packWriter{s: s, f: f, buf: bufio.NewWriterSize(f, 1<<20)}, nil
 }
 
 type packWriter struct {
-	s       *Storer
-	dir     string
-	scratch *filesystem.Storage
-	inner   io.WriteCloser
-	done    bool
+	s    *Storer
+	f    *os.File
+	buf  *bufio.Writer
+	n    int64
+	pack *incomingPack // set by ReadPack, which indexes as it stages
+	bad  bool          // ReadPack failed, so Close only cleans up
+	done bool
 }
 
-func (w *packWriter) Write(p []byte) (int, error) { return w.inner.Write(p) }
+func (w *packWriter) Write(p []byte) (int, error) {
+	n, err := w.buf.Write(p)
+	w.n += int64(n)
+	return n, err
+}
+
+// ReadPack reads exactly one packfile from r, and stops at its trailer. It
+// stages the pack and indexes it in one pass, so Close does not read the
+// staged file a second time. It never holds an object body in memory.
+//
+// cmd/objgitd's writePack prefers this to Write. The pack must end on its
+// own framing there, because a git:// or SSH client keeps the connection open
+// after the pack while it waits for report-status.
+func (w *packWriter) ReadPack(r io.Reader) error {
+	cw := &countingWriter{w: w.buf}
+	p, err := scanPack(r, cw, w.s.of, w.s.oh.Size())
+	w.n += cw.n
+	if err != nil {
+		w.bad = true
+		return fmt.Errorf("tigris: decode incoming pack: %w", err)
+	}
+	w.pack = p
+	return nil
+}
 
 func (w *packWriter) Close() error {
 	if w.done {
 		return nil
 	}
 	w.done = true
-	defer os.RemoveAll(w.dir)
+	defer os.Remove(w.f.Name())
+	defer w.f.Close()
 
-	if err := w.inner.Close(); err != nil {
-		return fmt.Errorf("tigris: decode incoming pack: %w", err)
+	if w.bad {
+		return nil
+	}
+	if err := w.buf.Flush(); err != nil {
+		return fmt.Errorf("tigris: stage incoming pack: %w", err)
+	}
+	if w.n == 0 {
+		return nil // defensive: writePack only calls us when a packfile is expected
 	}
 
-	objs, order, err := w.planObjects()
+	pack := w.pack
+	if pack == nil {
+		// The pack came through Write, so index the staged copy now.
+		var err error
+		pack, err = scanPack(io.NewSectionReader(w.f, 0, w.n), nil, w.s.of, w.s.oh.Size())
+		if err != nil {
+			return fmt.Errorf("tigris: decode incoming pack: %w", err)
+		}
+	}
+	pack.f = w.f
+
+	dir, err := os.MkdirTemp("", "objgit-tigris-bodies-*")
 	if err != nil {
-		return err
+		return fmt.Errorf("tigris: create body spill dir: %w", err)
 	}
+	defer os.RemoveAll(dir)
 
 	// One push becomes as many containers as its total size needs: the walk
 	// seals a segment the moment it is full and opens the next one lazily, so a
@@ -91,100 +117,30 @@ func (w *packWriter) Close() error {
 		byteLimit = maxPackBytes
 	}
 
-	var seg *packSegment
+	r := &resolver{w: w, p: pack, of: w.s.of, dir: dir, byteLimit: byteLimit, external: w.externalBase}
 	defer func() {
-		if seg != nil { // only reachable on an error before this segment sealed
-			seg.discard()
+		if r.seg != nil { // only reachable on an error before this segment sealed
+			r.seg.discard()
 		}
 	}()
-
-	// inSeg is the containment rule made concrete: a delta may only be stored
-	// as a delta when its base is in the container being built. It resets on
-	// every seal, so a delta stranded on the far side of a split is demoted to
-	// its whole form rather than pointing at a sibling container.
-	//
-	// No size hint: only the byte cap bounds a container now, so nothing here
-	// knows how many objects one holds. clear keeps the buckets, so the map
-	// grows once to the largest container's object count and stays there.
-	inSeg := map[plumbing.Hash]struct{}{}
-
-	walkErr := func() error {
-		for _, idx := range order {
-			p := objs[idx]
-			so, err := w.payloadFor(p, inSeg)
-			if err != nil {
-				return err
-			}
-
-			// The cap seals *before* the add: a container sitting at 127 MiB
-			// must not swallow a 500 MiB blob and land at 627 MiB. The
-			// len(seg.recs) > 0 guard is what permits the one legal spill — an
-			// object larger than the whole cap gets a container to itself,
-			// since it has to live somewhere. That container then seals on the
-			// next object's check here, or at the end of the walk below.
-			//
-			// p.size is trustworthy: add fails the push if the bytes it copies
-			// disagree with the payload's own declared size.
-			//
-			// seg.offset counts *stored* bytes while p.size is the raw size, so
-			// the comparison mixes the two. It stays correct because the codec
-			// policy guarantees stored <= raw (compress.go, and the rewind in
-			// writeProbed), which makes p.size a valid upper bound on what this
-			// object can add — more so for a delta, whose payload is smaller
-			// still. The only cost is sealing a little early.
-			if seg != nil && len(seg.recs) > 0 && seg.offset+p.size > byteLimit {
-				full := seg
-				seg = nil // ownership moves to seal, which owns its staging files
-				if err := w.seal(full); err != nil {
-					return err
-				}
-				clear(inSeg)
-
-				// The seal moved the goalposts: this object's base is no longer
-				// in the container being built, so its delta form is no longer
-				// legal. Ask again, now that inSeg is empty.
-				if so, err = w.payloadFor(p, inSeg); err != nil {
-					return err
-				}
-			}
-			if seg == nil {
-				var err error
-				if seg, err = newPackSegment(w.s); err != nil {
-					return err
-				}
-			}
-			if err := seg.add(so); err != nil {
-				return err
-			}
-			inSeg[p.hash] = struct{}{}
-		}
-		return nil
-	}()
-	if walkErr != nil {
+	if err := r.run(); err != nil {
 		// Any segment this push already sealed is enqueued and cannot be
 		// recalled. Each one is a complete, self-consistent container holding
 		// real objects, so nothing dangles; the error fails the push, so no ref
 		// ever points into the incomplete set.
-		return fmt.Errorf("tigris: build pack container: %w", walkErr)
+		return fmt.Errorf("tigris: build pack container: %w", err)
 	}
-	if seg == nil {
-		return nil // defensive: writePack only calls us when a packfile is expected
+	if r.seg == nil {
+		return nil
 	}
-	last := seg
-	seg = nil
+	last := r.seg
+	r.seg = nil
 	return w.seal(last)
 }
 
-// plannedObject is one object's metadata, gathered before any bytes are
-// written. Type and size come from the *resolved* object, never from the delta
-// header: git records a delta entry's size as the length of its instruction
-// stream, not of the object it rebuilds, and every record's raw field means the
-// latter.
-type plannedObject struct {
-	hash plumbing.Hash
-	typ  plumbing.ObjectType
-	size int64         // the reconstructed object's size
-	base plumbing.Hash // zero when the client did not send this as a delta
+// externalBase reads a REF-delta base that is already in the repository.
+func (w *packWriter) externalBase(h plumbing.Hash) (plumbing.EncodedObject, error) {
+	return w.s.EncodedObject(plumbing.AnyObject, h)
 }
 
 // storedObject is one object as a segment will record it: the payload bytes to
@@ -197,185 +153,6 @@ type storedObject struct {
 	typ     plumbing.ObjectType
 	raw     int64
 	base    plumbing.Hash // zero when payload is the whole object
-}
-
-// planObjects walks the scratch storage once and returns every object
-// (flat) alongside an order — indices into flat — where a delta always
-// follows its base.
-//
-// The ordering is the reason this pass exists. IterEncodedObjects yields in
-// index order, which is hash order, so a delta can arrive long before the
-// object it is built from — and the containment rule cannot be checked against
-// a container that has not been filled yet.
-//
-// order and placed hold indices/flags rather than copies of plannedObject or
-// a second map keyed by plumbing.Hash: a 32-byte SHA256 hash makes a
-// map[plumbing.Hash]* expensive per entry, and a push the size of a large
-// repository's full history has enough objects that the difference is the
-// gap between this fitting in memory and not. flat is already hash-sorted
-// (the property above), so base lookups use binary search instead of a
-// second map.
-func (w *packWriter) planObjects() ([]plannedObject, []int32, error) {
-	iter, err := w.scratch.IterEncodedObjects(plumbing.AnyObject)
-	if err != nil {
-		return nil, nil, fmt.Errorf("tigris: walk scratch objects: %w", err)
-	}
-	defer iter.Close()
-
-	// Hash, type, and size only: IterEncodedObjects' iterator, like the rest
-	// of filesystem.ObjectStorage's packed-object path, is documented as not
-	// safe for concurrent use, so this walk stays on one goroutine. Delta-base
-	// resolution below is the expensive part and is where the concurrency goes.
-	var flat []plannedObject
-	if err := iter.ForEach(func(obj plumbing.EncodedObject) error {
-		flat = append(flat, plannedObject{hash: obj.Hash(), typ: obj.Type(), size: obj.Size()})
-		return nil
-	}); err != nil {
-		return nil, nil, fmt.Errorf("tigris: plan pack container: %w", err)
-	}
-
-	if err := w.resolveDeltaBases(flat); err != nil {
-		return nil, nil, fmt.Errorf("tigris: plan pack container: %w", err)
-	}
-
-	// Emit bases first. Marking before recursing is what makes a cycle
-	// terminate: a chain that loops back on itself simply places the object it
-	// looped to, and the delta behind it is demoted when its base turns out not
-	// to be in the container yet.
-	order := make([]int32, 0, len(flat))
-	placed := make([]bool, len(flat))
-	var emit func(i int32)
-	emit = func(i int32) {
-		if placed[i] {
-			return
-		}
-		placed[i] = true
-		if base := flat[i].base; base != plumbing.ZeroHash {
-			if j, ok := findByHash(flat, base); ok {
-				emit(j)
-			}
-		}
-		order = append(order, i)
-	}
-	for i := range flat {
-		emit(int32(i))
-	}
-	return flat, order, nil
-}
-
-// findByHash locates h in flat by binary search. Callers hold flat in the
-// hash order IterEncodedObjects produced, which is the order this depends on.
-func findByHash(flat []plannedObject, h plumbing.Hash) (int32, bool) {
-	i := sort.Search(len(flat), func(i int) bool {
-		return bytes.Compare(flat[i].hash.Bytes(), h.Bytes()) >= 0
-	})
-	if i < len(flat) && flat[i].hash == h {
-		return int32(i), true
-	}
-	return -1, false
-}
-
-// deltaScanWorkers bounds how many independent scratch storage handles
-// resolveDeltaBases opens at once. Capped rather than left at GOMAXPROCS so a
-// huge push does not open more file descriptors against the scratch
-// directory than is sensible; the scan is I/O-bound, not CPU-bound, so there
-// is little to gain past a handful of workers anyway.
-const deltaScanWorkers = 8
-
-// resolveDeltaBases fills in flat[i].base for every object the client sent
-// as a delta, by asking the scratch storage whether it has one.
-//
-// filesystem.ObjectStorage's packed-object delta lookup (which this needs)
-// reads through Packfile.Scanner(), a single shared, unsynchronized scanner
-// over one shared file handle — go-git's own doc comment on Scanner marks it
-// not thread-safe. So this cannot fan goroutines out against w.scratch
-// itself. Instead each worker opens its own *filesystem.Storage over the
-// same on-disk scratch directory: lazy init means each gets an independent
-// packfile.Packfile, Scanner, and file descriptor, so there is no shared
-// mutable state to race on. flat is partitioned by index range and each
-// worker only ever writes the indices in its own range, so flat itself needs
-// no synchronization either — distinct slice elements are distinct memory,
-// concurrent writes to them are not a race.
-//
-// Each worker's storage gets a zero-size object cache: every hash here is
-// looked up exactly once, so the cache would only hold memory without ever
-// serving a hit.
-func (w *packWriter) resolveDeltaBases(flat []plannedObject) error {
-	if len(flat) == 0 {
-		return nil
-	}
-
-	workers := min(deltaScanWorkers, len(flat))
-	chunk := (len(flat) + workers - 1) / workers
-
-	var g errgroup.Group
-	for start := 0; start < len(flat); start += chunk {
-		end := min(start+chunk, len(flat))
-		g.Go(func() error {
-			store := filesystem.NewStorageWithOptions(
-				osfs.New(w.dir), cache.NewObjectLRU(0),
-				filesystem.Options{ObjectFormat: w.s.of},
-			)
-			for i := start; i < end; i++ {
-				if do, ok := deltaFormOn(store, flat[i].hash); ok {
-					flat[i].base = do.BaseHash()
-				}
-			}
-			return nil
-		})
-	}
-	return g.Wait()
-}
-
-// deltaForm asks the scratch storage for h's delta, if the client sent one.
-// The scratch storage is a real go-git filesystem.Storage over the pushed
-// packfile, so this is the client's own delta chain, not one we computed.
-func (w *packWriter) deltaForm(h plumbing.Hash) (plumbing.DeltaObject, bool) {
-	return deltaFormOn(w.scratch, h)
-}
-
-// deltaFormOn is deltaForm against an explicit storage rather than w.scratch,
-// so resolveDeltaBases' workers can each use their own independent instance.
-func deltaFormOn(store *filesystem.Storage, h plumbing.Hash) (plumbing.DeltaObject, bool) {
-	obj, err := store.DeltaObject(plumbing.AnyObject, h)
-	if err != nil {
-		// Not fatal: a base we cannot read as a delta is simply stored whole.
-		return nil, false
-	}
-	do, ok := obj.(plumbing.DeltaObject)
-	if !ok || do.BaseHash() == plumbing.ZeroHash {
-		return nil, false
-	}
-	return do, true
-}
-
-// payloadFor fetches the bytes to store for p: the client's delta when its base
-// is already in the container being built, and the whole object otherwise.
-func (w *packWriter) payloadFor(p plannedObject, inSeg map[plumbing.Hash]struct{}) (storedObject, error) {
-	whole := func() (storedObject, error) {
-		obj, err := w.scratch.EncodedObject(plumbing.AnyObject, p.hash)
-		if err != nil {
-			return storedObject{}, fmt.Errorf("tigris: read %s from scratch: %w", p.hash, err)
-		}
-		return storedObject{payload: obj, hash: p.hash, typ: p.typ, raw: p.size}, nil
-	}
-
-	if p.base == plumbing.ZeroHash {
-		return whole()
-	}
-	if _, ok := inSeg[p.base]; !ok {
-		return whole()
-	}
-	do, ok := w.deltaForm(p.hash)
-	if !ok || do.BaseHash() != p.base {
-		return whole()
-	}
-	// A delta that does not actually save anything is worse than the object:
-	// it costs a base read on every future fetch for no bytes back.
-	if do.Size() >= p.size {
-		return whole()
-	}
-	return storedObject{payload: do, hash: p.hash, typ: p.typ, raw: p.size, base: p.base}, nil
 }
 
 // packSegment is one container under construction: the staging .bin and the

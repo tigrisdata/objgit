@@ -848,8 +848,9 @@ func (s *Storer) packPayload(h plumbing.Hash, e packEntry) ([]byte, error) {
 }
 
 // maxDeltaDepth bounds how far a read will walk a delta chain before giving up.
-// It matches go-git's own limit (packfile.maxDepth), which is what bounds the
-// chains a push can hand us in the first place. A .cue is just bytes in a
+// A read admits a chain of exactly this many links. It matches git's default
+// pack.depth, but a client can send chains up to 4095 links, so the writer
+// (resolver.place in indexpack.go) is what holds stored chains to this bound. A .cue is just bytes in a
 // bucket, so this is also the guard that keeps a corrupt or hostile index from
 // recursing without end; the visited set beside it catches short cycles that
 // would otherwise spin until the depth ran out.
@@ -908,7 +909,10 @@ func (s *Storer) framePacked(h plumbing.Hash, e packEntry, payload []byte, depth
 // something it did not keep. Reporting ErrObjectNotFound here would let a
 // damaged index read as "this object was never pushed".
 func (s *Storer) deltaBase(base plumbing.Hash, depth int) (plumbing.EncodedObject, error) {
-	if depth >= maxDeltaDepth {
+	// depth is the link that reaches this base, so a chain of exactly
+	// maxDeltaDepth links fetches its whole object at depth maxDeltaDepth.
+	// framePacked refuses the link past it.
+	if depth > maxDeltaDepth {
 		return nil, fmt.Errorf("%w: delta chain through %s is deeper than %d links", errBadCue, base.String(), maxDeltaDepth)
 	}
 
