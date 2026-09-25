@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v6/memfs"
+	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/tigrisdata/objgit/internal/auth"
 	"github.com/tigrisdata/objgit/internal/kube"
 	"github.com/tigrisdata/objgit/internal/kube/kubetest"
@@ -149,6 +150,29 @@ func TestReceivePackHookKubernetes(t *testing.T) {
 				if p["name"] == "branch" && p["value"] != "main" {
 					t.Errorf("branch param = %v, want main", p["value"])
 				}
+			}
+		})
+	}
+}
+
+func TestHookOrigin(t *testing.T) {
+	sha := plumbing.NewHash("0123456789abcdef0123456789abcdef01234567")
+	tests := []struct {
+		name       string
+		ref        plumbing.ReferenceName
+		wantBranch string
+	}{
+		{"a pushed branch", "refs/heads/main", "main"},
+		{"a nested branch", "refs/heads/feature/x", "feature/x"},
+		{"an SSH shell on a tag", "refs/tags/v1.0", ""},
+		{"an SSH shell on a commit", "refs/commits/0123456789abcdef0123456789abcdef01234567", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hookOrigin("xe/x", refUpdate{Name: tt.ref, New: sha})
+			want := kube.Origin{Repo: "xe/x", Ref: tt.ref.String(), Branch: tt.wantBranch, Commit: sha.String()}
+			if got != want {
+				t.Errorf("hookOrigin = %+v, want %+v", got, want)
 			}
 		})
 	}

@@ -159,16 +159,21 @@ obey these rules:
   server adds a random suffix to the name.
 - `spec.params` has a parameter named `commit`.
 
-The command changes the template before it sends it:
+The command changes the template before it sends it. The values come from
+the update that `objgitd` runs the hook for. They are the same values as the
+`OBJGIT_*` variables, but a script cannot change them:
 
-| Field                                          | New value                                   |
-| ---------------------------------------------- | ------------------------------------------- |
-| The `commit` parameter                         | `OBJGIT_NEW_SHA`                            |
-| The `branch` parameter, if the template has it | `OBJGIT_BRANCH`                             |
-| Annotation `objgit.tigrisdata.com/repo`        | `OBJGIT_REPO`                               |
-| Annotation `objgit.tigrisdata.com/ref`         | `OBJGIT_REF`                                |
-| Annotation `objgit.tigrisdata.com/commit`      | `OBJGIT_NEW_SHA`                            |
-| Label `objgit.tigrisdata.com/commit-prefix`    | The first 12 characters of `OBJGIT_NEW_SHA` |
+| Field                                          | New value                             |
+| ---------------------------------------------- | ------------------------------------- |
+| The `commit` parameter                         | The commit, as in `OBJGIT_NEW_SHA`    |
+| The `branch` parameter, if the template has it | The branch, as in `OBJGIT_BRANCH`     |
+| Annotation `objgit.tigrisdata.com/repo`        | The repository, as in `OBJGIT_REPO`   |
+| Annotation `objgit.tigrisdata.com/ref`         | The ref, as in `OBJGIT_REF`           |
+| Annotation `objgit.tigrisdata.com/commit`      | The commit                            |
+| Label `objgit.tigrisdata.com/commit-prefix`    | The first 12 characters of the commit |
+
+In the SSH `sh` shell on a tag or a commit, there is no branch. The `branch`
+parameter then keeps its template value.
 
 Other parameters and fields do not change. Then the command sends a create
 request and prints the generated name and the namespace. A template without

@@ -25,11 +25,12 @@ const (
 const commitPrefixLen = 12
 
 // PipelineRunCommand is tekton:pipelinerun FILE. It reads one PipelineRun
-// template from the hook filesystem, points it at the pushed commit, and
+// template from the hook filesystem, points it at the commit of Origin, and
 // creates it. The template must use metadata.generateName, so each call
 // creates a new run.
 type PipelineRunCommand struct {
 	Client *Client
+	Origin Origin
 }
 
 // Exec runs tekton:pipelinerun.
@@ -40,9 +41,8 @@ func (p PipelineRunCommand) Exec(ctx context.Context, ec *command.ExecContext, a
 		return interp.ExitStatus(2)
 	}
 	file := args[0]
-	commit := env(ec, "OBJGIT_NEW_SHA")
-	if commit == "" || strings.Trim(commit, "0") == "" {
-		return fail(ec, name, "OBJGIT_NEW_SHA is not set to a commit")
+	if strings.Trim(p.Origin.Commit, "0") == "" {
+		return fail(ec, name, "this shell has no commit to build")
 	}
 
 	f, err := ec.FS.Open(resolve(ec.Dir, file))
@@ -61,7 +61,7 @@ func (p PipelineRunCommand) Exec(ctx context.Context, ec *command.ExecContext, a
 		return fail(ec, name, "%s holds %d objects, want one PipelineRun", file, len(objs))
 	}
 	run := objs[0]
-	if err := preparePipelineRun(run, commit, env(ec, "OBJGIT_BRANCH"), env(ec, "OBJGIT_REPO"), env(ec, "OBJGIT_REF")); err != nil {
+	if err := preparePipelineRun(run, p.Origin); err != nil {
 		return fail(ec, name, "%s: %v", file, err)
 	}
 
@@ -69,14 +69,15 @@ func (p PipelineRunCommand) Exec(ctx context.Context, ec *command.ExecContext, a
 	if err != nil {
 		return fail(ec, name, "create %s: %v", strings.TrimSuffix(run.GenerateName(), "-"), err)
 	}
-	audit(ec, "kube: created", res)
+	audit(p.Origin, "kube: created", res)
 	fmt.Fprintf(ec.Stdout, "%s/%s created in namespace %s\n", res.Resource, res.Object.Name(), res.Object.Namespace())
 	return nil
 }
 
-// resolve maps a shell path to an fsys-relative path, as the Kefka registry
-// does: absolute paths start at the filesystem root, and relative paths start
-// at dir.
+// resolve maps a shell path to an fsys-relative path: absolute paths start
+// at the filesystem root, and relative paths start at dir. Unlike the Kefka
+// registry, it does not clamp a path that climbs above the root. The hook
+// filesystem (internal/mountfs) cleans every path against its root.
 func resolve(dir, p string) string {
 	if path.IsAbs(p) {
 		p = strings.TrimPrefix(path.Clean(p), "/")
@@ -90,8 +91,10 @@ func resolve(dir, p string) string {
 }
 
 // preparePipelineRun checks that run is a generateName PipelineRun, and sets
-// its commit and branch parameters and its objgit metadata.
-func preparePipelineRun(run Object, commit, branch, repo, ref string) error {
+// its commit and branch parameters and its objgit metadata from origin. The
+// branch parameter keeps its template value when origin is not a branch.
+func preparePipelineRun(run Object, origin Origin) error {
+	commit := origin.Commit
 	group, _, _ := strings.Cut(run.APIVersion(), "/")
 	if group != "tekton.dev" || run.Kind() != "PipelineRun" {
 		return fmt.Errorf("%s %s is not a tekton.dev PipelineRun", run.APIVersion(), run.Kind())
@@ -116,8 +119,8 @@ func preparePipelineRun(run Object, commit, branch, repo, ref string) error {
 			p["value"] = commit
 			haveCommit = true
 		case "branch":
-			if branch != "" {
-				p["value"] = branch
+			if origin.Branch != "" {
+				p["value"] = origin.Branch
 			}
 		}
 	}
@@ -127,7 +130,7 @@ func preparePipelineRun(run Object, commit, branch, repo, ref string) error {
 
 	meta := run["metadata"].(map[string]any) // GenerateName found it
 	annotations := subMap(meta, "annotations")
-	for key, v := range map[string]string{AnnotationRepo: repo, AnnotationRef: ref, AnnotationCommit: commit} {
+	for key, v := range map[string]string{AnnotationRepo: origin.Repo, AnnotationRef: origin.Ref, AnnotationCommit: commit} {
 		if v != "" {
 			annotations[key] = v
 		}

@@ -52,6 +52,7 @@ type Server struct {
 	objects  map[string]stored // by object path
 	denied   map[string]bool   // "verb resource", such as "patch pipelines"
 	requests []Request
+	paths    []string // the raw path of every request, discovery included
 	nextName int
 }
 
@@ -118,7 +119,18 @@ func (s *Server) Requests() []Request {
 	return append([]Request(nil), s.requests...)
 }
 
+// Paths returns the escaped path of every request so far, discovery and get
+// included.
+func (s *Server) Paths() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.paths...)
+}
+
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	s.paths = append(s.paths, r.URL.EscapedPath())
+	s.mu.Unlock()
 	if r.Header.Get("Authorization") != "Bearer "+s.Token() {
 		status(w, http.StatusUnauthorized, "Unauthorized", "Unauthorized")
 		return

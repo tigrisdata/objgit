@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -291,18 +292,37 @@ func (s *Session) resource(ctx context.Context, apiVersion, kind string) (Resour
 	return Resource{}, fmt.Errorf("no resource of kind %q in %s; is its CustomResourceDefinition installed?", kind, apiVersion)
 }
 
+// Kubernetes names API groups as DNS-1123 subdomains, and versions as short
+// lower-case alphanumerics such as v1 or v1beta1.
+var (
+	groupPattern   = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`)
+	versionPattern = regexp.MustCompile(`^[a-z0-9]+$`)
+)
+
+// splitAPIVersion splits apiVersion into its group ("" for the core group)
+// and version. It refuses anything else, because both parts go into request
+// paths: an escaped slash or a "?" there would reach a different API path.
+func splitAPIVersion(apiVersion string) (group, version string, err error) {
+	group, version, grouped := strings.Cut(apiVersion, "/")
+	if !grouped {
+		group, version = "", apiVersion
+	}
+	if (grouped && (len(group) > 253 || !groupPattern.MatchString(group))) || !versionPattern.MatchString(version) {
+		return "", "", fmt.Errorf("invalid apiVersion %q; want group/version, such as tekton.dev/v1, or v1", apiVersion)
+	}
+	return group, version, nil
+}
+
 // discover lists the top-level resources of apiVersion. Subresources, such
 // as pipelineruns/status, are left out.
 func (c *Client) discover(ctx context.Context, apiVersion string) ([]Resource, error) {
-	group, version, grouped := strings.Cut(apiVersion, "/")
-	p := "/api/" + apiVersion
-	if !grouped {
-		group, version = "", apiVersion
-	} else {
-		p = "/apis/" + apiVersion
+	group, version, err := splitAPIVersion(apiVersion)
+	if err != nil {
+		return nil, err
 	}
-	if strings.Count(apiVersion, "/") > 1 || version == "" {
-		return nil, fmt.Errorf("apiVersion %q is malformed", apiVersion)
+	p := "/api/" + version
+	if group != "" {
+		p = "/apis/" + group + "/" + version
 	}
 
 	var list struct {

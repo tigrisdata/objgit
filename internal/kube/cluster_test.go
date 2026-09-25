@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // testCluster returns a client for a real cluster, or skips. Set
@@ -44,7 +46,8 @@ func testCluster(t *testing.T) *Client {
 func TestCluster(t *testing.T) {
 	c := testCluster(t)
 	ctx := context.Background()
-	suffix := strings.ToLower(strings.NewReplacer("/", "-", "_", "-").Replace(t.Name()))
+	// A new suffix for each run, because the objects stay in the cluster.
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
 
 	pipeline := Object{
 		"apiVersion": "tekton.dev/v1",

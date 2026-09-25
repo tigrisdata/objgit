@@ -48,7 +48,9 @@ func DecodeYAMLStream(r io.Reader) ([]Object, error) {
 }
 
 // splitYAML splits a stream into documents. A separator line is "---"
-// followed by nothing, whitespace, or a comment.
+// followed by nothing, whitespace, or a comment. Other content after "---",
+// such as "--- {a: 1}", is an error: the YAML converter would read only the
+// first document of such a piece and drop the rest without an error.
 func splitYAML(r io.Reader) ([][]byte, error) {
 	var docs [][]byte
 	var cur bytes.Buffer
@@ -57,11 +59,12 @@ func splitYAML(r io.Reader) ([][]byte, error) {
 		line, err := br.ReadBytes('\n')
 		if len(line) > 0 {
 			if rest, ok := bytes.CutPrefix(line, []byte("---")); ok {
-				if rest = bytes.TrimSpace(rest); len(rest) == 0 || rest[0] == '#' {
-					docs = append(docs, bytes.Clone(cur.Bytes()))
-					cur.Reset()
-					line = nil
+				if rest = bytes.TrimSpace(rest); len(rest) != 0 && rest[0] != '#' {
+					return nil, fmt.Errorf("document %d: invalid document separator %q; put the content on the next line", len(docs)+2, bytes.TrimRight(line, "\r\n"))
 				}
+				docs = append(docs, bytes.Clone(cur.Bytes()))
+				cur.Reset()
+				line = nil
 			}
 			cur.Write(line)
 		}

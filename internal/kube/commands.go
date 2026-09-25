@@ -12,17 +12,29 @@ import (
 	"mvdan.cc/sh/v3/interp"
 )
 
-// Register adds kube:apply and tekton:pipelinerun to reg. A nil client
-// registers stubs that explain how to turn the commands on, so a hook that
-// calls them fails with a reason instead of "command not found".
-func Register(reg *registry.Impl, c *Client) {
+// Origin is the update that a shell runs for, as the daemon knows it. The
+// commands take it from the daemon and not from the OBJGIT_* variables,
+// because a script can change those. The audit log and the PipelineRun
+// metadata are the only record of which repository changed the cluster.
+type Origin struct {
+	Repo   string // the repository path
+	Ref    string // the full ref name
+	Branch string // the short branch name; "" when Ref is not a branch
+	Commit string // the commit hash
+}
+
+// Register adds kube:apply and tekton:pipelinerun to reg, for the update
+// origin. A nil client registers stubs that explain how to turn the commands
+// on, so a hook that calls them fails with a reason instead of "command not
+// found".
+func Register(reg *registry.Impl, c *Client, origin Origin) {
 	if c == nil {
 		reg.Register("kube:apply", disabled("kube:apply"))
 		reg.Register("tekton:pipelinerun", disabled("tekton:pipelinerun"))
 		return
 	}
-	reg.Register("kube:apply", ApplyCommand{Client: c})
-	reg.Register("tekton:pipelinerun", PipelineRunCommand{Client: c})
+	reg.Register("kube:apply", ApplyCommand{Client: c, Origin: origin})
+	reg.Register("tekton:pipelinerun", PipelineRunCommand{Client: c, Origin: origin})
 }
 
 type disabled string
@@ -38,6 +50,7 @@ func (d disabled) Exec(_ context.Context, ec *command.ExecContext, _ []string) e
 // first failed request stops the command. It never prunes.
 type ApplyCommand struct {
 	Client *Client
+	Origin Origin
 }
 
 // Exec runs kube:apply.
@@ -70,7 +83,7 @@ func (a ApplyCommand) Exec(ctx context.Context, ec *command.ExecContext, args []
 		if err != nil {
 			return fail(ec, name, "%s: %v", describe(res.Resource, obj), err)
 		}
-		audit(ec, "kube: applied", res)
+		audit(a.Origin, "kube: applied", res)
 		fmt.Fprintf(ec.Stdout, "%s serverside-applied\n", describe(res.Resource, res.Object))
 	}
 	return nil
@@ -92,22 +105,16 @@ func fail(ec *command.ExecContext, name, format string, a ...any) error {
 	return interp.ExitStatus(1)
 }
 
-// audit logs one change to the cluster, with the repository that made it.
-func audit(ec *command.ExecContext, msg string, res Result) {
+// audit logs one change to the cluster, with the update that made it.
+func audit(origin Origin, msg string, res Result) {
 	slog.Info(msg,
-		"repo", env(ec, "OBJGIT_REPO"),
-		"ref", env(ec, "OBJGIT_REF"),
+		"repo", origin.Repo,
+		"ref", origin.Ref,
+		"sha", origin.Commit,
 		"resource", res.Resource.String(),
 		"namespace", res.Object.Namespace(),
 		"name", res.Object.Name(),
 	)
-}
-
-func env(ec *command.ExecContext, key string) string {
-	if ec.Environ == nil {
-		return ""
-	}
-	return ec.Environ.Get(key).String()
 }
 
 // readAll is io.ReadAll that closes r.

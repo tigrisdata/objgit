@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -17,6 +18,9 @@ import (
 )
 
 const testSHA = "0123456789abcdef0123456789abcdef01234567"
+
+// testOrigin is the update that the daemon gives the commands.
+var testOrigin = Origin{Repo: "xe/x", Ref: "refs/heads/main", Branch: "main", Commit: testSHA}
 
 // hookEnv is the part of the hook environment the commands read.
 var hookEnv = []string{
@@ -140,7 +144,7 @@ func TestApplyCommand(t *testing.T) {
 			if tt.setup != nil {
 				tt.setup(srv)
 			}
-			stdout, stderr, code := run(t, ApplyCommand{Client: testClient(srv)},
+			stdout, stderr, code := run(t, ApplyCommand{Client: testClient(srv), Origin: testOrigin},
 				&command.ExecContext{Stdin: strings.NewReader(tt.stdin)}, tt.args...)
 			if code != tt.wantCode {
 				t.Fatalf("exit = %d, want %d; stderr: %s", code, tt.wantCode, stderr)
@@ -166,7 +170,7 @@ func TestApplyCommand(t *testing.T) {
 
 func TestApplyCommandReapply(t *testing.T) {
 	srv := kubetest.New(t)
-	cmd := ApplyCommand{Client: testClient(srv)}
+	cmd := ApplyCommand{Client: testClient(srv), Origin: testOrigin}
 	for i := range 2 {
 		if _, stderr, code := run(t, cmd, &command.ExecContext{Stdin: strings.NewReader(twoConfigMaps)}); code != 0 {
 			t.Fatalf("apply %d: exit %d; stderr: %s", i+1, code, stderr)
@@ -202,7 +206,7 @@ func TestPipelineRunCommand(t *testing.T) {
 	if err := util.WriteFile(fsys, "src/.tekton/testrun.yaml", []byte(testRun), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cmd := PipelineRunCommand{Client: testClient(srv)}
+	cmd := PipelineRunCommand{Client: testClient(srv), Origin: testOrigin}
 
 	stdout, stderr, code := run(t, cmd, &command.ExecContext{Dir: "src", FS: fsys}, ".tekton/testrun.yaml")
 	if code != 0 {
@@ -260,7 +264,7 @@ func TestPipelineRunCommandDefaultNamespace(t *testing.T) {
 	if err := util.WriteFile(fsys, "run.yaml", []byte(manifest), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	stdout, stderr, code := run(t, PipelineRunCommand{Client: testClient(srv)}, &command.ExecContext{FS: fsys}, "run.yaml")
+	stdout, stderr, code := run(t, PipelineRunCommand{Client: testClient(srv), Origin: testOrigin}, &command.ExecContext{FS: fsys}, "run.yaml")
 	if code != 0 {
 		t.Fatalf("exit %d; stderr: %s", code, stderr)
 	}
@@ -279,7 +283,7 @@ func TestPipelineRunCommandWithoutBranchParam(t *testing.T) {
 	if err := util.WriteFile(fsys, "run.yaml", []byte(manifest), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, stderr, code := run(t, PipelineRunCommand{Client: testClient(srv)}, &command.ExecContext{FS: fsys}, "run.yaml"); code != 0 {
+	if _, stderr, code := run(t, PipelineRunCommand{Client: testClient(srv), Origin: testOrigin}, &command.ExecContext{FS: fsys}, "run.yaml"); code != 0 {
 		t.Fatalf("exit %d; stderr: %s", code, stderr)
 	}
 	for _, p := range srv.Requests()[0].Body["spec"].(map[string]any)["params"].([]any) {
@@ -293,8 +297,8 @@ func TestPipelineRunCommandErrors(t *testing.T) {
 	tests := []struct {
 		name       string
 		setup      func(*kubetest.Server)
-		manifest   string // written to run.yaml; "" writes nothing
-		env        []string
+		manifest   string   // written to run.yaml; "" writes nothing
+		origin     *Origin  // nil means testOrigin
 		args       []string // nil means run.yaml
 		noArgs     bool
 		wantCode   int
@@ -340,11 +344,18 @@ func TestPipelineRunCommandErrors(t *testing.T) {
 			wantStderr: "holds 2 objects",
 		},
 		{
-			name:       "no commit in the environment",
+			name:       "no commit in the origin",
 			manifest:   testRun,
-			env:        []string{"OBJGIT_BRANCH=main"},
+			origin:     &Origin{Repo: "xe/x", Ref: "refs/heads/main", Branch: "main"},
 			wantCode:   1,
-			wantStderr: "OBJGIT_NEW_SHA",
+			wantStderr: "no commit",
+		},
+		{
+			name:       "an all-zero commit in the origin",
+			manifest:   testRun,
+			origin:     &Origin{Repo: "xe/x", Commit: strings.Repeat("0", 40)},
+			wantCode:   1,
+			wantStderr: "no commit",
 		},
 		{
 			name:       "RBAC denial",
@@ -371,11 +382,11 @@ func TestPipelineRunCommandErrors(t *testing.T) {
 			if args == nil && !tt.noArgs {
 				args = []string{"run.yaml"}
 			}
-			ec := &command.ExecContext{FS: fsys}
-			if tt.env != nil {
-				ec.Environ = expand.ListEnviron(tt.env...)
+			origin := testOrigin
+			if tt.origin != nil {
+				origin = *tt.origin
 			}
-			_, stderr, code := run(t, PipelineRunCommand{Client: testClient(srv)}, ec, args...)
+			_, stderr, code := run(t, PipelineRunCommand{Client: testClient(srv), Origin: origin}, &command.ExecContext{FS: fsys}, args...)
 			if code != tt.wantCode {
 				t.Fatalf("exit = %d, want %d; stderr: %s", code, tt.wantCode, stderr)
 			}
@@ -403,7 +414,7 @@ func TestRegister(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			reg := registry.New()
-			Register(reg, tt.client)
+			Register(reg, tt.client, testOrigin)
 			for _, name := range []string{"kube:apply", "tekton:pipelinerun"} {
 				cmd, ok := reg.Get(name)
 				if !ok {
@@ -418,5 +429,76 @@ func TestRegister(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestCommandsIgnoreSpoofedEnvironment runs both commands with OBJGIT_*
+// variables that a script changed. The audit log, the run metadata, and the
+// parameters must come from the daemon's origin instead.
+func TestCommandsIgnoreSpoofedEnvironment(t *testing.T) {
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	defer slog.SetDefault(prev)
+
+	spoofed := expand.ListEnviron(
+		"OBJGIT_REPO=victim/repo",
+		"OBJGIT_REF=refs/heads/prod",
+		"OBJGIT_BRANCH=prod",
+		"OBJGIT_NEW_SHA=ffffffffffffffffffffffffffffffffffffffff",
+	)
+	srv := kubetest.New(t)
+	fsys := memfs.New()
+	if err := util.WriteFile(fsys, "run.yaml", []byte(testRun), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, stderr, code := run(t, ApplyCommand{Client: testClient(srv), Origin: testOrigin},
+		&command.ExecContext{Stdin: strings.NewReader(twoConfigMaps), Environ: spoofed}); code != 0 {
+		t.Fatalf("kube:apply: exit %d; stderr: %s", code, stderr)
+	}
+	if _, stderr, code := run(t, PipelineRunCommand{Client: testClient(srv), Origin: testOrigin},
+		&command.ExecContext{FS: fsys, Environ: spoofed}, "run.yaml"); code != 0 {
+		t.Fatalf("tekton:pipelinerun: exit %d; stderr: %s", code, stderr)
+	}
+
+	if strings.Contains(logs.String(), "victim") || strings.Contains(logs.String(), "prod") {
+		t.Errorf("audit log uses the spoofed environment:\n%s", logs.String())
+	}
+	if strings.Count(logs.String(), "repo=xe/x") != 3 {
+		t.Errorf("audit log lacks repo=xe/x for each change:\n%s", logs.String())
+	}
+
+	reqs := srv.Requests()
+	body := Object(reqs[len(reqs)-1].Body)
+	annotations := body["metadata"].(map[string]any)["annotations"].(map[string]any)
+	if annotations[AnnotationRepo] != "xe/x" || annotations[AnnotationRef] != "refs/heads/main" || annotations[AnnotationCommit] != testSHA {
+		t.Errorf("annotations = %v, want the origin", annotations)
+	}
+	for _, p := range body["spec"].(map[string]any)["params"].([]any) {
+		p := p.(map[string]any)
+		if (p["name"] == "commit" && p["value"] != testSHA) || (p["name"] == "branch" && p["value"] != "main") {
+			t.Errorf("param %v, want the origin value", p)
+		}
+	}
+}
+
+// TestPipelineRunCommandWithoutBranch is the SSH sh shell on a tag or a
+// commit: the origin has no branch, so the template's branch stays.
+func TestPipelineRunCommandWithoutBranch(t *testing.T) {
+	srv := kubetest.New(t)
+	fsys := memfs.New()
+	if err := util.WriteFile(fsys, "run.yaml", []byte(testRun), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	origin := Origin{Repo: "xe/x", Ref: "refs/tags/v1.0", Commit: testSHA}
+	if _, stderr, code := run(t, PipelineRunCommand{Client: testClient(srv), Origin: origin}, &command.ExecContext{FS: fsys}, "run.yaml"); code != 0 {
+		t.Fatalf("exit %d; stderr: %s", code, stderr)
+	}
+	for _, p := range srv.Requests()[0].Body["spec"].(map[string]any)["params"].([]any) {
+		p := p.(map[string]any)
+		if p["name"] == "branch" && p["value"] != "master" {
+			t.Errorf("branch param = %v, want the template value master", p["value"])
+		}
 	}
 }

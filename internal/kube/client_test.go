@@ -155,6 +155,35 @@ func TestApply(t *testing.T) {
 	}
 }
 
+func TestApplyRejectsMalformedAPIVersion(t *testing.T) {
+	tests := []struct {
+		name       string
+		apiVersion string
+	}{
+		{"escaped slashes reach another path", "v1%2Fnamespaces%2Fci%2Fsecrets%2Fx"},
+		{"escaped slashes in a group", "tekton.dev/v1%2Fnamespaces%2Fci"},
+		{"a query string", "tekton.dev/v1?dryRun=All&x="},
+		{"a fragment", "v1#x"},
+		{"too many slashes", "tekton.dev/v1/pipelines"},
+		{"an empty group", "/v1"},
+		{"an empty version", "tekton.dev/"},
+		{"an upper-case group", "Tekton.dev/v1"},
+		{"a dot segment", "../v1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := kubetest.New(t)
+			_, err := testClient(srv).Apply(context.Background(), obj(tt.apiVersion, "ConfigMap", "", "a"))
+			if err == nil || !strings.Contains(err.Error(), "invalid apiVersion") {
+				t.Fatalf("err = %v, want an invalid apiVersion error", err)
+			}
+			if paths := srv.Paths(); len(paths) != 0 {
+				t.Errorf("requests sent for a malformed apiVersion: %q", paths)
+			}
+		})
+	}
+}
+
 func TestApplyRejectsIncompleteObjects(t *testing.T) {
 	tests := []struct {
 		name string

@@ -69,6 +69,16 @@ func TestDecodeYAMLStream(t *testing.T) {
 			wantErr: "not a mapping",
 		},
 		{
+			name:    "a separator with content is an error, not a lost document",
+			input:   "metadata:\n  name: a\n--- {metadata: {name: b}}\n",
+			wantErr: "document separator",
+		},
+		{
+			name:    "a separator with a block scalar is an error",
+			input:   "metadata:\n  name: a\n--- |\n  text\n",
+			wantErr: "document separator",
+		},
+		{
 			name:    "duplicate keys are rejected",
 			input:   "metadata:\n  name: a\n  name: b\n",
 			wantErr: "document 1",

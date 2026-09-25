@@ -101,7 +101,12 @@ If the build embedded a Git LFS pointer, `Exec` returns an error that says so.
 `internal/kube` is a small REST client, not client-go. `InCluster` reads
 the ServiceAccount mount and reads the token again for each request, because
 bound tokens rotate. Each command run takes one `Session`, which caches
-discovery for each `apiVersion` until the run ends. `kubetest` is a fake
+discovery for each `apiVersion` until the run ends. The commands get a `kube.Origin`
+from `hookOrigin`, and not from the `OBJGIT_*` variables, because a script
+can change those. The audit log (`kube: applied`, `kube: created`) and the
+PipelineRun metadata use this origin. `splitAPIVersion` refuses an
+`apiVersion` that is not a plain group and version, because both go into
+request paths. `kubetest` is a fake
 API server for the tests. `TestCluster` runs the same calls against a real
 cluster when `OBJGIT_TEST_KUBE_*` is set. See
 [../usage/kubernetes-hooks.md](../usage/kubernetes-hooks.md).
