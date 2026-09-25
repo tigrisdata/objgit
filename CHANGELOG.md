@@ -1,3 +1,9 @@
+## [1.13.1](https://github.com/tigrisdata/objgit/compare/v1.13.0...v1.13.1) (2026-09-25)
+
+### Performance Improvements
+
+- **storage/tigris:** push any repository in bounded memory ([#25](https://github.com/tigrisdata/objgit/issues/25)) ([2bd51ec](https://github.com/tigrisdata/objgit/commit/2bd51ec8b57d70e63c78cb5814eb77c7baf5b66e))
+
 # [1.13.0](https://github.com/tigrisdata/objgit/compare/v1.12.1...v1.13.0) (2026-09-24)
 
 ### Features
