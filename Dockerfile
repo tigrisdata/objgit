@@ -19,6 +19,12 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 COPY . .
 
+# internal/kustomize/kustomize.wasm is a Git LFS object. A checkout without
+# LFS has the pointer file there, and the build would embed it. Stop here
+# when the file does not start with the WebAssembly magic.
+RUN head -c 4 internal/kustomize/kustomize.wasm | od -An -tx1 | grep -q '00 61 73 6d' || \
+    { echo "internal/kustomize/kustomize.wasm is not WebAssembly; run git lfs pull" >&2; exit 1; }
+
 # Static, stripped binary. No cgo: objgitd is pure Go and answers the git
 # protocol natively (no `git` binary at runtime).
 RUN --mount=type=cache,target=/go/pkg/mod \
