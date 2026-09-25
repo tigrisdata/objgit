@@ -58,8 +58,8 @@ func (s *Storer) listKeys(prefix string) ([]string, error) {
 // same direction — so it catches up with the watermark early and reads the rest
 // locally, without ever having waited for the download.
 type objectIter struct {
-	s      *Storer
-	want   plumbing.ObjectType
+	s    *Storer
+	want plumbing.ObjectType
 	// snap and packed replace a copy of every packEntry: packed costs 8
 	// bytes for each object. A hash in more than one pack is yielded once,
 	// from the record that snap.lookup returns, and the loose walk skips any
