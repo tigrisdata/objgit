@@ -53,7 +53,12 @@ safe because of what it _cannot_ reach, not because of kernel isolation:
   `uniq`, `wc`, `tr`, `sha256sum`, `base64`, `base32`, `mkdir`, `cp`, `mv`,
   `rm`, `touch`, `date`, `sleep`, `seq`, and `expr`. There is no `git`,
   package manager, compiler, or `curl`.
-- **No network.**
+- **Kustomize and Kubernetes.** `kustomize` renders a bundle from `/src`.
+  With `-allow-kubernetes`, `kube:apply` and `tekton:pipelinerun` send
+  objects to the cluster that `objgitd` runs in. See
+  [kubernetes-hooks.md](kubernetes-hooks.md).
+- **No network.** The only exception is the Kubernetes API, for the two
+  Kubernetes commands, when `-allow-kubernetes` is on.
 - **No host filesystem.** The only files a hook can see are the two mounts
   below.
 
@@ -80,17 +85,17 @@ redirections like `echo x > out` — must target `/tmp`.
 
 Each run gets variables describing the branch that triggered it:
 
-| Variable                    | Example                    | Notes                                                     |
-| --------------------------- | -------------------------- | --------------------------------------------------------- |
-| `OBJGIT_REPO`               | `/myproject.git`           | Repository path                                           |
-| `OBJGIT_SERVICE`            | `receive-pack`             | Always `receive-pack`                                     |
-| `OBJGIT_REF`                | `refs/heads/main`          | Full ref name                                             |
-| `OBJGIT_BRANCH`             | `main`                     | Short branch name                                         |
-| `OBJGIT_OLD_SHA`            | `0000…0000`                | Previous tip; all zeros when the branch was created       |
-| `OBJGIT_NEW_SHA`            | `f43417…`                  | New tip                                                   |
-| `OBJGIT_ADDED_FILES_JSON`   | `["new.txt"]`              | Added paths, as a JSON array                              |
-| `OBJGIT_CHANGED_FILES_JSON` | `["README.md"]`            | Changed paths, as a JSON array                            |
-| `OBJGIT_DELETED_FILES_JSON` | `["old.txt"]`              | Deleted paths, as a JSON array                            |
+| Variable                    | Example                    | Notes                                                    |
+| --------------------------- | -------------------------- | -------------------------------------------------------- |
+| `OBJGIT_REPO`               | `/myproject.git`           | Repository path                                          |
+| `OBJGIT_SERVICE`            | `receive-pack`             | Always `receive-pack`                                    |
+| `OBJGIT_REF`                | `refs/heads/main`          | Full ref name                                            |
+| `OBJGIT_BRANCH`             | `main`                     | Short branch name                                        |
+| `OBJGIT_OLD_SHA`            | `0000…0000`                | Previous tip; all zeros when the branch was created      |
+| `OBJGIT_NEW_SHA`            | `f43417…`                  | New tip                                                  |
+| `OBJGIT_ADDED_FILES_JSON`   | `["new.txt"]`              | Added paths, as a JSON array                             |
+| `OBJGIT_CHANGED_FILES_JSON` | `["README.md"]`            | Changed paths, as a JSON array                           |
+| `OBJGIT_DELETED_FILES_JSON` | `["old.txt"]`              | Deleted paths, as a JSON array                           |
 | `OBJGIT_CHANGES_FILE`       | `/tmp/objgit-changes.json` | File containing all three arrays in a single JSON object |
 
 The file lists describe the **net change of the branch tip** across the push.
@@ -106,7 +111,7 @@ unpadded base64url encoding of its raw bytes.
 contains the same complete lists. For example:
 
 ```json
-{"added":["new.txt"],"changed":["README.md"],"deleted":["old.txt"]}
+{ "added": ["new.txt"], "changed": ["README.md"], "deleted": ["old.txt"] }
 ```
 
 For compatibility with scripts written for stock git, the same information is
@@ -220,5 +225,6 @@ Hook failure is logged, but it cannot undo the accepted push.
   scratch space.
 - No way to reject a push from a hook (it runs after the fact).
 - No system tooling, network, or arbitrary executables — only kefka's
-  registered commands.
+  registered commands. The Kubernetes commands reach only the in-cluster
+  API server.
 - Hook output reaches the pusher only when the client negotiated sideband.

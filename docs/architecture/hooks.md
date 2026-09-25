@@ -82,6 +82,30 @@ Open files report their full mounted path so WASI can stat them after open.
 sets the interpreter's `Dir` to `/src`. Without this setting, interp
 copies the host working directory of the daemon into `$PWD`.
 
+## Commands outside kefka
+
+`newHookShell` registers three commands that kefka does not have:
+
+| Command                            | Package              | Notes                                                                                          |
+| ---------------------------------- | -------------------- | ---------------------------------------------------------------------------------------------- |
+| `kustomize`                        | `internal/kustomize` | An embedded WASI kustomize, tracked with Git LFS. Always registered.                           |
+| `kube:apply`, `tekton:pipelinerun` | `internal/kube`      | Real commands when `d.kube` is set by `-allow-kubernetes`. Otherwise stubs that name the flag. |
+
+The kustomize adapter is not kefka's generic `wasmcommand`, for two
+reasons. It sets the guest `PWD` to the shell directory, because Go's
+wasip1 port takes its working directory from `PWD`. Its wazero runtime also
+closes a running instance when the context ends, so `-hook-timeout` stops a
+long build. The module compiles once for each process, in about 4 seconds.
+If the build embedded a Git LFS pointer, `Exec` returns an error that says so.
+
+`internal/kube` is a small REST client, not client-go. `InCluster` reads
+the ServiceAccount mount and reads the token again for each request, because
+bound tokens rotate. Each command run takes one `Session`, which caches
+discovery for each `apiVersion` until the run ends. `kubetest` is a fake
+API server for the tests. `TestCluster` runs the same calls against a real
+cluster when `OBJGIT_TEST_KUBE_*` is set. See
+[../usage/kubernetes-hooks.md](../usage/kubernetes-hooks.md).
+
 ## The interactive shell (`shell.go`)
 
 The SSH command `sh <repo> [branch]` opens the same sandbox as an interactive

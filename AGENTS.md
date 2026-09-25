@@ -49,6 +49,10 @@ Notes on the tests and on configuration:
   flag to UPPER_SNAKE. `-allow-push` becomes `ALLOW_PUSH`, and `-bucket`
   becomes `BUCKET`.
 - `godotenv` loads a `.env` file from the working directory at startup.
+- `internal/kustomize/kustomize.wasm` is a Git LFS object. Run `git lfs pull`
+  before you build. Without it, `TestEmbeddedModule` fails.
+- `TestCluster` in `internal/kube` needs a real cluster. It skips itself
+  without the `OBJGIT_TEST_KUBE_*` variables.
 - Tigris client credentials come from the standard AWS SDK chain, such as
   `AWS_PROFILE`.
 
@@ -66,7 +70,9 @@ Notes on the tests and on configuration:
 | `cmd/objgitd/snapshots.go`                                | The erofs snapshot run after a push.                                              |
 | `cmd/objgitd/lfs.go`                                      | The Git LFS HTTP handlers and `git-lfs-authenticate` over SSH.                    |
 | `internal/auth`                                           | The one authorization interface.                                                  |
-| `internal/lfs`                                            | Git LFS: protocol types, the bucket store, and the presigner.                    |
+| `internal/kube`                                           | The in-cluster API client, `kube:apply`, and `tekton:pipelinerun`.                |
+| `internal/kustomize`                                      | The embedded WASI kustomize (Git LFS) and its Kefka adapter.                      |
+| `internal/lfs`                                            | Git LFS: protocol types, the bucket store, and the presigner.                     |
 | `internal/repofs`                                         | Maps a repository path to a `storage.Storer`.                                     |
 | `internal/storage/tigris`                                 | Repository storage. A `storage.Storer` on the bucket.                             |
 | `internal/bundler`                                        | The async upload queue behind that storer.                                        |
@@ -86,7 +92,7 @@ describes the daemon and links to one page for each subsystem.
 | ------------------------------------------------------ | ----------------------------------------------------------------------- |
 | [transports.md](docs/architecture/transports.md)       | Any transport. It holds two protocol points that are easy to get wrong. |
 | [auth.md](docs/architecture/auth.md)                   | Credentials, decisions, or a new `Authorizer`.                          |
-| [hooks.md](docs/architecture/hooks.md)                 | Push hooks, output streaming, or the sandbox.                           |
+| [hooks.md](docs/architecture/hooks.md)                 | Push hooks, output streaming, the sandbox, or its Kubernetes commands.  |
 | [metrics.md](docs/architecture/metrics.md)             | Any metric or instrumentation seam.                                     |
 | [snapshots.md](docs/architecture/snapshots.md)         | Snapshot images, the snapshot cache, or `runSnapshots`.                 |
 | [tigris-storer.md](docs/architecture/tigris-storer.md) | Object layout, refs, packs, the pack cache, or the upload path.         |

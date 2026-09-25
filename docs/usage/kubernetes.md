@@ -105,6 +105,10 @@ git clone ssh://git@objgit.objgit.svc.cluster.local/org/repo.git
 Scrape metrics from `objgit-metrics.objgit.svc.cluster.local:9090/metrics`.
 The same listener serves pprof under `/debug/pprof/`.
 
+Hooks can apply Kustomize bundles and start Tekton PipelineRuns in the same
+cluster. This needs `ALLOW_KUBERNETES=true` and the RBAC in
+`manifest/tekton-rbac/`. See [kubernetes-hooks.md](kubernetes-hooks.md).
+
 ## Health check
 
 The metrics listener answers `GET /healthz` with `200 ok`. The smart-HTTP mux
