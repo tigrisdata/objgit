@@ -73,6 +73,7 @@ Notes on the tests and on configuration:
 | `internal/s3fs`                                           | Daemon-level state only, which is the SSH host key.                               |
 | `internal/mountfs`, `internal/treefs`, `internal/kefkash` | The hook sandbox filesystem and shell wiring.                                     |
 | `internal/metrics`                                        | Every Prometheus vector, plus thin helpers.                                       |
+| `internal/gittest`                                        | `Isolate`, which keeps the real git client in tests away from this repository.    |
 | `internal/snapshot`                                       | erofs images of git trees: `Ensure`, `Open`, and the `Store` interface.           |
 | `internal/slog.go`                                        | JSON handler init.                                                                |
 | `cmd/membench/`                                           | Push memory benchmark harness. Not shipped; see `docs/usage/memory-benchmark.md`. |
@@ -112,6 +113,10 @@ Two more directories carry detail:
   `http_test.go` and `git_protocol_test.go`.
 - Reuse the shared test helpers `runGit`, `tryGit`, and `seedRepo`. They live
   in `git_protocol_test.go`.
+- If a package runs the real git client in its tests, call `gittest.Isolate`
+  from its `TestMain`. The husky `commit-msg` hook runs `go test`, and git
+  exports `GIT_DIR` to hooks. Without `Isolate`, a test can write to the
+  config that all worktrees share and set `core.bare = true`.
 - Put a plan for non-trivial work in `docs/plans/`. `git-http-protocol.md`
   shows the style.
 - Put architecture notes in `docs/architecture/`, and not in this file. Keep
