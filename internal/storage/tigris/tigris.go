@@ -291,7 +291,7 @@ func New(ctx context.Context, bucket string, opts ...Option) (*Storer, error) {
 		s.client = c
 	}
 	s.up = newUploader(s)
-	s.packs = newPackIndex()
+	s.packs = newPackIndex(s.oh.Size())
 	s.refs = newRefCache()
 	s.shallow = newShallowCache()
 	s.fetchSem = make(chan struct{}, maxLivePackFetches)
@@ -334,7 +334,7 @@ func (s *Storer) Scoped(prefix string) *Storer {
 		cp.prefix = strings.TrimSuffix(cp.prefix, "/") + "/" + prefix + "/"
 	}
 	cp.up = newUploader(&cp)
-	cp.packs = newPackIndex()
+	cp.packs = newPackIndex(cp.oh.Size())
 	cp.refs = newRefCache()
 	cp.shallow = newShallowCache()
 	return &cp
