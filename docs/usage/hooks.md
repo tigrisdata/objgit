@@ -13,13 +13,45 @@ Hooks are off by default. Start the server with `-allow-hooks`:
 ./objgitd -bucket $BUCKET -allow-push -allow-hooks
 ```
 
-| Flag            | Env            | Default | Meaning                                                  |
-| --------------- | -------------- | ------- | -------------------------------------------------------- |
-| `-allow-hooks`  | `ALLOW_HOOKS`  | `false` | Run `.objgit/hooks/receive-pack` after a successful push |
-| `-hook-timeout` | `HOOK_TIMEOUT` | `60s`   | Wall-clock limit for a single hook run                   |
+| Flag              | Env              | Default                                 | Meaning                                                     |
+| ----------------- | ---------------- | --------------------------------------- | ----------------------------------------------------------- |
+| `-allow-hooks`    | `ALLOW_HOOKS`    | `false`                                 | Run `.objgit/hooks/receive-pack` after a successful push    |
+| `-hook-timeout`   | `HOOK_TIMEOUT`   | `60s`                                   | Wall-clock limit for a single hook run                      |
+| `-wasm-path`      | `WASM_PATH`      | `/app/wasm/bin,/usr/libexec/objgit/bin` | Comma-separated directories of WASI programs for hooks      |
+| `-wasm-cache-dir` | `WASM_CACHE_DIR` | empty                                   | Directory that keeps compiled WASI programs across restarts |
 
 `-allow-hooks` is independent of `-allow-push`, but a hook can only fire on a
 push, so in practice you want both.
+
+### WASI programs
+
+Each `.wasm` file in a `-wasm-path` directory is a hook command. The command
+name is the file name without `.wasm`, so `kustomize.wasm` is `kustomize`.
+The image puts the programs from `bin/` in `/usr/libexec/objgit/bin`.
+
+`-wasm-path` works like `PATH`:
+
+- If two directories have a program with the same name, the first directory
+  wins.
+- The daemon skips a directory that does not exist.
+- A program replaces a kefka command with the same name, such as `jq`.
+- A program cannot replace `kube:apply` or `tekton:pipelinerun`.
+
+The daemon lists the directories one time, at startup. It reads and compiles a
+program on its first run. The compile of kustomize takes about 4 seconds, and
+this time counts against `-hook-timeout`. With `-wasm-cache-dir`, the daemon
+keeps the compiled programs on disk, and a run after a restart starts in
+less than a second.
+
+To add a program to a deployment:
+
+1. Compile the program for WASI preview 1, for example with
+   `GOOS=wasip1 GOARCH=wasm go build`.
+2. Put the `.wasm` file in `/app/wasm/bin`, for example from a volume mount.
+3. Restart `objgitd`.
+
+A program sees the hook filesystem at `/`. It has no network. It gets these
+environment variables: `PWD`, `HOME`, and `TMPDIR`.
 
 ## When a hook runs
 
@@ -48,7 +80,8 @@ virtual `bash` interpreter. **This is not a container, VM, or OS sandbox.** It i
 safe because of what it _cannot_ reach, not because of kernel isolation:
 
 - **No system binaries.** Kefka provides Go commands, WASM-backed uutils, and
-  the WASM programs `jo`, `jq`, `python3` (also `python`), `qjs`, and `rg`. Available
+  the WASM programs `jo`, `jq`, `python3` (also `python`), `qjs`, and `rg`.
+  The [WASI programs](#wasi-programs) in `-wasm-path` add to these. Available
   coreutils include `cat`, `ls`, `printf`, `head`, `tail`, `cut`, `sort`,
   `uniq`, `wc`, `tr`, `sha256sum`, `base64`, `base32`, `mkdir`, `cp`, `mv`,
   `rm`, `touch`, `date`, `sleep`, `seq`, and `expr`. There is no `git`,

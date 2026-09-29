@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,7 +17,14 @@ import (
 	"github.com/tigrisdata/objgit/internal/kube"
 	"github.com/tigrisdata/objgit/internal/kube/kubetest"
 	"github.com/tigrisdata/objgit/internal/repofs"
+	"github.com/tigrisdata/objgit/internal/wasmbin"
 )
+
+// repoBins loads the repository's bin directory once, so the tests that run
+// kustomize compile it once.
+var repoBins = sync.OnceValues(func() (*wasmbin.Set, error) {
+	return wasmbin.Load(context.Background(), []string{filepath.Join("..", "..", "bin")}, "")
+})
 
 // tektonHook is the hook recipe from docs/usage/kubernetes-hooks.md.
 const tektonHook = "kustomize build .tekton | kube:apply && tekton:pipelinerun .tekton/testrun.yaml\n"
@@ -61,6 +69,11 @@ func TestReceivePackHookKubernetes(t *testing.T) {
 		},
 	}
 
+	bins, err := repoBins()
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			srv := kubetest.New(t)
@@ -73,6 +86,7 @@ func TestReceivePackHookKubernetes(t *testing.T) {
 				authz:       auth.AllowAnonymous{AllowWrite: true},
 				allowHooks:  true,
 				hookTimeout: 2 * time.Minute, // the first kustomize run compiles the module
+				bins:        bins,
 			}
 			if tt.enabled {
 				d.kube = kube.New(kube.Config{
@@ -96,7 +110,7 @@ func TestReceivePackHookKubernetes(t *testing.T) {
 			runGit(t, work, "config", "user.email", "test@example.com")
 			runGit(t, work, "config", "user.name", "Test")
 			for _, name := range []string{"kustomization.yaml", "x.yaml", "testrun.yaml"} {
-				data, err := os.ReadFile(filepath.Join("..", "..", "internal", "kustomize", "testdata", "tekton", name))
+				data, err := os.ReadFile(filepath.Join("..", "..", "internal", "wasmbin", "testdata", "tekton", name))
 				if err != nil {
 					t.Fatal(err)
 				}

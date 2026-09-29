@@ -5,11 +5,11 @@ cluster that `objgitd` runs in. Then the hook can start a Tekton
 PipelineRun for the pushed commit. Three commands in the hook shell do this
 work:
 
-| Command                   | What it does                                                              | Needs                                  |
-| ------------------------- | ------------------------------------------------------------------------- | -------------------------------------- |
-| `kustomize`               | Runs an embedded kustomize. It reads `/src` and can write only to `/tmp`. | `-allow-hooks`                         |
-| `kube:apply`              | Reads YAML on stdin and applies each object with Server-Side Apply.       | `-allow-hooks` and `-allow-kubernetes` |
-| `tekton:pipelinerun FILE` | Creates a new PipelineRun from a template, set to the pushed commit.      | `-allow-hooks` and `-allow-kubernetes` |
+| Command                   | What it does                                                                    | Needs                                  |
+| ------------------------- | ------------------------------------------------------------------------------- | -------------------------------------- |
+| `kustomize`               | Runs kustomize from `-wasm-path`. It reads `/src` and can write only to `/tmp`. | `-allow-hooks`                         |
+| `kube:apply`              | Reads YAML on stdin and applies each object with Server-Side Apply.             | `-allow-hooks` and `-allow-kubernetes` |
+| `tekton:pipelinerun FILE` | Creates a new PipelineRun from a template, set to the pushed commit.            | `-allow-hooks` and `-allow-kubernetes` |
 
 The commands are also in the SSH `sh` shell, because that shell is the hook
 sandbox. Read [hooks.md](hooks.md) first. It explains the sandbox, the
@@ -110,11 +110,13 @@ shell directory.
 - The sandbox has no network. Remote bases, such as a Git URL in
   `resources`, do not load.
 - The first run in each `objgitd` process compiles the module. This takes
-  about 4 seconds of CPU, and it counts against `-hook-timeout`.
+  about 4 seconds of CPU, and it counts against `-hook-timeout`. With
+  `-wasm-cache-dir`, only the first run on a new disk compiles it.
 - The hook timeout stops a long build.
 
-The embedded module reports its version as `(devel)`. Its SHA-256 is in
-`internal/kustomize/kustomize.go`.
+The image puts `bin/kustomize.wasm` from this repository in
+`/usr/libexec/objgit/bin`. See [WASI programs](hooks.md#wasi-programs). The
+module reports its version as `(devel)`, so its source revision is not known.
 
 ### kube:apply
 

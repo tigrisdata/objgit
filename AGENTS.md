@@ -49,8 +49,10 @@ Notes on the tests and on configuration:
   flag to UPPER_SNAKE. `-allow-push` becomes `ALLOW_PUSH`, and `-bucket`
   becomes `BUCKET`.
 - `godotenv` loads a `.env` file from the working directory at startup.
-- `internal/kustomize/kustomize.wasm` is a Git LFS object. Run `git lfs pull`
-  before you build. Without it, `TestEmbeddedModule` fails.
+- The `.wasm` files in `bin/` are Git LFS objects. Run `git lfs pull` before
+  you build. Without them, `TestRepoBin` fails. The image copies `bin/` to
+  `/usr/libexec/objgit/bin`. For a local run with hooks, set
+  `WASM_PATH=./bin`.
 - `TestCluster` in `internal/kube` needs a real cluster. It skips itself
   without the `OBJGIT_TEST_KUBE_*` variables.
 - Tigris client credentials come from the standard AWS SDK chain, such as
@@ -58,30 +60,31 @@ Notes on the tests and on configuration:
 
 ## Where the code lives
 
-| Path                                                      | Purpose                                                                           |
-| --------------------------------------------------------- | --------------------------------------------------------------------------------- |
-| `cmd/objgitd/main.go`                                     | Builds the one `*daemon` and starts every listener.                               |
-| `cmd/objgitd/git_protocol.go`                             | The git:// server. Also holds `operationFor` and `(*daemon).authorize`.           |
-| `cmd/objgitd/http.go`                                     | Smart HTTP. `*daemon` is the `http.Handler` itself.                               |
-| `cmd/objgitd/ssh.go`                                      | The SSH server and its per-session dispatch.                                      |
-| `cmd/objgitd/shell.go`                                    | The SSH `sh` command: an interactive shell in the hook sandbox.                   |
-| `cmd/objgitd/receivepack.go`                              | The go-git fork that streams hook output, plus `writePack`.                       |
-| `cmd/objgitd/hooks.go`                                    | Ref diffing and the sandboxed hook run.                                           |
-| `cmd/objgitd/snapshots.go`                                | The erofs snapshot run after a push.                                              |
-| `cmd/objgitd/lfs.go`                                      | The Git LFS HTTP handlers and `git-lfs-authenticate` over SSH.                    |
-| `internal/auth`                                           | The one authorization interface.                                                  |
-| `internal/kube`                                           | The in-cluster API client, `kube:apply`, and `tekton:pipelinerun`.                |
-| `internal/kustomize`                                      | The embedded WASI kustomize (Git LFS) and its Kefka adapter.                      |
-| `internal/lfs`                                            | Git LFS: protocol types, the bucket store, and the presigner.                     |
-| `internal/repofs`                                         | Maps a repository path to a `storage.Storer`.                                     |
-| `internal/storage/tigris`                                 | Repository storage. A `storage.Storer` on the bucket.                             |
-| `internal/bundler`                                        | The async upload queue behind that storer.                                        |
-| `internal/s3fs`                                           | Daemon-level state only, which is the SSH host key.                               |
-| `internal/mountfs`, `internal/treefs`, `internal/kefkash` | The hook sandbox filesystem and shell wiring.                                     |
-| `internal/metrics`                                        | Every Prometheus vector, plus thin helpers.                                       |
-| `internal/snapshot`                                       | erofs images of git trees: `Ensure`, `Open`, and the `Store` interface.           |
-| `internal/slog.go`                                        | JSON handler init.                                                                |
-| `cmd/membench/`                                           | Push memory benchmark harness. Not shipped; see `docs/usage/memory-benchmark.md`. |
+| Path                                                      | Purpose                                                                                |
+| --------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `cmd/objgitd/main.go`                                     | Builds the one `*daemon` and starts every listener.                                    |
+| `cmd/objgitd/git_protocol.go`                             | The git:// server. Also holds `operationFor` and `(*daemon).authorize`.                |
+| `cmd/objgitd/http.go`                                     | Smart HTTP. `*daemon` is the `http.Handler` itself.                                    |
+| `cmd/objgitd/ssh.go`                                      | The SSH server and its per-session dispatch.                                           |
+| `cmd/objgitd/shell.go`                                    | The SSH `sh` command: an interactive shell in the hook sandbox.                        |
+| `cmd/objgitd/receivepack.go`                              | The go-git fork that streams hook output, plus `writePack`.                            |
+| `cmd/objgitd/hooks.go`                                    | Ref diffing and the sandboxed hook run.                                                |
+| `cmd/objgitd/snapshots.go`                                | The erofs snapshot run after a push.                                                   |
+| `cmd/objgitd/lfs.go`                                      | The Git LFS HTTP handlers and `git-lfs-authenticate` over SSH.                         |
+| `internal/auth`                                           | The one authorization interface.                                                       |
+| `internal/kube`                                           | The in-cluster API client, `kube:apply`, and `tekton:pipelinerun`.                     |
+| `internal/wasmbin`                                        | Runs the WASI programs in `-wasm-path`, such as kustomize, as hook commands.           |
+| `internal/lfs`                                            | Git LFS: protocol types, the bucket store, and the presigner.                          |
+| `internal/repofs`                                         | Maps a repository path to a `storage.Storer`.                                          |
+| `internal/storage/tigris`                                 | Repository storage. A `storage.Storer` on the bucket.                                  |
+| `internal/bundler`                                        | The async upload queue behind that storer.                                             |
+| `internal/s3fs`                                           | Daemon-level state only, which is the SSH host key.                                    |
+| `internal/mountfs`, `internal/treefs`, `internal/kefkash` | The hook sandbox filesystem and shell wiring.                                          |
+| `internal/metrics`                                        | Every Prometheus vector, plus thin helpers.                                            |
+| `internal/snapshot`                                       | erofs images of git trees: `Ensure`, `Open`, and the `Store` interface.                |
+| `internal/slog.go`                                        | JSON handler init.                                                                     |
+| `bin/`                                                    | WASI programs for hooks (Git LFS). The image copies them to `/usr/libexec/objgit/bin`. |
+| `cmd/membench/`                                           | Push memory benchmark harness. Not shipped; see `docs/usage/memory-benchmark.md`.      |
 
 ## Architecture
 

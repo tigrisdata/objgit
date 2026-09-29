@@ -24,11 +24,11 @@ import (
 	"github.com/go-git/go-git/v6/storage"
 	"github.com/tigrisdata/objgit/internal/kefkash"
 	"github.com/tigrisdata/objgit/internal/kube"
-	"github.com/tigrisdata/objgit/internal/kustomize"
 	"github.com/tigrisdata/objgit/internal/metrics"
 	"github.com/tigrisdata/objgit/internal/mountfs"
 	"github.com/tigrisdata/objgit/internal/pushevents"
 	"github.com/tigrisdata/objgit/internal/treefs"
+	"github.com/tigrisdata/objgit/internal/wasmbin"
 	"github.com/tigrisdata/objgit/internal/webhook"
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
@@ -166,7 +166,7 @@ func (d *daemon) runHook(repoPath, service string, st storage.Storer, u refUpdat
 	}
 
 	stdin := strings.NewReader(hookStdin(u))
-	sh, err := newHookShell(tree, changes, hookEnv(repoPath, service, u, changes), d.kube, hookOrigin(repoPath, u), stdin, stdout, stderr)
+	sh, err := newHookShell(tree, changes, hookEnv(repoPath, service, u, changes), d.bins, d.kube, hookOrigin(repoPath, u), stdin, stdout, stderr)
 	if err != nil {
 		log.Error("hook: build shell", "err", err)
 		return
@@ -288,10 +288,11 @@ func hookStdin(u refUpdate) string {
 // newHookShell builds the kefka sandbox a hook runs in: /src is a lazy
 // read-only view of tree, /tmp is writable scratch that holds hookChangesFile,
 // and the shell starts in /src with env. Both push hooks and the SSH sh command
-// use it, so the two environments cannot drift apart. kc backs kube:apply and
-// tekton:pipelinerun, which act for origin; nil registers stubs that say how
-// to turn them on.
-func newHookShell(tree *object.Tree, changes hookChanges, env []string, kc *kube.Client, origin kube.Origin, stdin io.Reader, stdout, stderr io.Writer) (*interp.Runner, error) {
+// use it, so the two environments cannot drift apart. bins adds the WASI
+// programs from -wasm-path, which can replace a kefka built-in. kc backs
+// kube:apply and tekton:pipelinerun, which act for origin; nil registers stubs
+// that say how to turn them on.
+func newHookShell(tree *object.Tree, changes hookChanges, env []string, bins *wasmbin.Set, kc *kube.Client, origin kube.Origin, stdin io.Reader, stdout, stderr io.Writer) (*interp.Runner, error) {
 	fsys := mountfs.New(map[string]billy.Filesystem{
 		"src": treefs.New(tree),
 		"tmp": memfs.New(),
@@ -304,7 +305,7 @@ func newHookShell(tree *object.Tree, changes hookChanges, env []string, kc *kube
 	coreutils.Register(reg)
 	wasmprog.Register(reg)
 	uutils.Register(reg)
-	kustomize.Register(reg)
+	bins.Register(reg)
 	kube.Register(reg, kc, origin)
 	if err := reg.Chdir(fsys, "/src"); err != nil {
 		return nil, fmt.Errorf("chdir /src: %w", err)

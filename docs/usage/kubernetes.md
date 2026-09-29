@@ -130,6 +130,10 @@ The startup, liveness, and readiness probes in the manifest all send
   the SSH host key live in the Tigris bucket. On startup, the daemon sweeps
   cache directories that an earlier run left behind, so a crash does not
   leak disk space across restarts.
+- The **WASI compilation cache** (`WASM_CACHE_DIR`) is at
+  `/var/cache/objgit/wasm` on the same claim. The compiled kustomize is about
+  100 MB. With this cache, the first hook after a restart does not compile
+  kustomize again.
 - **Upload scratch data** is separate from the pack cache. The tigris storer
   stages pack writes to the OS temp directory through `os.CreateTemp`. The
   root filesystem of the container is read-only, so the OS temp directory

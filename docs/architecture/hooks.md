@@ -84,19 +84,30 @@ copies the host working directory of the daemon into `$PWD`.
 
 ## Commands outside kefka
 
-`newHookShell` registers three commands that kefka does not have:
+`newHookShell` registers commands that kefka does not have:
 
-| Command                            | Package              | Notes                                                                                          |
-| ---------------------------------- | -------------------- | ---------------------------------------------------------------------------------------------- |
-| `kustomize`                        | `internal/kustomize` | An embedded WASI kustomize, tracked with Git LFS. Always registered.                           |
-| `kube:apply`, `tekton:pipelinerun` | `internal/kube`      | Real commands when `d.kube` is set by `-allow-kubernetes`. Otherwise stubs that name the flag. |
+| Command                                                | Package            | Notes                                                                                               |
+| ------------------------------------------------------ | ------------------ | --------------------------------------------------------------------------------------------------- |
+| Each `.wasm` file in `-wasm-path`, such as `kustomize` | `internal/wasmbin` | WASI programs from directories in the image. `d.bins` holds them. It is nil without `-allow-hooks`. |
+| `kube:apply`, `tekton:pipelinerun`                     | `internal/kube`    | Real commands when `d.kube` is set by `-allow-kubernetes`. Otherwise stubs that name the flag.      |
 
-The kustomize adapter is not kefka's generic `wasmcommand`, for two
-reasons. It sets the guest `PWD` to the shell directory, because Go's
-wasip1 port takes its working directory from `PWD`. Its wazero runtime also
-closes a running instance when the context ends, so `-hook-timeout` stops a
-long build. The module compiles once for each process, in about 4 seconds.
-If the build embedded a Git LFS pointer, `Exec` returns an error that says so.
+`wasmbin.Load` lists the `-wasm-path` directories one time, at startup. It
+does not read the files. The first directory with a name wins, as in `PATH`.
+`newHookShell` registers the programs after the kefka built-ins and before
+`internal/kube`. A program can replace a built-in such as `jq`. A program
+cannot replace `kube:apply` or `tekton:pipelinerun`.
+
+Each program compiles on its first run. Only a successful compile stays in
+memory, so the next run reads a missing or damaged file again. The compile of
+kustomize takes about 4 seconds. With `-wasm-cache-dir`, wazero keeps the
+compiled code on disk, and a later start loads it in about 0.15 seconds. If a
+file is a Git LFS pointer, `Exec` returns an error that says so.
+
+The adapter is not kefka's generic `wasmcommand`, for two reasons. It sets
+the guest `PWD` to the shell directory, because Go's wasip1 port takes its
+working directory from `PWD`. Its wazero runtime also closes a running
+instance when the context ends, so `-hook-timeout` stops a long build. All
+programs share one runtime.
 
 `internal/kube` is a small REST client, not client-go. `InCluster` reads
 the ServiceAccount mount and reads the token again for each request, because
