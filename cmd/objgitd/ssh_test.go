@@ -167,12 +167,7 @@ func gitSSHEnv(t *testing.T) []string {
 	t.Helper()
 	key := sshClientKey(t)
 	sshCmd := fmt.Sprintf("ssh -i %q -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null", key)
-	return append(os.Environ(),
-		"GIT_SSH_COMMAND="+sshCmd,
-		"GIT_TERMINAL_PROMPT=0",
-		"GIT_CONFIG_GLOBAL=/dev/null",
-		"GIT_CONFIG_SYSTEM=/dev/null",
-	)
+	return append(os.Environ(), "GIT_SSH_COMMAND="+sshCmd)
 }
 
 // gitWithEnv runs git with a custom environment, returning combined output and
