@@ -1,3 +1,5 @@
+## [1.13.2](https://github.com/tigrisdata/objgit/compare/v1.13.1...v1.13.2) (2026-09-29)
+
 ## [1.13.1](https://github.com/tigrisdata/objgit/compare/v1.13.0...v1.13.1) (2026-09-25)
 
 ### Performance Improvements
