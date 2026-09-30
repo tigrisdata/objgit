@@ -12,6 +12,7 @@ Notable features:
 - ssh, http, and git protocol support.
 - [post-receive hooks](./docs/usage/hooks.md) powered by userspace sandboxed shells and [Kefka](https://xeiaso.net/blog/2026/dancing-mad-sandboxing/).
 - SSH sandbox access to the environment hooks run in.
+- [Kustomize, Kubernetes, and Tekton commands](./docs/usage/kubernetes-hooks.md) in hooks, so a push can start a PipelineRun.
 - [Git LFS](./docs/usage/lfs.md) with presigned transfers, so large files move straight between the client and Tigris instead of through the daemon. LFS object bytes are deduplicated across every repository in the bucket.
 - EROFS snapshots per tree (including LFS pointer resolution).
 - basic prometheus metrics.

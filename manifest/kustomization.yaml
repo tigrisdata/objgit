@@ -69,6 +69,14 @@ configMapGenerator:
       # Run .objgit/hooks/receive-pack from the repository after a push. See
       # docs/usage/hooks.md.
       - ALLOW_HOOKS=false
+      # Give hooks the kube:apply and tekton:pipelinerun commands, with the
+      # objgitd ServiceAccount. Needs ALLOW_HOOKS=true and the RBAC in
+      # manifest/tekton-rbac/. Anybody who can push can then use that
+      # ServiceAccount. See docs/usage/kubernetes-hooks.md.
+      - ALLOW_KUBERNETES=false
+      # Keep compiled WASI programs, such as kustomize, on the PVC. Without
+      # it, the first hook after each restart spends seconds on a compile.
+      - WASM_CACHE_DIR=/var/cache/objgit/wasm
       - SLOG_LEVEL=INFO
 
 secretGenerator:

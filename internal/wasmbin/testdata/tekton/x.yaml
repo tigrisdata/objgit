@@ -1,0 +1,24 @@
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: xe-x-build-test
+  namespace: ci
+
+spec:
+  params:
+    - name: "branch"
+      type: string
+    - name: "commit"
+      type: string
+  workspaces:
+    - name: repo
+  tasks:
+    - name: clone-repo
+      taskRef:
+        name: git-clone-naive
+      workspaces:
+        - name: output
+          workspace: repo
+      params:
+        - name: revision
+          value: $(params.commit)

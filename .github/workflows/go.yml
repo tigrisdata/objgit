@@ -24,6 +24,9 @@ jobs:
         with:
           persist-credentials: false
           fetch-tags: true
+          # The .wasm files in bin/ are Git LFS objects. Without them, the
+          # tests and the image get the pointer files.
+          lfs: true
 
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:

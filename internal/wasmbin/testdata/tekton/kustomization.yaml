@@ -1,0 +1,5 @@
+# A trimmed copy of https://github.com/Xe/x/tree/master/.tekton.
+namespace: ci
+
+resources:
+  - x.yaml

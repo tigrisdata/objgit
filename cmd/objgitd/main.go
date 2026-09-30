@@ -25,11 +25,13 @@ import (
 	"github.com/tigrisdata/objgit"
 	"github.com/tigrisdata/objgit/internal"
 	"github.com/tigrisdata/objgit/internal/auth"
+	"github.com/tigrisdata/objgit/internal/kube"
 	"github.com/tigrisdata/objgit/internal/lfs"
 	"github.com/tigrisdata/objgit/internal/metrics"
 	"github.com/tigrisdata/objgit/internal/repofs"
 	"github.com/tigrisdata/objgit/internal/s3fs"
 	"github.com/tigrisdata/objgit/internal/storage/tigris"
+	"github.com/tigrisdata/objgit/internal/wasmbin"
 	tstorage "github.com/tigrisdata/storage-go"
 	"golang.org/x/sync/errgroup"
 
@@ -46,6 +48,11 @@ var (
 
 	allowHooks  = flag.Bool("allow-hooks", false, "run .objgit/hooks/receive-pack in a sandbox after a successful push")
 	hookTimeout = flag.Duration("hook-timeout", 60*time.Second, "wall-clock limit for a single hook run")
+
+	wasmPath     = flag.String("wasm-path", "/app/wasm/bin,/usr/libexec/objgit/bin", "comma-separated directories of WASI programs that hooks and the SSH sh command can run; each *.wasm file is a command named after the file, the first directory with a name wins, as in PATH, and a directory that does not exist is skipped")
+	wasmCacheDir = flag.String("wasm-cache-dir", "", "directory that keeps compiled WASI programs from -wasm-path across restarts; empty keeps them in memory only, so each start compiles each program again on its first run")
+
+	allowKubernetes = flag.Bool("allow-kubernetes", false, "enable the kube:apply and tekton:pipelinerun commands in hooks and the SSH sh command; they act with the pod's in-cluster ServiceAccount, so anybody who can push a hook gets its Kubernetes permissions. Needs -allow-hooks")
 
 	packCacheDir   = flag.String("pack-cache-dir", "", "parent directory for the local pack cache; empty uses the OS temp directory")
 	packCacheBytes = flag.Int64("pack-cache-bytes", 2<<30, "disk budget for the local pack cache, least-recently-used eviction; 0 disables caching")
@@ -114,6 +121,11 @@ func main() {
 			slog.Error("-allow-lfs with -ssh-bind needs -external-url; git-lfs-authenticate has to name a public HTTP URL")
 			os.Exit(1)
 		}
+	}
+
+	if *allowKubernetes && !*allowHooks {
+		slog.Error("-allow-kubernetes needs -allow-hooks; the Kubernetes commands only run in hooks and the SSH sh command")
+		os.Exit(1)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -198,6 +210,30 @@ func main() {
 		snapshotTmpDir:  *packCacheDir,
 	}
 
+	if *allowKubernetes {
+		kc, err := kube.InCluster()
+		if err != nil {
+			slog.Error("-allow-kubernetes needs an in-cluster ServiceAccount", "err", err)
+			os.Exit(1)
+		}
+		d.kube = kc
+	}
+
+	if *allowHooks {
+		// Load only lists the directories. Each program is read and compiled
+		// on its first run, which for kustomize takes seconds without a cache.
+		bins, err := wasmbin.Load(ctx, strings.Split(*wasmPath, ","), *wasmCacheDir)
+		if err != nil {
+			slog.Error("can't load WASI programs", "wasm_path", *wasmPath, "err", err)
+			os.Exit(1)
+		}
+		defer bins.Close(context.Background())
+		if len(bins.Names()) == 0 {
+			slog.Warn("no WASI programs found; hooks cannot run kustomize", "wasm_path", *wasmPath)
+		}
+		d.bins = bins
+	}
+
 	if *allowLFS {
 		// The store talks to the bucket, so it gets the hardened client like
 		// every other request path. rawClient survives only for the presigner:
@@ -222,6 +258,8 @@ func main() {
 		"bucket", *bucket,
 		"allow_push", *allowPush,
 		"allow_hooks", *allowHooks,
+		"allow_kubernetes", *allowKubernetes,
+		"wasm_commands", d.bins.Names(),
 		"allow_lfs", *allowLFS,
 		"external_url", *externalURL,
 		"pack_cache_bytes", *packCacheBytes,

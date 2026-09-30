@@ -82,6 +82,46 @@ Open files report their full mounted path so WASI can stat them after open.
 sets the interpreter's `Dir` to `/src`. Without this setting, interp
 copies the host working directory of the daemon into `$PWD`.
 
+## Commands outside kefka
+
+`newHookShell` registers commands that kefka does not have:
+
+| Command                                                | Package            | Notes                                                                                               |
+| ------------------------------------------------------ | ------------------ | --------------------------------------------------------------------------------------------------- |
+| Each `.wasm` file in `-wasm-path`, such as `kustomize` | `internal/wasmbin` | WASI programs from directories in the image. `d.bins` holds them. It is nil without `-allow-hooks`. |
+| `kube:apply`, `tekton:pipelinerun`                     | `internal/kube`    | Real commands when `d.kube` is set by `-allow-kubernetes`. Otherwise stubs that name the flag.      |
+
+`wasmbin.Load` lists the `-wasm-path` directories one time, at startup. It
+does not read the files. The first directory with a name wins, as in `PATH`.
+`newHookShell` registers the programs after the kefka built-ins and before
+`internal/kube`. A program can replace a built-in such as `jq`. A program
+cannot replace `kube:apply` or `tekton:pipelinerun`.
+
+Each program compiles on its first run. Only a successful compile stays in
+memory, so the next run reads a missing or damaged file again. The compile of
+kustomize takes about 4 seconds. With `-wasm-cache-dir`, wazero keeps the
+compiled code on disk, and a later start loads it in about 0.15 seconds. If a
+file is a Git LFS pointer, `Exec` returns an error that says so.
+
+The adapter is not kefka's generic `wasmcommand`, for two reasons. It sets
+the guest `PWD` to the shell directory, because Go's wasip1 port takes its
+working directory from `PWD`. Its wazero runtime also closes a running
+instance when the context ends, so `-hook-timeout` stops a long build. All
+programs share one runtime.
+
+`internal/kube` is a small REST client, not client-go. `InCluster` reads
+the ServiceAccount mount and reads the token again for each request, because
+bound tokens rotate. Each command run takes one `Session`, which caches
+discovery for each `apiVersion` until the run ends. The commands get a `kube.Origin`
+from `hookOrigin`, and not from the `OBJGIT_*` variables, because a script
+can change those. The audit log (`kube: applied`, `kube: created`) and the
+PipelineRun metadata use this origin. `splitAPIVersion` refuses an
+`apiVersion` that is not a plain group and version, because both go into
+request paths. `kubetest` is a fake
+API server for the tests. `TestCluster` runs the same calls against a real
+cluster when `OBJGIT_TEST_KUBE_*` is set. See
+[../usage/kubernetes-hooks.md](../usage/kubernetes-hooks.md).
+
 ## The interactive shell (`shell.go`)
 
 The SSH command `sh <repo> [branch]` opens the same sandbox as an interactive

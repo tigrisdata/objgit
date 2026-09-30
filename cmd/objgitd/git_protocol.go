@@ -13,8 +13,10 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/storage"
 	"github.com/tigrisdata/objgit/internal/auth"
+	"github.com/tigrisdata/objgit/internal/kube"
 	"github.com/tigrisdata/objgit/internal/metrics"
 	"github.com/tigrisdata/objgit/internal/repofs"
+	"github.com/tigrisdata/objgit/internal/wasmbin"
 )
 
 // handshakeTimeout bounds how long a client has to send its git-proto-request.
@@ -72,6 +74,15 @@ type daemon struct {
 	// registers no LFS route, so the feature reads as a 404 from outside
 	// instead of as a broken endpoint.
 	lfs *lfsService
+
+	// kube is the Kubernetes API client behind the kube:apply and
+	// tekton:pipelinerun hook commands, nil when -allow-kubernetes is unset.
+	// A nil kube registers stubs that name the flag.
+	kube *kube.Client
+
+	// bins is the WASI programs from -wasm-path, such as kustomize, that
+	// hooks and the SSH sh command can run. A nil bins adds none.
+	bins *wasmbin.Set
 }
 
 // storerFor reports whether a repository already exists at st, returning st
