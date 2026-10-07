@@ -207,6 +207,37 @@ The wall time did not change by a measurable amount, at 25 s to 28 s on a
 laptop. One `pread` for each inflate, about 1.4 million calls, now takes most
 of the time. See phase 3.
 
+## A smaller zstd window (done)
+
+After phase 2, the largest fixed cost of a push was the history of the zstd
+encoder. The `encoder()` singleton used the default window, and it kept 64 MiB
+of history for the life of the process.
+
+Each input of the singleton is an object of at most `inMemoryCap` (1 MiB), a
+`probeWindow` head, or a block of a `.cue` or packed-refs. A window of
+`inMemoryCap` therefore finds almost all of the same matches. Objects larger
+than `inMemoryCap` use `streamEncPool`, and this change does not touch them.
+
+The numbers come from the harness of phase 1, with the same packs.
+
+| Measurement                     | Default window |   1 MiB window |
+| ------------------------------- | -------------: | -------------: |
+| Xe/x, live heap after the push  |         72 MiB |         16 MiB |
+| Xe/x, resolve peak heap         |        213 MiB |         79 MiB |
+| Xe/x, peak RSS                  |        204 MiB |        123 MiB |
+| golang/go, live heap after push |         72 MiB |         16 MiB |
+| golang/go, resolve peak heap    | 450 to 478 MiB | 366 to 372 MiB |
+| golang/go, peak RSS             | 466 to 487 MiB | 394 to 397 MiB |
+| Xe/x, `.bin` bytes              |     41,996,083 |     41,996,083 |
+| Xe/x, `.cue` bytes              |        781,897 |        782,627 |
+| golang/go, `.bin` bytes         |    811,363,186 |    811,363,186 |
+| golang/go, `.cue` bytes         |     28,360,904 |     28,422,877 |
+
+The `.bin` bytes do not change, because each input on that path fits in the
+window. A `.cue` block can be larger than 1 MiB, so the `.cue` files grow by
+0.09% for Xe/x and by 0.22% for golang/go. The wall time does not change by a
+measurable amount.
+
 ## Phase 3: work to examine later
 
 - **Index size for very large repositories.** After phase 2, about 110 bytes
@@ -219,10 +250,6 @@ of the time. See phase 3.
   page cache, and cgroup accounting counts them in both cases.
 - **The `.cue` zstd decoder.** It keeps about 45 MiB of buffers after its
   first use. A lower decoder concurrency cuts that.
-- **The zstd encoder.** It keeps 64 MiB of history for each process.
-  `EncodeAll` inputs are at most `inMemoryCap` (1 MiB), except `.cue` blocks.
-  A 1 MiB window cuts that to about 8 MiB. This changes the compressed bytes,
-  so it needs its own measurement.
 - **Large bases in their own container.** An object larger than
   `maxPackBytes` gets a container of its own. A delta against it lands in the
   next container, so the writer stores that delta whole. This behavior is

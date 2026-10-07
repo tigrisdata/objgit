@@ -120,6 +120,14 @@ func SetEncoderConcurrency(n int) {
 	encoderConcurrency = n
 }
 
+// encoderWindow is the match window of the encoder() singleton. Every input
+// it compresses is an object of at most inMemoryCap, a probeWindow head, or a
+// block of a .cue or packed-refs, so a window larger than inMemoryCap finds
+// almost no more matches. Each encoder state keeps a history buffer sized off
+// the window for the life of the process, so the default window cost 64 MiB
+// of heap across encoderConcurrency states.
+const encoderWindow = inMemoryCap
+
 func encoder() *zstd.Encoder {
 	zstdEncOnce.Do(func() {
 		// Errors here are impossible with a nil writer and valid options; the
@@ -127,6 +135,7 @@ func encoder() *zstd.Encoder {
 		zstdEnc, _ = zstd.NewWriter(nil,
 			zstd.WithEncoderLevel(zstd.SpeedDefault),
 			zstd.WithEncoderConcurrency(encoderConcurrency),
+			zstd.WithWindowSize(encoderWindow),
 		)
 	})
 	return zstdEnc
