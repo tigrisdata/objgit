@@ -443,9 +443,12 @@ Reads check three tiers, in this order:
 
 The pack index starts with a listing of `packs/*.cue` for each `Storer`.
 If both the index and loose storage lack an object, the reader lists packs
-once more. Concurrent misses share that refresh. The refresh loads only unseen
+again. Concurrent misses share one in-flight refresh. The refresh loads only unseen
 packs and preserves existing tables, iterator snapshots, and local registrations.
-Repeated misses cannot trigger more listings in that storer. Permission errors,
+Each completed attempt starts a one-second cooldown for that storer.
+Misses during the cooldown reuse its result, including an error. Later misses
+can retry after a genuine missing-object probe, an incomplete listing, or a
+storage failure. Known objects remain readable during refresh. Permission errors,
 corrupt cues, and canceled operations remain errors. This bounded recovery does
 not replace the supported bucket consistency requirement.
 Those files are small, and no `.bin` body is read to build it.

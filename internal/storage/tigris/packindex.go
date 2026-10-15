@@ -422,13 +422,15 @@ type packAccess struct {
 // newest record of a hash wins, and a push's own writes win over the cold
 // build.
 type packIndex struct {
-	mu          sync.Mutex
-	buildMu     sync.Mutex // serializes cold builds and the bounded refresh
-	refreshOnce sync.Once
-	refreshErr  error
-	indexed     map[string]struct{} // immutable packs already registered or loaded
-	built       bool
-	hashSize    int
+	mu           sync.Mutex
+	buildMu      sync.Mutex // serializes cold builds and the bounded refresh
+	refreshMu    sync.Mutex
+	refresh      *packRefresh
+	refreshAfter time.Time
+	refreshErr   error
+	indexed      map[string]struct{} // immutable packs already registered or loaded
+	built        bool
+	hashSize     int
 
 	ids    []string          // pack number -> pack id
 	idNum  map[string]uint32 // pack id -> pack number
@@ -663,7 +665,7 @@ func (p *packIndex) bulkCopy(id string) (*os.File, bool) {
 }
 
 // ensurePacksBuilt loads the initial pack listing. A miss in both pack and
-// loose storage can request one additional listing through refreshPacks.
+// loose storage can request another listing through refreshPacks.
 func (s *Storer) ensurePacksBuilt() error {
 	s.packs.mu.Lock()
 	built := s.packs.built
@@ -674,12 +676,48 @@ func (s *Storer) ensurePacksBuilt() error {
 	return s.buildPacks(false)
 }
 
-// refreshPacks coalesces all misses into at most one extra listing per Storer.
-// It adds only previously unseen immutable packs, preserving local registrations
-// and existing iterator snapshots. It cannot guarantee global read consistency.
+// packRefresh holds one attempt's result for all callers that joined it.
+// Closing done publishes err without holding the index or refresh locks.
+type packRefresh struct {
+	done chan struct{}
+	err  error
+}
+
+// refreshPacks coalesces concurrent misses and limits attempts to one per
+// second after completion. A later miss can recover after an empty listing or
+// a transient error. Known objects never wait for this path.
 func (s *Storer) refreshPacks() error {
-	s.packs.refreshOnce.Do(func() { s.packs.refreshErr = s.buildPacks(true) })
-	return s.packs.refreshErr
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
+	p := s.packs
+	p.refreshMu.Lock()
+	if active := p.refresh; active != nil {
+		p.refreshMu.Unlock()
+		select {
+		case <-active.done:
+			return active.err
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		}
+	}
+	if time.Now().Before(p.refreshAfter) {
+		err := p.refreshErr
+		p.refreshMu.Unlock()
+		return err
+	}
+	active := &packRefresh{done: make(chan struct{})}
+	p.refresh = active
+	p.refreshMu.Unlock()
+
+	active.err = s.buildPacks(true)
+	p.refreshMu.Lock()
+	p.refreshErr = active.err
+	p.refreshAfter = time.Now().Add(time.Second)
+	p.refresh = nil
+	close(active.done)
+	p.refreshMu.Unlock()
+	return active.err
 }
 
 func (s *Storer) buildPacks(refresh bool) error {

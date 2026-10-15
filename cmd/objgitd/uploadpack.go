@@ -10,7 +10,6 @@ import (
 	"strconv"
 
 	"github.com/go-git/go-git/v6/plumbing/format/pktline"
-	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/storage"
 )
@@ -20,38 +19,75 @@ import (
 // response must end at the shallow-update flush. go-git otherwise appends a
 // NAK, which Git mistakes for the next round's shallow list.
 func uploadPackHTTP(ctx context.Context, st storage.Storer, in io.ReadCloser, out io.WriteCloser, opts *transport.UploadPackRequest) error {
-	rd := bufio.NewReader(in)
-	n, _, err := pktline.PeekLine(rd)
-	if err != nil {
-		return err
-	}
-	if n == pktline.Flush {
-		return nil
-	}
-	var req packp.UploadRequest
-	if err := req.Decode(rd); err != nil {
-		return fmt.Errorf("decode upload request: %w", err)
-	}
-	var prefix bytes.Buffer
-	if err := req.Encode(&prefix); err != nil {
-		return err
-	}
-	var shallowOnly bool
-	if !req.Depth.IsZero() {
-		_, err := rd.Peek(1)
-		shallowOnly = errors.Is(err, io.EOF)
-		if err != nil && !shallowOnly {
-			return err
-		}
-	}
-	if shallowOnly {
-		out = &shallowRoundWriter{WriteCloser: out}
-	}
-	err = transport.UploadPack(ctx, st, io.NopCloser(io.MultiReader(&prefix, rd)), out, opts)
-	if shallowOnly && errors.Is(err, errShallowRoundDone) {
+	rd := &uploadRequestReader{rd: bufio.NewReader(in)}
+	defer rd.Close()
+	response := &shallowRoundWriter{WriteCloser: out, request: rd}
+	err := transport.UploadPack(ctx, st, io.NopCloser(rd), response, opts)
+	if rd.shallowOnly && errors.Is(err, errShallowRoundDone) {
 		return nil
 	}
 	return err
+}
+
+// uploadRequestReader forwards the original bytes, one packet at a time, until
+// the first flush. It only recognizes deepen and request EOF; upstream owns
+// validation. Memory stays bounded regardless of the number of wants/shallows.
+type uploadRequestReader struct {
+	rd          *bufio.Reader
+	packet      *[pktline.MaxSize]byte
+	pending     []byte
+	deepen      bool
+	finished    bool
+	shallowOnly bool
+}
+
+func (r *uploadRequestReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if len(r.pending) == 0 {
+		if r.finished {
+			return r.rd.Read(p)
+		}
+		if r.packet == nil {
+			r.packet = pktline.GetBuffer()
+		}
+		n, err := pktline.Read(r.rd, r.packet[:])
+		if err != nil {
+			return 0, err
+		}
+		if n == pktline.Flush {
+			r.finished = true
+			if r.deepen {
+				_, err := r.rd.Peek(1)
+				r.shallowOnly = errors.Is(err, io.EOF)
+				if err != nil && !r.shallowOnly {
+					return 0, err
+				}
+			}
+		}
+		r.pending = r.packet[:max(n, pktline.LenSize)]
+		if bytes.HasPrefix(r.pending[4:], []byte("deepen")) {
+			r.deepen = true
+		}
+	}
+	n := copy(p, r.pending)
+	r.pending = r.pending[n:]
+	if r.finished && len(r.pending) == 0 {
+		// Pack generation can outlive negotiation by minutes. Return the
+		// packet buffer as soon as the flush has reached upstream.
+		_ = r.Close()
+	}
+	return n, nil
+}
+
+func (r *uploadRequestReader) Close() error {
+	if r.packet != nil {
+		pktline.PutBuffer(r.packet)
+		r.packet = nil
+		r.pending = nil
+	}
+	return nil
 }
 
 var errShallowRoundDone = errors.New("shallow discovery round complete")
@@ -61,6 +97,7 @@ var errShallowRoundDone = errors.New("shallow discovery round complete")
 // and supports arbitrary Write boundaries, including several packets at once.
 type shallowRoundWriter struct {
 	io.WriteCloser
+	request   *uploadRequestReader
 	header    [4]byte
 	headerN   int
 	remaining int
@@ -68,6 +105,9 @@ type shallowRoundWriter struct {
 }
 
 func (w *shallowRoundWriter) Write(p []byte) (int, error) {
+	if w.request != nil && !w.request.shallowOnly {
+		return w.WriteCloser.Write(p)
+	}
 	consumed := 0
 	for len(p) > 0 {
 		if w.done {

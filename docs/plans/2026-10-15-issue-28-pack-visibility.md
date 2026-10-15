@@ -21,7 +21,7 @@ The user also stated that the cluster is inaccessible and requested a personal-c
 
 - A regression test reproduced unsafe ref publication after an earlier upload failure. Upload errors now remain fatal for that writer.
 - The requested wait log precedes the ref-publication barrier and hook execution.
-- Bounded discovery recovery now allows one extra listing after both packed and loose lookup miss. Concurrent misses share that refresh.
+- Discovery recovery uses a one-second cooldown after each attempt. Concurrent misses share one refresh, and later misses can retry.
 - The refresh adds only unseen immutable packs. It preserves existing tables, snapshots, and local registrations.
 - Real HTTP and SSH tests use the AWS SDK and Tigris storer against a gated S3 HTTP fixture.
 - Those tests reproduce bin/cue failures and prove that hooks wait for successful publication.
@@ -220,3 +220,29 @@ The full suite needs the Git LFS artifacts described in `AGENTS.md`. Live tests 
 - The report identifies the production bucket mode and image revision, or clearly states that those facts remain unavailable.
 - No local read probe or finite retry is described as proof of global visibility.
 - Existing missing production data, if found, has a separate recovery proposal based on an intact source repository.
+
+## Review follow-up
+
+The review found two limits in the first implementation. This follow-up replaces both mechanisms.
+
+1. Replace the HTTP request decode/re-encode pass with a packet reader. Forward the original bytes and retain at most one packet. Let upstream validate the request once.
+2. Replace the lifetime refresh budget with a one-second cooldown after each completed attempt. Concurrent misses share one result. Errors remain visible during the cooldown. Later misses can retry, including after an earlier genuine miss or storage failure.
+3. Test byte preservation, fragmented input, shallow-round detection, repeated publications, failure recovery, and concurrent requests. Use virtual time for timing-only tests. Full pack fixtures use the real cooldown because the shared compression pools cannot cross virtual-time boundaries.
+4. Run the full suite, build, and focused race checks. Request another skeptical review before completion.
+
+This policy bounds refresh frequency per storer. It does not promise immediate visibility during the cooldown or change the bucket consistency requirement.
+
+Follow-up validation:
+
+- The old refresh implementation fails both new recovery cases: a genuine missing probe and a transient listing error.
+- The corrected reader discovers two successive publications through all three object lookup APIs. Concurrent misses share each attempt.
+- Virtual-time tests cover a slow refresh, cooldown timing, cancellation during cooldown, and cancellation of an active waiter.
+- HTTP tests cover fragmented input, maximum-size packets, malformed packets, read errors, and exact request bytes.
+- The adapter returns its packet buffer after the first flush, before pack generation.
+- `go test ./...` and `go build ./...` pass.
+- The full storage race suite and focused daemon race checks pass. Final focused race checks include all new cases.
+- A second skeptical review found no blockers. Its three optional improvements are included.
+
+The adapter benchmark compares packet forwarding with the previous decode/replay pass. In the final local sample, 10,000 wants took 0.25 ms versus 1.55 ms. Allocations were about 4.3 KB versus 3.66 MB. These measurements cover adapter overhead, not total fetch throughput. Run `go test ./cmd/objgitd -run '^$' -bench BenchmarkUploadRequest -benchmem` to repeat them.
+
+Production-cluster validation remains pending. The operator procedure still applies.

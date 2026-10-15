@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -102,7 +103,7 @@ func TestPackVisibilityBoundaries(t *testing.T) {
 }
 
 // A reader that built its index before another writer published a ref must
-// recover without a new Storer. Only one refresh is allowed per reader.
+// recover without a new Storer. Misses within the cooldown share a refresh.
 func TestPackLookupRefreshOnMiss(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
@@ -308,4 +309,182 @@ func TestPackRefreshDoesNotBlockKnownObjects(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Error("known object blocked behind pack refresh")
 	}
+}
+
+// A missing probe or a transient error must not poison a long-lived reader.
+func TestPackRefreshRecoversAfterCooldown(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	fixtures := []packFixture{buildPackFixture(t, 2, false), buildPackFixture(t, 5, false)}
+	for _, tt := range []struct {
+		name string
+		fail bool
+	}{{"missing probe", false}, {"listing failure", true}} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFakeS3(t)
+			obs, counts := countingObserver()
+			reader := newTestStorer(t, f, obs)
+			if err := reader.ensurePacksBuilt(); err != nil {
+				t.Fatal(err)
+			}
+			ghost := hashForBody(reader.of, plumbing.BlobObject, "absent")
+			want := plumbing.ErrObjectNotFound
+			if tt.fail {
+				want = errors.New("temporary listing failure")
+				f.listErr = want
+			}
+			for range 12 {
+				if err := reader.HasEncodedObject(ghost); !errors.Is(err, want) {
+					t.Fatalf("initial miss: %v", err)
+				}
+			}
+			if n := counts()["ListObjectsV2"]; n != 2 {
+				t.Fatalf("miss burst made %d listings, want 2", n)
+			}
+			f.listErr = nil
+			writer := newTestStorer(t, f)
+			for round, fx := range fixtures {
+				before := reader.packs.snapshot()
+				writePack(t, writer, fx)
+				if err := writer.up.flush(); err != nil {
+					t.Fatal(err)
+				}
+				var target plumbing.Hash
+				for _, h := range fx.hashes {
+					if _, _, found := before.lookup(h.Bytes()); !found {
+						target = h
+						break
+					}
+				}
+				if target.IsZero() {
+					t.Fatal("fixture has no new objects")
+				}
+				time.Sleep(time.Second)
+				errs := make(chan error, 12)
+				for i := range 12 {
+					go func() {
+						var err error
+						switch i % 3 {
+						case 0:
+							err = reader.HasEncodedObject(target)
+						case 1:
+							_, err = reader.EncodedObjectSize(target)
+						case 2:
+							_, err = reader.EncodedObject(plumbing.AnyObject, target)
+						}
+						errs <- err
+					}()
+				}
+				for range 12 {
+					if err := <-errs; err != nil {
+						t.Fatalf("publication %d: %v", round+1, err)
+					}
+				}
+				if n := counts()["ListObjectsV2"]; n != round+3 {
+					t.Fatalf("publication %d: %d listings, want %d", round+1, n, round+3)
+				}
+			}
+		})
+	}
+}
+
+// A slow listing must not let queued misses start another attempt immediately.
+func TestPackRefreshCooldownStartsAfterCompletion(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFakeS3(t)
+		obs, counts := countingObserver()
+		reader := newTestStorer(t, f, obs)
+		if err := reader.ensurePacksBuilt(); err != nil {
+			t.Fatal(err)
+		}
+		gate := &blockedPackList{s3API: f, entered: make(chan struct{}), release: make(chan struct{})}
+		reader.client = gate
+		errs := make(chan error, 12)
+		for range 12 {
+			go func() { errs <- reader.refreshPacks() }()
+		}
+		<-gate.entered
+		synctest.Wait()
+		time.Sleep(2 * time.Second)
+		close(gate.release)
+		for range 12 {
+			if err := <-errs; err != nil {
+				t.Fatal(err)
+			}
+		}
+		reader.client = f
+		if err := reader.refreshPacks(); err != nil {
+			t.Fatal(err)
+		}
+		if n := counts()["ListObjectsV2"]; n != 2 {
+			t.Fatalf("slow attempt caused %d listings, want 2", n)
+		}
+		time.Sleep(time.Second)
+		if err := reader.refreshPacks(); err != nil {
+			t.Fatal(err)
+		}
+		if n := counts()["ListObjectsV2"]; n != 3 {
+			t.Fatalf("after cooldown: %d listings, want 3", n)
+		}
+	})
+}
+
+func TestPackRefreshCancellationDuringCooldown(t *testing.T) {
+	f := newFakeS3(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reader, err := New(ctx, "test-bucket", withClient(f))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.refreshPacks(); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := reader.refreshPacks(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cached result masked cancellation: %v", err)
+	}
+}
+
+// Model a storage call that cannot stop promptly on context cancellation.
+type uncancelablePackList struct{ *blockedPackList }
+
+func (c *uncancelablePackList) ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, opts ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
+	return c.blockedPackList.ListObjectsV2(context.WithoutCancel(ctx), in, opts...)
+}
+
+func TestPackRefreshWaiterCancellation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFakeS3(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		reader, err := New(ctx, "test-bucket", withClient(f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := reader.ensurePacksBuilt(); err != nil {
+			t.Fatal(err)
+		}
+		gate := &blockedPackList{s3API: f, entered: make(chan struct{}), release: make(chan struct{})}
+		reader.client = &uncancelablePackList{gate}
+		leader := make(chan error, 1)
+		waiter := make(chan error, 1)
+		go func() { leader <- reader.refreshPacks() }()
+		<-gate.entered
+		go func() { waiter <- reader.refreshPacks() }()
+		synctest.Wait()
+		cancel()
+		synctest.Wait()
+		select {
+		case err := <-waiter:
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("waiter error=%v", err)
+			}
+		default:
+			t.Error("canceled waiter remained blocked on storage")
+		}
+		close(gate.release)
+		<-leader
+	})
 }
