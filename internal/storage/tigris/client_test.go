@@ -51,6 +51,8 @@ type fakeS3 struct {
 	delErr  error
 	listErr error
 
+	beforePut func(string) error // test gate, called outside mu before each PUT
+
 	putDelay time.Duration // artificial latency before PutObject lands, for async-upload tests
 
 	// putHook fires inside PutObject after the injected-error check and before
@@ -408,6 +410,11 @@ func parseByteRange(header string, size int) (start, end int, ok bool) {
 }
 
 func (f *fakeS3) PutObject(_ context.Context, p *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	if f.beforePut != nil {
+		if err := f.beforePut(sv(p.Key)); err != nil {
+			return nil, err
+		}
+	}
 	if f.putDelay > 0 {
 		// Held outside the lock, so overlapping uploads really do overlap and
 		// the high-water mark means something.

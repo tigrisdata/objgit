@@ -7,6 +7,12 @@ Hook output streams to the pushing client live, as `remote: ...` lines. Hooks
 therefore run **synchronously**: the client waits for them to finish before
 the push completes. `-hook-timeout` bounds that wait.
 
+Before reference publication, receive-pack logs
+`waiting for packfiles to finish pushing` for a push that contains a pack.
+The Tigris storer then waits for every queued bin and cue upload.
+An upload failure prevents ref publication and hook execution.
+The upload failure remains fatal for that writer, including later ref updates.
+
 A hook **cannot reject a push**. It runs after the refs are updated and after
 report-status is sent, which is post-receive semantics. Deleted branches are
 skipped.

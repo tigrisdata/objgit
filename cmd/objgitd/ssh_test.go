@@ -304,6 +304,7 @@ func TestSSHHookFires(t *testing.T) {
 	// Hooks run synchronously and stream over the sideband, so by the time push
 	// returns the hook output rides along in the push output as "remote:" lines.
 	logs := logBuf.String()
+	assertPackWaitBeforeHook(t, logs)
 	if !strings.Contains(logs, "hook: running") {
 		t.Fatalf("hook did not run; logs:\n%s", logs)
 	}

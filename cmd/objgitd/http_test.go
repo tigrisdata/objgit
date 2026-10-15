@@ -201,6 +201,7 @@ func TestSmartHTTPHookStreams(t *testing.T) {
 	}
 
 	logs := logBuf.String()
+	assertPackWaitBeforeHook(t, logs)
 	if !strings.Contains(logs, "hook: running") {
 		t.Fatalf("hook did not run; logs:\n%s", logs)
 	}

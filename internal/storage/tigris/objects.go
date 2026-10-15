@@ -48,6 +48,14 @@ func (s *Storer) headInfo(h plumbing.Hash) (objHead, error) {
 	switch {
 	case err == nil:
 	case isNotFound(err):
+		if err := s.refreshPacks(); err != nil {
+			return zeroObjHead, err
+		}
+		if e, ok, err := s.packLookup(h); err != nil {
+			return zeroObjHead, err
+		} else if ok {
+			return objHead{typ: e.typ, size: e.raw}, nil
+		}
 		return zeroObjHead, plumbing.ErrObjectNotFound
 	default:
 		return zeroObjHead, fmt.Errorf("tigris: head %s: %w", h.String(), err)
@@ -144,6 +152,14 @@ func (s *Storer) EncodedObject(t plumbing.ObjectType, h plumbing.Hash) (plumbing
 	switch {
 	case err == nil:
 	case isNotFound(err):
+		if err := s.refreshPacks(); err != nil {
+			return nil, err
+		}
+		if e, ok, err := s.packLookup(h); err != nil {
+			return nil, err
+		} else if ok {
+			return s.packObject(t, h, e)
+		}
 		return nil, plumbing.ErrObjectNotFound
 	default:
 		return nil, fmt.Errorf("tigris: get %s: %w", h.String(), err)

@@ -188,6 +188,12 @@ func receivePackStreaming(
 		return res
 	}
 
+	// Ref publication waits for all queued bin and cue uploads. Keep this
+	// barrier before onUpdated, which can launch hooks that clone the ref.
+	if needPackfile {
+		slog.Info("waiting for packfiles to finish pushing")
+	}
+
 	var firstErr error
 	cmdStatus := make(map[plumbing.ReferenceName]error)
 	acceptedAt := updateReferences(st, updreq, cmdStatus, &firstErr)

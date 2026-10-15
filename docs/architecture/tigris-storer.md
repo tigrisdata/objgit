@@ -285,7 +285,13 @@ failure of one repository can therefore never block or poison another.
 `SetReference` and `CheckAndSetReference` call `flush()` first. `flush()`
 waits for every queued upload and surfaces the first error. A reference
 therefore never goes live while it points at an object whose upload failed or
-is still in flight.
+is still in flight. The first upload error remains fatal for that uploader.
+Failed jobs delete their staging files, so a second flush cannot retry them.
+A later ref update on the same writer therefore returns the same upload error.
+A fresh scoped storer has an independent uploader.
+
+See [the cluster publication check](../usage/pack-publication-check.md) for an
+HTTP and SSH smoke test with a fresh daemon.
 
 `newUploader` sets two bundler limits above their defaults.
 
@@ -435,7 +441,13 @@ Reads check three tiers, in this order:
 2. The pack index.
 3. The loose `objects/<hex>` key.
 
-The pack index is built once for each `Storer`, from the `packs/*.cue` files.
+The pack index starts with a listing of `packs/*.cue` for each `Storer`.
+If both the index and loose storage lack an object, the reader lists packs
+once more. Concurrent misses share that refresh. The refresh loads only unseen
+packs and preserves existing tables, iterator snapshots, and local registrations.
+Repeated misses cannot trigger more listings in that storer. Permission errors,
+corrupt cues, and canceled operations remain errors. This bounded recovery does
+not replace the supported bucket consistency requirement.
 Those files are small, and no `.bin` body is read to build it.
 
 ### The pack index (`packtable.go`)

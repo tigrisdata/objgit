@@ -316,3 +316,13 @@ func waitForLog(t *testing.T, buf *syncBuffer, substr string, timeout time.Durat
 	}
 	t.Fatalf("timed out waiting for log %q; logs:\n%s", substr, buf.String())
 }
+
+// assertPackWaitBeforeHook checks the observable order shared by HTTP and SSH.
+func assertPackWaitBeforeHook(t *testing.T, logs string) {
+	t.Helper()
+	wait := strings.Index(logs, "waiting for packfiles to finish pushing")
+	hook := strings.Index(logs, "hook: running")
+	if wait < 0 || hook < 0 || wait >= hook {
+		t.Errorf("pack upload wait must be logged before the hook runs; logs:\n%s", logs)
+	}
+}

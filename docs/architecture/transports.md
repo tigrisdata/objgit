@@ -33,6 +33,12 @@ fixed suffix.
 Smart HTTP calls the same go-git server commands with `StatelessRPC: true`.
 `GET /info/refs` also sets `AdvertiseRefs: true`.
 
+For shallow clones, Git first sends a separate wants/deepen request without
+haves or done. `uploadpack.go` ends that response at the shallow-update flush.
+The upstream server otherwise appends a NAK that Git mistakes for the next
+round's shallow list. The HTTP adapter preserves upstream pack generation and
+stops only this discovery round. SSH uses the upstream command directly.
+
 ## SSH (`ssh.go`)
 
 `newSSHServer` builds the gliderlabs/ssh server and the host key. `handleSSH`

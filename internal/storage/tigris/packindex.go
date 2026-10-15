@@ -422,9 +422,13 @@ type packAccess struct {
 // newest record of a hash wins, and a push's own writes win over the cold
 // build.
 type packIndex struct {
-	mu       sync.Mutex
-	built    bool
-	hashSize int
+	mu          sync.Mutex
+	buildMu     sync.Mutex // serializes cold builds and the bounded refresh
+	refreshOnce sync.Once
+	refreshErr  error
+	indexed     map[string]struct{} // immutable packs already registered or loaded
+	built       bool
+	hashSize    int
 
 	ids    []string          // pack number -> pack id
 	idNum  map[string]uint32 // pack id -> pack number
@@ -447,6 +451,7 @@ const maxPackTables = 16
 func newPackIndex(hashSize int) *packIndex {
 	return &packIndex{
 		hashSize: hashSize,
+		indexed:  make(map[string]struct{}),
 		idNum:    make(map[string]uint32),
 		sizes:    make(map[string]int64),
 		local:    make(map[string]string),
@@ -491,6 +496,7 @@ func (p *packIndex) register(id string, recs []cueRecord, localBin string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	num := p.packNum(id)
+	p.indexed[id] = struct{}{}
 	if _, ok := p.dead[num]; ok {
 		// A pack that failed once and is written again is live. The map is
 		// shared with snapshots, so replace it.
@@ -656,17 +662,38 @@ func (p *packIndex) bulkCopy(id string) (*os.File, bool) {
 	}
 }
 
-// ensurePacksBuilt lists packs/*.cue under this Storer's prefix and merges
-// their entries into the index, once per instance. Not sticky on error — a
-// transient S3 failure is retried on the next call, not remembered forever.
-// Entries this instance has itself register-ed (its own in-flight pushes)
-// are untouched: they live outside anything a listing could ever race with.
+// ensurePacksBuilt loads the initial pack listing. A miss in both pack and
+// loose storage can request one additional listing through refreshPacks.
 func (s *Storer) ensurePacksBuilt() error {
 	s.packs.mu.Lock()
 	built := s.packs.built
 	s.packs.mu.Unlock()
 	if built {
 		return nil
+	}
+	return s.buildPacks(false)
+}
+
+// refreshPacks coalesces all misses into at most one extra listing per Storer.
+// It adds only previously unseen immutable packs, preserving local registrations
+// and existing iterator snapshots. It cannot guarantee global read consistency.
+func (s *Storer) refreshPacks() error {
+	s.packs.refreshOnce.Do(func() { s.packs.refreshErr = s.buildPacks(true) })
+	return s.packs.refreshErr
+}
+
+func (s *Storer) buildPacks(refresh bool) error {
+	s.packs.buildMu.Lock()
+	defer s.packs.buildMu.Unlock()
+	s.packs.mu.Lock()
+	if s.packs.built && !refresh {
+		s.packs.mu.Unlock()
+		return nil
+	}
+	known := maps.Clone(s.packs.indexed)
+	s.packs.mu.Unlock()
+	if err := s.ctx.Err(); err != nil {
+		return err
 	}
 
 	keys, err := s.listKeys(s.prefix + packPrefix)
@@ -686,6 +713,9 @@ func (s *Storer) ensurePacksBuilt() error {
 			continue
 		}
 		id := strings.TrimSuffix(strings.TrimPrefix(k, s.prefix+packPrefix), cueSuffix)
+		if _, ok := known[id]; ok {
+			continue
+		}
 
 		raw, err := s.fetchSmall(k)
 		if err != nil {
@@ -708,13 +738,11 @@ func (s *Storer) ensurePacksBuilt() error {
 
 	s.packs.mu.Lock()
 	defer s.packs.mu.Unlock()
-	if s.packs.built {
-		return nil // lost a race with a concurrent cold build on this instance
-	}
 	// The cold tables go first, which makes them the oldest. The packs this
 	// instance registered itself are newer, so their records win.
 	s.packs.tables = append(tables, s.packs.tables...)
 	for id, n := range sizes {
+		s.packs.indexed[id] = struct{}{}
 		if _, ok := s.packs.sizes[id]; !ok {
 			s.packs.sizes[id] = n
 		}
