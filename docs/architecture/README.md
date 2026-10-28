@@ -1,3 +1,7 @@
+---
+title: "Architecture"
+---
+
 # Architecture
 
 `objgitd` is one binary. It stores git repositories as objects in a Tigris

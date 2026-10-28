@@ -1,3 +1,7 @@
+---
+title: "Plan: bin/cue pack containers for `internal/storage/tigris`"
+---
+
 # Plan: bin/cue pack containers for `internal/storage/tigris`
 
 **Status:** Implemented. This document records the design and the reasons

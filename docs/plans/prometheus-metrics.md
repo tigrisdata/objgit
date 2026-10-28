@@ -1,3 +1,7 @@
+---
+title: "Plan: Prometheus metrics for objgitd"
+---
+
 # Plan: Prometheus metrics for objgitd
 
 ## Context

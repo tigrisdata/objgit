@@ -1,3 +1,7 @@
+---
+title: "Design: a streaming file source for `erofs.Builder`"
+---
+
 # Design: a streaming file source for `erofs.Builder`
 
 This spec is for work in the `github.com/Xe/erofs` repository, not in objgit.

@@ -1,3 +1,7 @@
+---
+title: "Measuring the storage format change"
+---
+
 # Measuring the storage format change
 
 `cmd/formatbench` answers one question: what did the move from git's native
@@ -11,10 +15,10 @@ comparable.
 
 ## The two sides
 
-| Side | Ref | What it runs |
-| --- | --- | --- |
-| before | `v1.0.2` | `internal/s3fs` and go-git's dotgit layout. One bucket. Listing cache and pack cache on. |
-| after | current checkout | `internal/storage/tigris`. `.bin`/`.cue` containers, zstd, cue v3. |
+| Side   | Ref              | What it runs                                                                             |
+| ------ | ---------------- | ---------------------------------------------------------------------------------------- |
+| before | `v1.0.2`         | `internal/s3fs` and go-git's dotgit layout. One bucket. Listing cache and pack cache on. |
+| after  | current checkout | `internal/storage/tigris`. `.bin`/`.cue` containers, zstd, cue v3.                       |
 
 The format landed in commits `f4a1419` and `ebfe4e3` on 2026-08-27, released as
 v1.2.0. `v1.0.2` is the last release before it where repositories live in the
@@ -148,20 +152,20 @@ spellings.
 
 ## Flags
 
-| Flag | Default | What it does |
-| --- | --- | --- |
-| `-repos` | every entry | Comma-separated corpus entries to run. |
-| `-builds` | `before,after` | Which columns to run. See below. |
-| `-before-ref` | `v1.0.2` | The ref the "before" daemon is built from. |
-| `-reps` | per entry | Override the repetition count for every repository. |
-| `-out` | `var/bench/out` | Parent directory for run output. |
-| `-org` | `formatbench` | Org segment every benchmark repository is created under. |
-| `-bucket` | `BUCKET` | The bucket the daemon under test writes to. |
-| `-push-timeout` | `45m` | Time limit for one push. |
-| `-clone-timeout` | `30m` | Time limit for one clone. |
-| `-verify` | `true` | Compare each clone against its mirror. |
-| `-refresh-mirrors` | `false` | Fetch each mirror before the run. |
-| `-cleanup` | none | Delete every prefix in a `repos.txt` and exit. |
+| Flag               | Default         | What it does                                             |
+| ------------------ | --------------- | -------------------------------------------------------- |
+| `-repos`           | every entry     | Comma-separated corpus entries to run.                   |
+| `-builds`          | `before,after`  | Which columns to run. See below.                         |
+| `-before-ref`      | `v1.0.2`        | The ref the "before" daemon is built from.               |
+| `-reps`            | per entry       | Override the repetition count for every repository.      |
+| `-out`             | `var/bench/out` | Parent directory for run output.                         |
+| `-org`             | `formatbench`   | Org segment every benchmark repository is created under. |
+| `-bucket`          | `BUCKET`        | The bucket the daemon under test writes to.              |
+| `-push-timeout`    | `45m`           | Time limit for one push.                                 |
+| `-clone-timeout`   | `30m`           | Time limit for one clone.                                |
+| `-verify`          | `true`          | Compare each clone against its mirror.                   |
+| `-refresh-mirrors` | `false`         | Fetch each mirror before the run.                        |
+| `-cleanup`         | none            | Delete every prefix in a `repos.txt` and exit.           |
 
 Every flag also reads from the environment through `flagenv`, which maps each
 one to UPPER_SNAKE. `-before-ref` becomes `BEFORE_REF`.
@@ -170,10 +174,10 @@ one to UPPER_SNAKE. `-before-ref` becomes `BEFORE_REF`.
 
 `-builds` takes three spellings, comma-separated:
 
-| Entry | What it builds |
-| --- | --- |
-| `before` | The ref in `-before-ref`, which defaults to `v1.0.2`. |
-| `after` | The current checkout. |
+| Entry          | What it builds                                                                    |
+| -------------- | --------------------------------------------------------------------------------- |
+| `before`       | The ref in `-before-ref`, which defaults to `v1.0.2`.                             |
+| `after`        | The current checkout.                                                             |
 | `<name>=<ref>` | That ref, in a column labelled `<name>`. An empty ref means the current checkout. |
 
 The third form is how you measure a candidate fix. Put the old build, the
@@ -195,8 +199,8 @@ Slashes in a ref name become dashes in that directory name.
 The default corpus is three repositories, chosen for three shapes rather than
 three names. Edit the `corpus` table in `cmd/formatbench/main.go` to change it.
 
-| Name | Shape |
-| --- | --- |
-| objgit | Small. Mostly text. |
-| x | Medium. Large object count. |
+| Name        | Shape                               |
+| ----------- | ----------------------------------- |
+| objgit      | Small. Mostly text.                 |
+| x           | Medium. Large object count.         |
 | tigris-blog | Blob-heavy. Images do not compress. |

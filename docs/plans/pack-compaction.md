@@ -1,3 +1,7 @@
+---
+title: "Plan: pack compaction and tombstone reaping"
+---
+
 # Plan: pack compaction and tombstone reaping
 
 ## Context
@@ -224,11 +228,11 @@ The pass needs no lock against a push, for four reasons:
 
 ### Flags
 
-| Flag                  | Default | Purpose                                     |
-| --------------------- | ------- | ------------------------------------------- |
-| `-compact-interval`   | `0`     | Time between sweeps. `0` disables the sweeper. |
-| `-compact-max-packs`  | `16`    | Pack count that triggers a pass.            |
-| `-compact-grace`      | `1h`    | Time between the merge and the delete.      |
+| Flag                 | Default | Purpose                                        |
+| -------------------- | ------- | ---------------------------------------------- |
+| `-compact-interval`  | `0`     | Time between sweeps. `0` disables the sweeper. |
+| `-compact-max-packs` | `16`    | Pack count that triggers a pass.               |
+| `-compact-grace`     | `1h`    | Time between the merge and the delete.         |
 
 Each flag is kebab-case with a `flagenv` fallback, such as `COMPACT_INTERVAL`.
 

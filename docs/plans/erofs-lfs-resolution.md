@@ -1,3 +1,7 @@
+---
+title: "Resolve LFS pointers in EROFS snapshots"
+---
+
 # Resolve LFS pointers in EROFS snapshots
 
 ## Goal

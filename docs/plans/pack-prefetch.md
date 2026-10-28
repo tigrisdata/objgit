@@ -1,3 +1,7 @@
+---
+title: "Plan: non-blocking pack prefetch"
+---
+
 # Plan: non-blocking pack prefetch
 
 ## Context
@@ -114,12 +118,12 @@ and it gives that read a chance at a stream another request has warmed.
 
 ## Files
 
-| Action | Path                                    | Purpose                                            |
-| ------ | --------------------------------------- | -------------------------------------------------- |
-| Edit   | `internal/storage/tigris/packindex.go`  | `packStream`, `packAccess`, `startPackFetch`, tiers |
-| Edit   | `internal/storage/tigris/packcache.go`  | `cacheEntry.stream`, `partial`, progress plumbing   |
-| Edit   | `internal/storage/tigris/tigris.go`     | `Storer.fetchSem`, observer contract                |
-| Edit   | `internal/storage/tigris/iter.go`       | doc comment for the deleted threshold               |
+| Action | Path                                   | Purpose                                             |
+| ------ | -------------------------------------- | --------------------------------------------------- |
+| Edit   | `internal/storage/tigris/packindex.go` | `packStream`, `packAccess`, `startPackFetch`, tiers |
+| Edit   | `internal/storage/tigris/packcache.go` | `cacheEntry.stream`, `partial`, progress plumbing   |
+| Edit   | `internal/storage/tigris/tigris.go`    | `Storer.fetchSem`, observer contract                |
+| Edit   | `internal/storage/tigris/iter.go`      | doc comment for the deleted threshold               |
 
 ## Tests
 

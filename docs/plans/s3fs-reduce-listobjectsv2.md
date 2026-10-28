@@ -1,3 +1,7 @@
+---
+title: "Reduce ListObjectsV2 volume in objgitd"
+---
+
 # Reduce ListObjectsV2 volume in objgitd
 
 ## Context

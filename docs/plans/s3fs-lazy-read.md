@@ -1,3 +1,7 @@
+---
+title: "Lazy, range-based reads for s3fs"
+---
+
 # Lazy, range-based reads for s3fs
 
 ## Context

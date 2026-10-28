@@ -1,3 +1,7 @@
+---
+title: "Design: erofs snapshots of pushed trees"
+---
+
 # Design: erofs snapshots of pushed trees
 
 ## Goal

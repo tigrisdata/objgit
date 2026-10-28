@@ -1,3 +1,7 @@
+---
+title: "Per-repo filesystem resolution + `{orgID}/{repoName}` paths (HTTP focus)"
+---
+
 # Per-repo filesystem resolution + `{orgID}/{repoName}` paths (HTTP focus)
 
 ## Context

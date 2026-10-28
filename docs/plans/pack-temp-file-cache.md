@@ -1,3 +1,7 @@
+---
+title: "Local temp-file pack cache"
+---
+
 # Local temp-file pack cache
 
 ## Problem

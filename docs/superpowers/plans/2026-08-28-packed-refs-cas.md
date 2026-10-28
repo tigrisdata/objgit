@@ -1,3 +1,7 @@
+---
+title: "Packed refs with compare-and-swap — Implementation Plan"
+---
+
 # Packed refs with compare-and-swap — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -30,9 +34,11 @@
 The spec's risk table makes this the gate on everything else. If Tigris does not return 412 for these two headers, the whole design is wrong and no other task is worth starting.
 
 **Files:**
+
 - Modify: `internal/storage/tigris/livebucket_test.go` (append a new test function)
 
 **Interfaces:**
+
 - Consumes: nothing.
 - Produces: nothing consumed by code. It produces the go-ahead for Tasks 2 through 8.
 
@@ -185,10 +191,12 @@ Signed-off-by: Xe Iaso <xe@tigrisdata.com>"
 Pure functions over byte slices. No S3, no Storer, so this task is testable on its own and needs none of the test-fake work in Task 3.
 
 **Files:**
+
 - Create: `internal/storage/tigris/packedrefs.go`
 - Create: `internal/storage/tigris/packedrefs_test.go`
 
 **Interfaces:**
+
 - Consumes: `encodeRefValue` and `decodeRefValue` from `refs.go:26` and `refs.go:33`, unchanged. `compressBlock` and `cueDecoder` from `compress.go:161` and `compress.go:107`. `codecRaw` and `codecZstd` from `compress.go:12`.
 - Produces:
   - `const packedRefsKey = "packed-refs"`
@@ -640,10 +648,12 @@ Signed-off-by: Xe Iaso <xe@tigrisdata.com>"
 The spec calls this the one piece of test infrastructure the change needs. It buys the whole compare-and-swap path with no bucket.
 
 **Files:**
+
 - Modify: `internal/storage/tigris/client_test.go:31-35` (the `fakeObject` struct), `:212-220` (`put`), `:298-333` (`GetObject`), `:355-390` (`PutObject`)
 - Create: `internal/storage/tigris/conditional_test.go`
 
 **Interfaces:**
+
 - Consumes: `isPreconditionFailed` from Task 1.
 - Produces:
   - `fakeObject` gains an `etag string` field.
@@ -893,6 +903,7 @@ Signed-off-by: Xe Iaso <xe@tigrisdata.com>"
 Reads become unconditional: every read merges `packed-refs` with the legacy loose layer, whether or not writes are enabled. That asymmetry is the whole rollback story.
 
 **Files:**
+
 - Create: `internal/storage/tigris/refcache.go`
 - Create: `internal/storage/tigris/refcache_test.go`
 - Modify: `internal/storage/tigris/tigris.go:83-113` (`Storer` fields), `:203-231` (`New`), `:251-264` (`Scoped`)
@@ -900,6 +911,7 @@ Reads become unconditional: every read merges `packed-refs` with the legacy loos
 - Modify: `internal/storage/tigris/refs_test.go:134-178` (`TestIterReferencesSortedAndComplete`)
 
 **Interfaces:**
+
 - Consumes: `decodePackedRefs`, `packedRefsKey`, `errBadPackedRefs` from Task 2. `listLooseRefs` from `refs.go:103`, unchanged.
 - Produces:
   - `type refCache struct` with fields `mu`, `built`, `etag`, `packed`, `loose`
@@ -1521,6 +1533,7 @@ Signed-off-by: Xe Iaso <xe@tigrisdata.com>"
 ### Task 5: The compare-and-swap write path
 
 **Files:**
+
 - Modify: `internal/storage/tigris/refcache.go` (append `commitRefs` and friends)
 - Modify: `internal/storage/tigris/tigris.go:54-69` (error vars)
 - Modify: `internal/storage/tigris/refs.go:48-81` (`SetReference`, `CheckAndSetReference`), `:137-142` (`RemoveReference`)
@@ -1529,6 +1542,7 @@ Signed-off-by: Xe Iaso <xe@tigrisdata.com>"
 - Create: `internal/storage/tigris/refcommit_test.go`
 
 **Interfaces:**
+
 - Consumes: `encodePackedRefs` (Task 2), `isPreconditionFailed` (Task 1), `preconditionFailed` in tests (Task 3), `refCache` and `refView` (Task 4), `s.up.flush()` from `upload.go`.
 - Produces:
   - `const maxRefCASRetries = 8`
@@ -2256,6 +2270,7 @@ Signed-off-by: Xe Iaso <xe@tigrisdata.com>"
 ### Task 6: The legacy fold and its loose-key cleanup
 
 **Files:**
+
 - Modify: `internal/storage/tigris/refcache.go` (replace the `dropFoldedLooseRefs` stub)
 - Modify: `internal/storage/tigris/tigris.go:74-80` (`s3API`)
 - Modify: `internal/storage/tigris/refs.go` (`PackRefs`)
@@ -2264,6 +2279,7 @@ Signed-off-by: Xe Iaso <xe@tigrisdata.com>"
 - Create: `internal/storage/tigris/reffold_test.go`
 
 **Interfaces:**
+
 - Consumes: `commitRefs` (Task 5), `refCache` (Task 4).
 - Produces:
   - `s3API` gains `DeleteObjects`.
@@ -2580,7 +2596,7 @@ func bp(v bool) *bool { return &v }
 
 and delete the copy at `client_test.go:464`.
 
-**Note:** removing a ref that has *no* loose key still issues a DeleteObjects for its name. S3 treats deleting an absent key as success, so this is harmless, and checking first would cost a round trip to save one.
+**Note:** removing a ref that has _no_ loose key still issues a DeleteObjects for its name. S3 treats deleting an absent key as success, so this is harmless, and checking first would cost a round trip to save one.
 
 - [ ] **Step 5: Give `PackRefs` its meaning**
 
@@ -2674,11 +2690,13 @@ Signed-off-by: Xe Iaso <xe@tigrisdata.com>"
 ### Task 7: The batch seam in receive-pack
 
 **Files:**
+
 - Modify: `internal/storage/tigris/refs.go` (add `UpdateReferences`)
 - Modify: `cmd/objgitd/receivepack.go:287-324` (`updateReferences`)
 - Create: `cmd/objgitd/refbatch_test.go`
 
 **Interfaces:**
+
 - Consumes: `commitRefs` (Task 5).
 - Produces:
   - `func (s *Storer) UpdateReferences(sets []*plumbing.Reference, removes []plumbing.ReferenceName) error`
@@ -3263,12 +3281,14 @@ Signed-off-by: Xe Iaso <xe@tigrisdata.com>"
 This task writes down what changed and prepares the flip. **It does not flip the default.** That is release 2's commit, made once the fleet runs a binary that can read packed refs.
 
 **Files:**
+
 - Modify: `docs/architecture/tigris-storer.md`
 - Modify: `docs/architecture/transports.md`
 - Modify: `internal/storage/tigris/tigris.go:6-21` (the package doc's layout diagram)
 - Modify: `AGENTS.md`
 
 **Interfaces:**
+
 - Consumes: everything above.
 - Produces: no code.
 

@@ -1,3 +1,7 @@
+---
+title: "Benchmark objgit before and after the bin/cue format change"
+---
+
 # Benchmark objgit before and after the bin/cue format change
 
 Status: Implemented as `cmd/formatbench`. See
@@ -28,10 +32,10 @@ plus `packs/<id>.cue` containers through `internal/storage/tigris`.
 
 ## What "before" and "after" mean
 
-| Column | Ref | What it runs |
-| --- | --- | --- |
-| before | `v1.0.2` | `internal/s3fs` + go-git dotgit. One bucket. Listing cache and pack cache on. |
-| after | `main` (`ce5a7ca`, v1.5.0) | `internal/storage/tigris`. bin/cue containers, zstd, cue v3. |
+| Column | Ref                        | What it runs                                                                  |
+| ------ | -------------------------- | ----------------------------------------------------------------------------- |
+| before | `v1.0.2`                   | `internal/s3fs` + go-git dotgit. One bucket. Listing cache and pack cache on. |
+| after  | `main` (`ce5a7ca`, v1.5.0) | `internal/storage/tigris`. bin/cue containers, zstd, cue v3.                  |
 
 `v1.0.2` is the last release where repositories live in the single `-bucket`
 flag, which is also how HEAD works. That keeps the setup identical on both
@@ -55,10 +59,10 @@ One thing about this pair goes in the post as a caveat, not as a hidden fact:
 
 Mirror-clone each repository once. Never write to the mirror.
 
-| Name | URL | Shape |
-| --- | --- | --- |
-| objgit | https://github.com/tigrisdata/objgit | Small. Mostly text. |
-| x | https://github.com/Xe/x | Medium. Large object count. |
+| Name        | URL                                       | Shape                               |
+| ----------- | ----------------------------------------- | ----------------------------------- |
+| objgit      | https://github.com/tigrisdata/objgit      | Small. Mostly text.                 |
+| x           | https://github.com/Xe/x                   | Medium. Large object count.         |
 | tigris-blog | https://github.com/tigrisdata/tigris-blog | Blob-heavy. Images do not compress. |
 
 Confirm the `tigris-blog` clone URL before the first run. Record the resolved
@@ -77,14 +81,14 @@ at `cmd/objgitd/main.go:81`. HEAD feeds it from `Storer.observe`
 
 Per cell, that is per build and per repository and per workload:
 
-| Field | Source |
-| --- | --- |
-| Wall seconds | Driver timer around the `git` subprocess. |
-| S3 requests by verb | Delta of `objgit_s3_requests_total{operation}`. |
-| S3 time | Delta of `objgit_s3_request_duration_seconds_sum`. |
-| Keys written | `ListObjectsV2` over the repository prefix after the push. |
-| Bytes stored | Sum of the sizes from that same listing. |
-| Bytes on the wire | Clone only. The `Receiving objects` line from git stderr. |
+| Field               | Source                                                     |
+| ------------------- | ---------------------------------------------------------- |
+| Wall seconds        | Driver timer around the `git` subprocess.                  |
+| S3 requests by verb | Delta of `objgit_s3_requests_total{operation}`.            |
+| S3 time             | Delta of `objgit_s3_request_duration_seconds_sum`.         |
+| Keys written        | `ListObjectsV2` over the repository prefix after the push. |
+| Bytes stored        | Sum of the sizes from that same listing.                   |
+| Bytes on the wire   | Clone only. The `Receiving objects` line from git stderr.  |
 
 Both eras key a repository under its `orgID/name` path. `v1.0.2` gets there
 through the go-git loader (`cmd/objgitd/git_protocol.go:61`). HEAD gets there
@@ -132,7 +136,7 @@ Reuse these patterns from membench rather than inventing new ones:
 2. Make a fresh empty directory for `-pack-cache-dir`.
 3. Start the daemon and wait for it to answer. Flags for both builds:
    `-bucket $BUCKET -http-bind 127.0.0.1:8080 -metrics-bind 127.0.0.1:9090
-   -ssh-bind= -allow-push -pack-cache-dir <tmp>`. Leave every other flag at
+-ssh-bind= -allow-push -pack-cache-dir <tmp>`. Leave every other flag at
    its default, so each build runs the way it shipped.
 4. Scrape `/metrics` and record the counters.
 5. Run `git push --mirror http://127.0.0.1:8080/bench/<repo>.git` from the
@@ -197,12 +201,12 @@ Two files in the run directory:
 Push:
 
 | repo | before wall | after wall | before PUTs | after PUTs | before keys | after keys | before bytes | after bytes |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| ---- | ----------- | ---------- | ----------- | ---------- | ----------- | ---------- | ------------ | ----------- |
 
 Clone:
 
 | repo | before wall | after wall | before GETs | after GETs | wire bytes |
-| --- | --- | --- | --- | --- | --- |
+| ---- | ----------- | ---------- | ----------- | ---------- | ---------- |
 
 End the section with this line, as written:
 
@@ -210,19 +214,19 @@ End the section with this line, as written:
 
 ## Files
 
-| Path | Change |
-| --- | --- |
-| `cmd/formatbench/main.go` | New. The driver: setup, cell loop, interleaving, timeouts. |
-| `cmd/formatbench/metrics.go` | New. Scrape and diff `objgit_s3_requests_total` by label. |
-| `cmd/formatbench/bucket.go` | New. List a prefix, sum key count and bytes. |
-| `cmd/formatbench/git.go` | New. Timed git subprocesses and the wire-byte parser. |
-| `cmd/formatbench/verify.go` | New. The correctness gate. |
-| `cmd/formatbench/report.go` | New. `results.json` and `results.md`. |
-| `cmd/formatbench/uuid.go` | New. Collision-free repository names. |
-| `docs/plans/bin-cue-benchmark.md` | New. This plan, committed where `AGENTS.md` says plans live. |
-| `docs/usage/format-benchmark.md` | New. How to run it. Follow `docs/usage/memory-benchmark.md` in shape. |
-| `AGENTS.md` | One row in the "Where the code lives" table, next to `cmd/membench/`. |
-| `var/bin-cue-git.md` | Replace the `TODO(Xe)` at line 66 with the finished tables. |
+| Path                              | Change                                                                |
+| --------------------------------- | --------------------------------------------------------------------- |
+| `cmd/formatbench/main.go`         | New. The driver: setup, cell loop, interleaving, timeouts.            |
+| `cmd/formatbench/metrics.go`      | New. Scrape and diff `objgit_s3_requests_total` by label.             |
+| `cmd/formatbench/bucket.go`       | New. List a prefix, sum key count and bytes.                          |
+| `cmd/formatbench/git.go`          | New. Timed git subprocesses and the wire-byte parser.                 |
+| `cmd/formatbench/verify.go`       | New. The correctness gate.                                            |
+| `cmd/formatbench/report.go`       | New. `results.json` and `results.md`.                                 |
+| `cmd/formatbench/uuid.go`         | New. Collision-free repository names.                                 |
+| `docs/plans/bin-cue-benchmark.md` | New. This plan, committed where `AGENTS.md` says plans live.          |
+| `docs/usage/format-benchmark.md`  | New. How to run it. Follow `docs/usage/memory-benchmark.md` in shape. |
+| `AGENTS.md`                       | One row in the "Where the code lives" table, next to `cmd/membench/`. |
+| `var/bin-cue-git.md`              | Replace the `TODO(Xe)` at line 66 with the finished tables.           |
 
 ## First results
 
@@ -233,17 +237,17 @@ old layout pays on a big one.
 
 Push:
 
-| Build | Wall | S3 requests | PUT | GET | LIST | Keys | Bucket bytes |
-| --- | --: | --: | --: | --: | --: | --: | --: |
-| before | 12.6s | 231 | 46 | 47 | 138 | 42 | 829.27 KiB |
-| after | 2.1s | 19 | 5 | 11 | 3 | 4 | 902.98 KiB |
+| Build  |  Wall | S3 requests | PUT | GET | LIST | Keys | Bucket bytes |
+| ------ | ----: | ----------: | --: | --: | ---: | ---: | -----------: |
+| before | 12.6s |         231 |  46 |  47 |  138 |   42 |   829.27 KiB |
+| after  |  2.1s |          19 |   5 |  11 |    3 |    4 |   902.98 KiB |
 
 Clone:
 
-| Build | Wall | S3 requests | GET | LIST | Wire bytes |
-| --- | --: | --: | --: | --: | --: |
-| before | 14.3s | 323 | 51 | 272 | 763.63 KiB |
-| after | 13.4s | 53 | 49 | 4 | 767.96 KiB |
+| Build  |  Wall | S3 requests | GET | LIST | Wire bytes |
+| ------ | ----: | ----------: | --: | ---: | ---------: |
+| before | 14.3s |         323 |  51 |  272 | 763.63 KiB |
+| after  | 13.4s |          53 |  49 |    4 | 767.96 KiB |
 
 Two things to read from this before the full run:
 

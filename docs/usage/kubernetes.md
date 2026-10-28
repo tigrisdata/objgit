@@ -1,3 +1,7 @@
+---
+title: "Kubernetes deployment"
+---
+
 # Kubernetes deployment
 
 `manifest/` holds a kustomize deployment for `objgitd`. The pod stores all

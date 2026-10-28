@@ -1,3 +1,7 @@
+---
+title: "Plan: Git Smart HTTP protocol for objgitd"
+---
+
 # Plan: Git Smart HTTP protocol for objgitd
 
 ## Context

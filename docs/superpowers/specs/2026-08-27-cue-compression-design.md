@@ -1,3 +1,7 @@
+---
+title: "Compression for pack containers in `internal/storage/tigris`"
+---
+
 # Compression for pack containers in `internal/storage/tigris`
 
 ## Context
@@ -20,7 +24,7 @@ The `.cue` sheet is where the fix has to live. `cueRecord.length` currently
 does double duty — it is both the byte span in the `.bin` and the git object
 size — and the comment at `packindex.go:66` says so outright: "`== the git
 object's size, since .bin payloads are raw`". Splitting that one field into
-*stored span* and *raw size* is the whole enabling change.
+_stored span_ and _raw size_ is the whole enabling change.
 
 Intended outcome, measured against this repository: **2.40x on stored pack
 bytes** (3,297,625 → 1,376,080), recovering 58.3% of what containers hold
@@ -51,14 +55,14 @@ existing v1 containers in live buckets stay readable forever.
 Every object in this repository (901 objects, 3.3 MB), one zstd level-3 frame
 each:
 
-| band | n | raw | zstd | ratio | objects that shrink |
-| --- | --- | --- | --- | --- | --- |
-| <512B | 342 | 59,757 | 56,064 | **1.07x** | 143 / 342 |
-| 512B–2K | 213 | 201,466 | 137,184 | 1.47x | 213 / 213 |
-| 2K–8K | 228 | 1,165,860 | 459,811 | 2.54x | 228 / 228 |
-| 8K–32K | 115 | 1,472,502 | 561,729 | 2.62x | 115 / 115 |
-| 32K–64K | 1 | 55,453 | 16,709 | 3.32x | 1 / 1 |
-| ≥64K | 2 | 342,587 | 76,608 | 4.47x | 2 / 2 |
+| band    | n   | raw       | zstd    | ratio     | objects that shrink |
+| ------- | --- | --------- | ------- | --------- | ------------------- |
+| <512B   | 342 | 59,757    | 56,064  | **1.07x** | 143 / 342           |
+| 512B–2K | 213 | 201,466   | 137,184 | 1.47x     | 213 / 213           |
+| 2K–8K   | 228 | 1,165,860 | 459,811 | 2.54x     | 228 / 228           |
+| 8K–32K  | 115 | 1,472,502 | 561,729 | 2.62x     | 115 / 115           |
+| 32K–64K | 1   | 55,453    | 16,709  | 3.32x     | 1 / 1               |
+| ≥64K    | 2   | 342,587   | 76,608  | 4.47x     | 2 / 2               |
 
 Cumulative bytes recovered by floor choice: **64 KiB → 8.1%**, 32 KiB → 9.2%,
 8 KiB → 36.9%, **2 KiB → 58.3%**, 512 B → 60.2%, no floor → 60.4%.
@@ -179,7 +183,7 @@ bytes against a declared object size would silently destroy it.
 **The 128 MiB container cap keeps working unchanged.** `packwriter.go:113`
 compares `seg.offset + obj.Size()` against the cap. `seg.offset` is now
 stored bytes while `obj.Size()` is raw — apples to oranges, except the
-win-or-don't policy makes `obj.Size()` a valid *upper bound*, so the
+win-or-don't policy makes `obj.Size()` a valid _upper bound_, so the
 expression stays correct and merely seals slightly early. Update the comment;
 leave the logic.
 
@@ -209,12 +213,12 @@ every caller outside `packindex.go` are untouched.
 All four tiers in `packObject` (`packindex.go:468`) change one word —
 `e.length` → `e.stored` — and route through one new helper:
 
-| Tier | Line | Change |
-| --- | --- | --- |
-| staged local `.bin` | `:485` | `SectionReader(f, e.offset, e.stored)` |
-| already-downloaded bulk copy | `:494` | same |
-| bulk-download trigger | `:500` | same |
-| ranged GET | `:511` | `bytes=%d-%d` computed over `e.stored` |
+| Tier                         | Line   | Change                                 |
+| ---------------------------- | ------ | -------------------------------------- |
+| staged local `.bin`          | `:485` | `SectionReader(f, e.offset, e.stored)` |
+| already-downloaded bulk copy | `:494` | same                                   |
+| bulk-download trigger        | `:500` | same                                   |
+| ranged GET                   | `:511` | `bytes=%d-%d` computed over `e.stored` |
 
 New helper `decodePacked(h, hs, codec, r)`: when `codec == zstd`, read the
 stored bytes and `DecodeAll` before handing off to the existing `decodeBody`.
@@ -242,7 +246,7 @@ but it means **rolling back a deploy loses access to every pack written in
 the window.**
 
 So gate writing, not reading. Reader support for both versions is
-unconditional. v2 *writing* goes behind:
+unconditional. v2 _writing_ goes behind:
 
 - `WithPackCompression(bool)` Option in `tigris.go`, alongside
   `WithPackCache` (`tigris.go:124`); field on `Storer`, copied by `Scoped`
@@ -264,17 +268,17 @@ the existing vector + thin-helper shape (`ObserveS3`, `:99`).
 
 ## Files to modify
 
-| Path | Change |
-| --- | --- |
-| `internal/storage/tigris/packindex.go` | cue v2 codec, `parseCue` version branch, `cueRecord`/`packEntry` fields, four read tiers, `decodePacked`, `binSize` |
-| `internal/storage/tigris/packwriter.go` | sniff + two counters in `add`, rewind on misprediction, sha256 moves to `seal`, cap comment |
-| `internal/storage/tigris/tigris.go` | `WithPackCompression`, `Storer` field, package doc layout comment (`:15`) |
-| `internal/storage/tigris/objects.go` | `e.length` → `e.raw` at `:38` |
-| `cmd/objgitd/main.go` | `-pack-compression` flag, wire the Option |
-| `internal/metrics/metrics.go` | codec counter + ratio histogram |
-| `internal/storage/tigris/pack_test.go` | see below |
-| `docs/reference/tigris-backend.md` | cue layout table (`:151`), payload description (`:41`, `:50`, `:72`), retire build-order item 7 (`:371`) |
-| `docs/architecture/tigris-storer.md` | "payload is raw" claims at `:117`, `:173` |
+| Path                                    | Change                                                                                                              |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `internal/storage/tigris/packindex.go`  | cue v2 codec, `parseCue` version branch, `cueRecord`/`packEntry` fields, four read tiers, `decodePacked`, `binSize` |
+| `internal/storage/tigris/packwriter.go` | sniff + two counters in `add`, rewind on misprediction, sha256 moves to `seal`, cap comment                         |
+| `internal/storage/tigris/tigris.go`     | `WithPackCompression`, `Storer` field, package doc layout comment (`:15`)                                           |
+| `internal/storage/tigris/objects.go`    | `e.length` → `e.raw` at `:38`                                                                                       |
+| `cmd/objgitd/main.go`                   | `-pack-compression` flag, wire the Option                                                                           |
+| `internal/metrics/metrics.go`           | codec counter + ratio histogram                                                                                     |
+| `internal/storage/tigris/pack_test.go`  | see below                                                                                                           |
+| `docs/reference/tigris-backend.md`      | cue layout table (`:151`), payload description (`:41`, `:50`, `:72`), retire build-order item 7 (`:371`)            |
+| `docs/architecture/tigris-storer.md`    | "payload is raw" claims at `:117`, `:173`                                                                           |
 
 ## Tests — `internal/storage/tigris/pack_test.go`
 

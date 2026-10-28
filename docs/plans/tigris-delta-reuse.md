@@ -1,3 +1,7 @@
+---
+title: "Keep the deltas that a push already computed"
+---
+
 # Keep the deltas that a push already computed
 
 ## Context
@@ -6,10 +10,10 @@ A clone of a large repository spent almost all of its CPU time in one
 place. A 30-second profile of `objgitd` while it served a clone of
 `tigris-os` gave these numbers:
 
-| Frame                          | Flat  | Cumulative |
-| ------------------------------ | ----- | ---------- |
-| `(*deltaIndex).findMatch`      | 47.9% | 85.0%      |
-| `hashBlock`                    | 34.1% | 34.1%      |
+| Frame                               | Flat  | Cumulative |
+| ----------------------------------- | ----- | ---------- |
+| `(*deltaIndex).findMatch`           | 47.9% | 85.0%      |
+| `hashBlock`                         | 34.1% | 34.1%      |
 | `diffDelta` and everything under it | —     | 92.8%      |
 
 No code from this repository was in the profile. Every frame belonged to
@@ -108,11 +112,11 @@ measurement with the search off suggested. The reason is a limit of the
 method, not a fault in it. Counters in the writer gave these numbers for
 one push of 59,459 objects:
 
-| Result                       | Objects |
-| ---------------------------- | ------- |
-| Delta kept                   | 26,514  |
-| Client sent no delta         | 32,349  |
-| Base in another container    | 596     |
+| Result                    | Objects |
+| ------------------------- | ------- |
+| Delta kept                | 26,514  |
+| Client sent no delta      | 32,349  |
+| Base in another container | 596     |
 
 The writer keeps 97.8% of the deltas that the client sends. Only 596
 objects lose their delta to a container boundary.

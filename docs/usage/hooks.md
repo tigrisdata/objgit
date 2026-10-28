@@ -1,3 +1,7 @@
+---
+title: "Push hooks"
+---
+
 # Push hooks
 
 `objgitd` can run a script after a successful push. The script lives **inside the

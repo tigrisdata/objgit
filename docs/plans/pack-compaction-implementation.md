@@ -1,10 +1,14 @@
+---
+title: "Pack Compaction Implementation Plan"
+---
+
 # Pack Compaction Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Merge small pack containers into larger ones and delete the sources after a grace period, so pack count and duplicate storage stop growing without bound.
 
-**Architecture:** A pass bin-packs *whole* source packs into an output container and copies every payload verbatim. Because the write-side containment rule already guarantees a delta's base sits in the same container as the delta, packing whole packs preserves containment for free — no decode, no delta resolution, no compressor. Deletion is deferred through a tombstone object with a deadline, so a request that built its pack index before the merge never loses the bytes under it. A background sweeper in the daemon runs one pass per repository.
+**Architecture:** A pass bin-packs _whole_ source packs into an output container and copies every payload verbatim. Because the write-side containment rule already guarantees a delta's base sits in the same container as the delta, packing whole packs preserves containment for free — no decode, no delta resolution, no compressor. Deletion is deferred through a tombstone object with a deadline, so a request that built its pack index before the merge never loses the bytes under it. A background sweeper in the daemon runs one pass per repository.
 
 **Tech Stack:** Go 1.26, `github.com/aws/aws-sdk-go-v2/service/s3`, `github.com/go-git/go-git/v6`, `github.com/klauspost/compress/zstd`, `github.com/prometheus/client_golang`, `golang.org/x/sync/errgroup`.
 
@@ -29,9 +33,11 @@
 The fake returns only `Key` from `ListObjectsV2`. Compaction needs the object size and the last-modified time to make grace-period and bin-packing decisions, and the sweeper needs `CommonPrefixes` to enumerate repositories.
 
 **Files:**
+
 - Modify: `internal/storage/tigris/client_test.go`
 
 **Interfaces:**
+
 - Consumes: nothing.
 - Produces: `fakeObject.mtime time.Time`; `fakeS3.clock func() time.Time`; `(*fakeS3).setMtime(key string, t time.Time)`. `ListObjectsV2` now populates `types.Object.Size` and `types.Object.LastModified`, and honors `p.Delimiter` by returning `types.CommonPrefix` values.
 
@@ -235,10 +241,12 @@ git commit -m "test(storage/tigris): fake reports object size, mtime, and common
 `listKeys` throws away the size and the last-modified time that `ListObjectsV2` already returned. Compaction needs both, and paying a second round trip for them would be waste.
 
 **Files:**
+
 - Modify: `internal/storage/tigris/iter.go:17-47`
 - Test: `internal/storage/tigris/iter_test.go`
 
 **Interfaces:**
+
 - Consumes: Task 1's fake.
 - Produces: `type objectEntry struct { key string; size int64; mtime time.Time }` and `func (s *Storer) listEntries(prefix string) ([]objectEntry, error)`. `listKeys` keeps its exact current signature and becomes a wrapper.
 
@@ -372,10 +380,12 @@ git commit -m "feat(storage/tigris): listEntries reports key size and mtime"
 The tombstone object records which packs to delete and when. Its format copies `packed-refs` byte for byte, so a reader of one format can read the other by eye.
 
 **Files:**
+
 - Create: `internal/storage/tigris/tombstones.go`
 - Test: `internal/storage/tigris/tombstones_test.go`
 
 **Interfaces:**
+
 - Consumes: `compressBlock` and the zstd decoder from `compress.go`, as `packedrefs.go` uses them.
 - Produces: `const tombstonesKey = "pack-tombstones"`; `type tombstone struct { id string; deadline time.Time }`; `func encodeTombstones(ts []tombstone) []byte`; `func decodeTombstones(raw []byte) ([]tombstone, error)`; `var errBadTombstones error`.
 
@@ -635,11 +645,13 @@ git commit -m "feat(storage/tigris): add the pack-tombstones binary format"
 `commitRefs` inlines its conditional `PutObject`. The tombstone object needs exactly the same compare-and-swap, so factor the call out rather than writing it twice.
 
 **Files:**
+
 - Modify: `internal/storage/tigris/refcache.go:196-215`
 - Modify: `internal/storage/tigris/tombstones.go`
 - Test: `internal/storage/tigris/tombstones_test.go`
 
 **Interfaces:**
+
 - Consumes: `tombstonesKey`, `encodeTombstones`, `decodeTombstones` from Task 3; `fetchSmallETag` from `refs.go:343`; `isPreconditionFailed` from `tigris.go:358`.
 - Produces: `var errCASConflict error`; `func (s *Storer) casPut(key string, body []byte, etag string) (string, error)`; `func (s *Storer) loadTombstones() ([]tombstone, string, error)`; `func (s *Storer) storeTombstones(ts []tombstone, etag string) (string, error)`.
 
@@ -816,10 +828,12 @@ git commit -m "refactor(storage/tigris): extract casPut, add tombstone load and 
 The pass and the cold index build both list `packs/` and parse every `.cue`. Share one function so the two can never disagree about what a pack is.
 
 **Files:**
+
 - Modify: `internal/storage/tigris/packindex.go:553-595`
 - Test: `internal/storage/tigris/compact_test.go` (create)
 
 **Interfaces:**
+
 - Consumes: `listEntries` from Task 2; `parseCue` from `packindex.go:207`.
 - Produces: `type packSurvey struct { id string; recs []cueRecord; size int64; mtime time.Time }` and `func (s *Storer) surveyPacks() (packs []packSurvey, orphanBins []objectEntry, err error)`. `ensurePacksBuilt` keeps its exact current signature and behavior.
 
@@ -1032,10 +1046,12 @@ git commit -m "refactor(storage/tigris): share one pack survey between the index
 Which packs a pass merges is pure arithmetic over the survey. Keep it a pure function so every edge case is a table row and no test needs a bucket.
 
 **Files:**
+
 - Create: `internal/storage/tigris/compact.go`
 - Test: `internal/storage/tigris/compact_test.go`
 
 **Interfaces:**
+
 - Consumes: `packSurvey` from Task 5.
 - Produces: `func selectForMerge(packs []packSurvey, maxPacks int, capBytes int64) [][]packSurvey`.
 
@@ -1205,11 +1221,13 @@ git commit -m "feat(storage/tigris): select small packs for compaction with a tr
 The merge writes payloads that are already encoded. `packSegment.add` re-encodes through a compressor, which is exactly the cost the design avoids. And `seal` hangs off `packWriter`, which the merge does not have.
 
 **Files:**
+
 - Modify: `internal/storage/tigris/packwriter.go:412-445` (add a method beside `add`)
 - Modify: `internal/storage/tigris/packwriter.go:644-697` (`seal`)
 - Test: `internal/storage/tigris/pack_test.go`
 
 **Interfaces:**
+
 - Consumes: `packSegment`, `cueRecord`.
 - Produces: `func (g *packSegment) appendVerbatim(rec cueRecord, r io.Reader) error`; `func sealSegment(s *Storer, seg *packSegment) (string, error)` returning the new pack id. `(*packWriter).seal` becomes a wrapper that discards the id.
 
@@ -1365,10 +1383,12 @@ git commit -m "feat(storage/tigris): add verbatim segment append and free seal f
 This is the heart of the pass: choose the surviving record for each hash, then copy payloads verbatim into a new container.
 
 **Files:**
+
 - Modify: `internal/storage/tigris/compact.go`
 - Test: `internal/storage/tigris/compact_test.go`
 
 **Interfaces:**
+
 - Consumes: `selectForMerge` (Task 6), `appendVerbatim` and `sealSegment` (Task 7), `streamPack` from `packindex.go:735`, `newPackSegment` from `packwriter.go:402`.
 - Produces: `func chooseRecords(group []packSurvey) map[string][]cueRecord` and `func (s *Storer) mergeGroup(group []packSurvey) (string, int, error)` returning the new pack id and the number of duplicate records dropped.
 
@@ -1634,10 +1654,12 @@ git commit -m "feat(storage/tigris): merge whole packs into one container with v
 ### Task 9: The reap step deletes expired tombstones
 
 **Files:**
+
 - Modify: `internal/storage/tigris/compact.go`
 - Test: `internal/storage/tigris/compact_test.go`
 
 **Interfaces:**
+
 - Consumes: `loadTombstones`, `storeTombstones`, `errCASConflict` (Task 4); `maxDeleteBatch` and the `DeleteObjects` idiom from `refcache.go:271`.
 - Produces: `func (s *Storer) reapTombstones(now time.Time) (deleted int, err error)`.
 
@@ -1828,10 +1850,12 @@ git commit -m "feat(storage/tigris): reap expired pack tombstones"
 Tombstones are state that can disagree with the bucket. Two cases leak packs, and both close with data the survey already holds.
 
 **Files:**
+
 - Modify: `internal/storage/tigris/compact.go`
 - Test: `internal/storage/tigris/compact_test.go`
 
 **Interfaces:**
+
 - Consumes: `surveyPacks` (Task 5), `loadTombstones`/`storeTombstones` (Task 4), `deleteKeys` (Task 9).
 - Produces: `func subsumedPacks(packs []packSurvey) []string`; `func (s *Storer) recordMissingTombstones(packs []packSurvey, grace time.Duration) (int, error)`; `func (s *Storer) deleteOrphanBins(orphans []objectEntry, now time.Time, grace time.Duration) (int, error)`.
 
@@ -2112,11 +2136,13 @@ git commit -m "feat(storage/tigris): back tombstones with subsumption and orphan
 ### Task 11: `Compact` orchestration and its metrics
 
 **Files:**
+
 - Modify: `internal/storage/tigris/compact.go`
 - Modify: `internal/metrics/metrics.go`
 - Test: `internal/storage/tigris/compact_test.go`
 
 **Interfaces:**
+
 - Consumes: every function from Tasks 5 through 10.
 - Produces: `type CompactOptions struct { MaxPacks int; Grace time.Duration; Now func() time.Time }`; `type CompactStats struct { PacksMerged, PacksWritten, PacksDeleted, ObjectsDeduped, OrphansDeleted int }`; `func (s *Storer) Compact(opt CompactOptions) (CompactStats, error)`; `func metrics.ObserveCompact(result string, dur time.Duration, st CompactCounts)`.
 
@@ -2458,10 +2484,12 @@ git commit -m "feat(storage/tigris): add the Compact pass and its metrics"
 The sweeper needs the list of repositories in the bucket, and a way to avoid doing the same work on every daemon at once.
 
 **Files:**
+
 - Modify: `internal/storage/tigris/compact.go`
 - Test: `internal/storage/tigris/compact_test.go`
 
 **Interfaces:**
+
 - Consumes: Task 1's delimiter support in the fake.
 - Produces: `func (s *Storer) ListRepoPrefixes() ([]string, error)`; `func (s *Storer) TakeCompactLease(owner string, ttl time.Duration, now time.Time) (bool, error)`; `func (s *Storer) ReleaseCompactLease() error`.
 
@@ -2674,10 +2702,12 @@ git commit -m "feat(storage/tigris): enumerate repositories and lease compaction
 ### Task 13: The sweeper
 
 **Files:**
+
 - Create: `internal/compactor/compactor.go`
 - Test: `internal/compactor/compactor_test.go`
 
 **Interfaces:**
+
 - Consumes: `(*tigris.Storer).ListRepoPrefixes`, `.Scoped`, `.Compact`, `.TakeCompactLease`, `.ReleaseCompactLease`, `tigris.CompactOptions`, `tigris.CompactStats`; `metrics.ObserveCompact` and `metrics.CompactCounts` from Task 11.
 - Produces: `type Sweeper struct { Base *tigris.Storer; Owner string; Interval time.Duration; Opts tigris.CompactOptions; Rand *rand.Rand }`; `func (sw *Sweeper) Run(ctx context.Context) error`; `func (sw *Sweeper) SweepOnce(ctx context.Context) error`.
 
@@ -2885,9 +2915,11 @@ git commit -m "feat(compactor): add the background pack compaction sweeper"
 ### Task 14: Wire the sweeper into the daemon
 
 **Files:**
+
 - Modify: `cmd/objgitd/main.go:36-50` (flags) and `cmd/objgitd/main.go:151` (errgroup)
 
 **Interfaces:**
+
 - Consumes: `compactor.Sweeper` (Task 13), `tigris.CompactOptions` (Task 11).
 - Produces: the flags `-compact-interval`, `-compact-max-packs`, `-compact-grace`.
 
@@ -2969,10 +3001,12 @@ It is the regression net for the containment invariant: if a merge ever
 stranded a delta from its base, the read below fails outright.
 
 **Files:**
+
 - Modify: `internal/storage/tigris/compact_test.go`
 - Modify: `internal/storage/tigris/livebucket_test.go`
 
 **Interfaces:**
+
 - Consumes: `buildPackFixture(t, numFiles int, withDeltaEdit bool) packFixture` and `writePack(t, s *Storer, fx packFixture)` from `pack_test.go:672,760`; `packFixture.hashes []plumbing.Hash`; `withMaxPackBytes` from `tigris.go:233`.
 
 - [ ] **Step 1: Write the test**
@@ -3161,10 +3195,10 @@ git commit -m "test(storage/tigris): prove compaction preserves a real delta-bea
 
 ---
 
-
 ### Task 16: Documentation
 
 **Files:**
+
 - Modify: `docs/architecture/tigris-storer.md` (the "Remaining gap" section at the end)
 - Modify: `docs/reference/tigris-backend.md:476-503` (the build order)
 - Modify: `AGENTS.md` (the "Where the code lives" table)
@@ -3252,7 +3286,7 @@ Change the first line of the section from `Items 1 to 4 and item 6 are complete.
 In `AGENTS.md`, add a row to the "Where the code lives" table after `internal/bundler`:
 
 ```markdown
-| `internal/compactor`          | The timer that runs pack compaction over every repository.             |
+| `internal/compactor` | The timer that runs pack compaction over every repository. |
 ```
 
 - [ ] **Step 4: Check the prose**
@@ -3272,23 +3306,23 @@ git commit -m "docs: describe pack compaction and close build order item 5"
 
 Checked against `docs/plans/pack-compaction.md`:
 
-| Spec section | Task |
-| --- | --- |
-| Rewrite merges whole packs | 7, 8 |
-| Prefer the whole copy over the delta copy | 8 (`chooseRecords`) |
-| Selection by pack count, smallest first | 6 |
-| Treadmill guard | 6 |
-| No recompression | 7 (`appendVerbatim` carries `codec`) |
-| Tombstone object and format | 3, 4 |
-| Reap step, delete before tombstone rewrite | 9 |
-| Backstop: subsumption, deadline from the newest pack | 10 |
-| Backstop: orphan `.bin` | 10 |
-| Sweeper, jitter, two-level enumeration | 12, 13 |
-| Lease | 12, 13 |
-| Concurrency with a live push | documented in 16; the overlap window is exercised in 15 |
-| Flags | 14 |
-| Metrics | 11 |
-| Testing (every listed case) | 3, 6, 8, 9, 10, 11, 15 |
+| Spec section                                         | Task                                                    |
+| ---------------------------------------------------- | ------------------------------------------------------- |
+| Rewrite merges whole packs                           | 7, 8                                                    |
+| Prefer the whole copy over the delta copy            | 8 (`chooseRecords`)                                     |
+| Selection by pack count, smallest first              | 6                                                       |
+| Treadmill guard                                      | 6                                                       |
+| No recompression                                     | 7 (`appendVerbatim` carries `codec`)                    |
+| Tombstone object and format                          | 3, 4                                                    |
+| Reap step, delete before tombstone rewrite           | 9                                                       |
+| Backstop: subsumption, deadline from the newest pack | 10                                                      |
+| Backstop: orphan `.bin`                              | 10                                                      |
+| Sweeper, jitter, two-level enumeration               | 12, 13                                                  |
+| Lease                                                | 12, 13                                                  |
+| Concurrency with a live push                         | documented in 16; the overlap window is exercised in 15 |
+| Flags                                                | 14                                                      |
+| Metrics                                              | 11                                                      |
+| Testing (every listed case)                          | 3, 6, 8, 9, 10, 11, 15                                  |
 
 Two items in the spec's testing list are folded rather than dropped. "A refused compare-and-swap on the tombstone retries" is covered by `TestTombstoneStoreDetectsConflict` in Task 4, plus the retry loops in Tasks 9 through 11. "A delta still reads after a merge" is covered in Task 15 by pushing a real git pack whose deltas git itself produced, then re-hashing every object after the merge and again after the reap. That is stronger than a synthetic delta, because a stranded base fails the read outright and a corrupt payload fails the hash.
 

@@ -1,3 +1,7 @@
+---
+title: "Packed refs with compare-and-swap"
+---
+
 # Packed refs with compare-and-swap
 
 Status: approved, not implemented.
@@ -53,10 +57,10 @@ two steps are not atomic. The comment at `refs.go:22` records this hole.
 
 Two keys hold ref state. Both sit under the per-Storer prefix from `Scoped`.
 
-| Key          | Role                                                     |
-| ------------ | -------------------------------------------------------- |
-| `packed-refs`| Every ref for this repository. Its ETag is the CAS token. |
-| `refs/<name>`| A legacy loose ref. Read-only. Deleted by the fold.      |
+| Key           | Role                                                      |
+| ------------- | --------------------------------------------------------- |
+| `packed-refs` | Every ref for this repository. Its ETag is the CAS token. |
+| `refs/<name>` | A legacy loose ref. Read-only. Deleted by the fold.       |
 
 `packed-refs` sits at the root, beside `shallow`, `index` and `config`. The
 name comes from the git file with the same role. The key does not start with
@@ -67,13 +71,13 @@ name comes from the git file with the same role. The key does not start with
 The object has a 16-byte plaintext header, and then a body. The header copies
 the shape that `.cue` uses in `packindex.go`:
 
-| Offset | Bytes | Content                                        |
-| ------ | ----- | ---------------------------------------------- |
-| 0      | 3     | Magic `OGR`.                                   |
-| 3      | 1     | Format version. This design writes version 1.  |
-| 4      | 1     | Body codec: `codecRaw` or `codecZstd`.          |
-| 5      | 4     | Ref count, big-endian `uint32`.                 |
-| 9      | 7     | Reserved. Zero.                                 |
+| Offset | Bytes | Content                                       |
+| ------ | ----- | --------------------------------------------- |
+| 0      | 3     | Magic `OGR`.                                  |
+| 3      | 1     | Format version. This design writes version 1. |
+| 4      | 1     | Body codec: `codecRaw` or `codecZstd`.        |
+| 5      | 4     | Ref count, big-endian `uint32`.               |
+| 9      | 7     | Reserved. Zero.                               |
 
 The body is raw, or one zstd frame. It reuses the encoder in `compress.go`.
 
@@ -282,10 +286,10 @@ The rollout copies the `WithPackCompression` pattern, for the reason its own
 comment gives at `tigris.go:150`. Ship the reader first, so the rollback
 window is empty.
 
-| Release | `WithPackedRefs` | Reads                            | Writes       |
-| ------- | ---------------- | -------------------------------- | ------------ |
-| 1       | off by default   | `packed-refs`, then loose on top | loose keys   |
-| 2       | on by default    | `packed-refs`, then loose on top | `packed-refs`|
+| Release | `WithPackedRefs` | Reads                            | Writes        |
+| ------- | ---------------- | -------------------------------- | ------------- |
+| 1       | off by default   | `packed-refs`, then loose on top | loose keys    |
+| 2       | on by default    | `packed-refs`, then loose on top | `packed-refs` |
 
 Release 1 changes nothing in production, because no `packed-refs` object exists
 yet. It exists so that release 2 can be rolled back. A rollback to release 1
@@ -302,21 +306,21 @@ and `IfNoneMatch`. A failed condition returns a `smithy.APIError` whose code is
 
 Tests are table-driven with `tt`, as `AGENTS.md` requires.
 
-| Test                    | Asserts                                                     |
-| ----------------------- | ----------------------------------------------------------- |
-| Format round-trip       | Empty set, one ref, symbolic refs, 100,000 refs.             |
-| Byte stability          | One set of refs encodes to identical bytes every time.       |
-| Merge, loose only       | A ref that exists only as a loose key is visible.            |
-| Merge, both layers      | The loose ref wins.                                          |
-| Fold                    | The fold deletes every key it folded.                        |
-| Fold, stopped part-way  | PUT succeeds and `DeleteObjects` fails. Refs still resolve. The next write retries the delete. |
-| CAS retry               | One 412, then a rebuild, then success.                       |
-| CAS exhaustion          | Eight 412 responses give `ErrRefContention`.                 |
-| Expectation failure     | A concurrent writer moves the ref. The result is `storage.ErrReferenceHasChanged`, and not `ErrRefContention`. |
-| Call count, write       | A push of 500 refs is exactly one `PutObject` call.          |
-| Call count, read        | An advertisement is exactly one `GetObject` and one `ListObjectsV2` call. |
-| Live bucket             | Real 412 behavior for `IfMatch` and `IfNoneMatch`. Goes in `livebucket_test.go`. |
-| End to end              | `git push` of many tags through `runGit` and `seedRepo`, with the same call counts. |
+| Test                   | Asserts                                                                                                        |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------- |
+| Format round-trip      | Empty set, one ref, symbolic refs, 100,000 refs.                                                               |
+| Byte stability         | One set of refs encodes to identical bytes every time.                                                         |
+| Merge, loose only      | A ref that exists only as a loose key is visible.                                                              |
+| Merge, both layers     | The loose ref wins.                                                                                            |
+| Fold                   | The fold deletes every key it folded.                                                                          |
+| Fold, stopped part-way | PUT succeeds and `DeleteObjects` fails. Refs still resolve. The next write retries the delete.                 |
+| CAS retry              | One 412, then a rebuild, then success.                                                                         |
+| CAS exhaustion         | Eight 412 responses give `ErrRefContention`.                                                                   |
+| Expectation failure    | A concurrent writer moves the ref. The result is `storage.ErrReferenceHasChanged`, and not `ErrRefContention`. |
+| Call count, write      | A push of 500 refs is exactly one `PutObject` call.                                                            |
+| Call count, read       | An advertisement is exactly one `GetObject` and one `ListObjectsV2` call.                                      |
+| Live bucket            | Real 412 behavior for `IfMatch` and `IfNoneMatch`. Goes in `livebucket_test.go`.                               |
+| End to end             | `git push` of many tags through `runGit` and `seedRepo`, with the same call counts.                            |
 
 The two call-count tests are the point of the whole change. They must fail
 before the work and pass after it.
@@ -331,26 +335,26 @@ way this design degrades quietly.
 
 ## Files
 
-| Path                                       | Change                                                                    |
-| ------------------------------------------ | ------------------------------------------------------------------------- |
-| `internal/storage/tigris/packedrefs.go`    | New. Header and text body, encode and decode.                             |
-| `internal/storage/tigris/refcache.go`      | New. The cache, and the CAS commit loop.                                  |
-| `internal/storage/tigris/refs.go`          | Rewire all seven ref methods onto the cache. Add `UpdateReferences`.      |
-| `internal/storage/tigris/tigris.go`        | `packedRefsKey`, `WithPackedRefs`, the cache field, `Scoped`, `DeleteObjects` on `s3API`. |
-| `cmd/objgitd/receivepack.go`               | The `refUpdater` assertion in `updateReferences`.                          |
-| `internal/metrics`                         | The CAS retry counter.                                                     |
-| `docs/architecture/tigris-storer.md`       | The new ref layout.                                                        |
-| `docs/architecture/transports.md`          | The atomicity change.                                                      |
+| Path                                    | Change                                                                                    |
+| --------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `internal/storage/tigris/packedrefs.go` | New. Header and text body, encode and decode.                                             |
+| `internal/storage/tigris/refcache.go`   | New. The cache, and the CAS commit loop.                                                  |
+| `internal/storage/tigris/refs.go`       | Rewire all seven ref methods onto the cache. Add `UpdateReferences`.                      |
+| `internal/storage/tigris/tigris.go`     | `packedRefsKey`, `WithPackedRefs`, the cache field, `Scoped`, `DeleteObjects` on `s3API`. |
+| `cmd/objgitd/receivepack.go`            | The `refUpdater` assertion in `updateReferences`.                                         |
+| `internal/metrics`                      | The CAS retry counter.                                                                    |
+| `docs/architecture/tigris-storer.md`    | The new ref layout.                                                                       |
+| `docs/architecture/transports.md`       | The atomicity change.                                                                     |
 
 ## Risks
 
-| Risk                                                     | Response                                                                 |
-| -------------------------------------------------------- | ------------------------------------------------------------------------ |
-| Tigris rejects conditional writes on some bucket type.   | The live-bucket test runs before any other work. It is the gate.          |
+| Risk                                                                            | Response                                                                                                                             |
+| ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Tigris rejects conditional writes on some bucket type.                          | The live-bucket test runs before any other work. It is the gate.                                                                     |
 | A Global or Dual-region bucket reads eventually. A stale read makes CAS unsafe. | Document that this design needs a Single-region or Multi-region bucket. See <https://www.tigrisdata.com/docs/concepts/consistency/>. |
-| Two releases run at once and both write refs.            | The merge rule makes the loose write win, so the older binary's push is honored. |
-| Write amplification: every push rewrites up to 2 MB.     | Accepted at the target scale. The next section names the fix if it hurts. |
-| The 100,000-ref fold makes one push slow.                | `PackRefs()` lets an operator run the fold first.                        |
+| Two releases run at once and both write refs.                                   | The merge rule makes the loose write win, so the older binary's push is honored.                                                     |
+| Write amplification: every push rewrites up to 2 MB.                            | Accepted at the target scale. The next section names the fix if it hurts.                                                            |
+| The 100,000-ref fold makes one push slow.                                       | `PackRefs()` lets an operator run the fold first.                                                                                    |
 
 ## Rejected alternatives
 

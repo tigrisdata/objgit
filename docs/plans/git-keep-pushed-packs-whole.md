@@ -1,3 +1,7 @@
+---
+title: "Keep pushed packs whole on git:// and SSH"
+---
+
 # Keep pushed packs whole on git:// and SSH
 
 ## Context

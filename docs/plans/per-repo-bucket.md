@@ -1,3 +1,7 @@
+---
+title: "Per-keypair Tigris resolver: a bucket per repo"
+---
+
 # Per-keypair Tigris resolver: a bucket per repo
 
 ## Context

@@ -1,3 +1,7 @@
+---
+title: "Replace the scratch go-git storage with a container sink"
+---
+
 # Replace the scratch go-git storage with a container sink
 
 **Status:** stage 1 of 4 implemented (`internal/storage/tigris/segmentstore.go`,
@@ -46,11 +50,11 @@ pack allocates:
 
 By allocation site:
 
-| Site | Share | Per push |
-| --- | --- | --- |
-| `bytes.growSlice` | 47.9% | 2.09 GB |
-| `plumbing.(*MemoryObject).Write` | 31.3% | 1.36 GB |
-| everything else | 20.8% | ~0.9 GB |
+| Site                             | Share | Per push |
+| -------------------------------- | ----- | -------- |
+| `bytes.growSlice`                | 47.9% | 2.09 GB  |
+| `plumbing.(*MemoryObject).Write` | 31.3% | 1.36 GB  |
+| everything else                  | 20.8% | ~0.9 GB  |
 
 By objgit entry point, cumulative:
 
@@ -92,7 +96,7 @@ if p.scanner.seeker == nil {
 
 and with low memory mode off, `scanner.go:526` retains `oh.content` for every
 object rather than re-inflating from disk on demand. Driving the parser
-directly off the network reader would therefore *increase* memory, not reduce
+directly off the network reader would therefore _increase_ memory, not reduce
 it.
 
 So this plan keeps a seekable temp `.pack` and removes the `filesystem.Storage`
@@ -158,7 +162,7 @@ To turn offsets into hashes, register a `packfile.Observer` via
 `WithScannerObservers`. `parser.go:146` and `:150` call
 `OnInflatedObjectHeader(oh.Type, oh.Size, oh.Offset)` and
 `OnInflatedObjectContent(oh.Hash, oh.Offset, oh.Crc32, nil)` for every object,
-where `oh.Type` and `oh.Size` are the *resolved* values and `oh.Offset` is the
+where `oh.Type` and `oh.Size` are the _resolved_ values and `oh.Offset` is the
 pack offset. Joining on offset gives `hash -> base hash`, which is precisely
 what `plannedObject.base` holds today, obtained without a single delta
 application.

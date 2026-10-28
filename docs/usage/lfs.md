@@ -1,3 +1,7 @@
+---
+title: "Git LFS"
+---
+
 # Git LFS
 
 `objgitd` serves the Git LFS API. Large files stay out of the git repository:
@@ -27,14 +31,14 @@ refuses to start with `-allow-lfs` and an empty `-http-bind`.
 
 ## Flags
 
-| Flag | Default | Purpose |
-| --- | --- | --- |
-| `-allow-lfs` | `false` | Serve the Git LFS API. |
-| `-allow-lfs-locks` | `true` | Serve the file locking API. |
-| `-external-url` | `""` | Public base URL, such as `https://git.example.com`. |
-| `-lfs-url-ttl` | `15m` | How long a presigned transfer URL stays valid. |
-| `-lfs-max-size` | `5368709120` | Largest object accepted, in bytes. |
-| `-lfs-max-batch` | `500` | Most objects in one batch request. |
+| Flag               | Default      | Purpose                                             |
+| ------------------ | ------------ | --------------------------------------------------- |
+| `-allow-lfs`       | `false`      | Serve the Git LFS API.                              |
+| `-allow-lfs-locks` | `true`       | Serve the file locking API.                         |
+| `-external-url`    | `""`         | Public base URL, such as `https://git.example.com`. |
+| `-lfs-url-ttl`     | `15m`        | How long a presigned transfer URL stays valid.      |
+| `-lfs-max-size`    | `5368709120` | Largest object accepted, in bytes.                  |
+| `-lfs-max-batch`   | `500`        | Most objects in one batch request.                  |
 
 Each flag also reads from an environment variable, in upper snake case.
 `-allow-lfs` is `ALLOW_LFS`.

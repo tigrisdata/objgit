@@ -1,3 +1,7 @@
+---
+title: "Stream pack downloads: serve reads while downloading (don't block clones)"
+---
+
 # Stream pack downloads: serve reads while downloading (don't block clones)
 
 ## Context

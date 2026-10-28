@@ -1,3 +1,7 @@
+---
+title: "Plan: directory-listing cache for `internal/s3fs`"
+---
+
 # Plan: directory-listing cache for `internal/s3fs`
 
 > **Status note.** This started as a groupcache-backed, fleet-shareable cache
@@ -149,7 +153,7 @@ invalidation — and (c) carrying user metadata when the caller needs it (`hasMe
   `CacheConfig.DisableHeadPrefetch` turns seeding off (zero value = on).
 - **`headInfo(ctx, key, needMeta) (*s3.HeadObjectOutput, error)`** serves a foreground
   lookup. A warm hit costs no round-trip. `needMeta` reports whether the caller needs the
-  x-amz-meta-* user metadata (true iff unix-metadata is enabled): when true, a
+  x-amz-meta-\* user metadata (true iff unix-metadata is enabled): when true, a
   listing-seeded (`hasMeta=false`) entry is treated as a miss and filled via one real
   `HeadObject` (which stores `hasMeta=true`). `headSF` (a `singleflight.Group`) dedupes
   concurrent fills for the same key.
@@ -168,12 +172,12 @@ walk folder-by-folder — `refs/` above all (`refs/`, `refs/heads/`, `refs/tags/
 listing and every negative lookup beneath it is then synthesised in memory.
 
 - **A second `sync.Map`** (`subtrees`, keyed by root) holds `subtreeData{ Objects
-  []subtreeObject; Truncated bool }` — the flat key+size+mtime set under a root — in a
+[]subtreeObject; Truncated bool }` — the flat key+size+mtime set under a root — in a
   `subtreeEntry{gen, expires}`, the same TTL/generation scheme as folder listings.
 - **`list(prefix)` routes**: if `recursiveRoot(prefix)` matches a configured root, serve
   from `subtree(root)` via `synthesizeListing(objects, prefix)` (remainder-after-prefix
   with a `/` ⇒ child dir, deduped; else child file). Otherwise the existing delimited
-  path. A complete subtree is authoritative for negative lookups (it has *all* keys under
+  path. A complete subtree is authoritative for negative lookups (it has _all_ keys under
   the root); only `!Truncated` subtrees are trusted.
 - **Bounded.** `listSubtree` stops once it exceeds `MaxSubtreeKeys` (default 50000) and
   reports `Truncated`; `list` then **falls back to the delimited per-folder listing**, so
@@ -241,7 +245,7 @@ listing and every negative lookup beneath it is then synthesised in memory.
 ### `internal/metrics/metrics.go`
 
 - A Prometheus collector that reads `ListingCache.Stats()` (`{Hits, Misses, ListingItems,
-  SubtreeItems, HeadItems}`) and exports `objgit_s3_listing_cache_hits_total`,
+SubtreeItems, HeadItems}`) and exports `objgit_s3_listing_cache_hits_total`,
   `_misses_total`, and `_items{kind=listing|subtree|head}`. No `repo` label. (Cache fills
   are already counted as `ListObjectsV2`/`HeadObject` via `observeS3`.) `main` registers it
   only when the cache is enabled.
