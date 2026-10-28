@@ -4,6 +4,7 @@ ignore:
   - plans/**
   - superpowers/**
   - reference/**
+favicon: static/objgit-mark.svg
 llms:
   header: >-
     Objgit is a git server that is backed by [Tigris](https://www.tigrisdata.com), globally distributed object storage.
