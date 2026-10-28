@@ -1,3 +1,7 @@
+---
+title: "Plan: Optional Unix-permission metadata in s3fs"
+---
+
 # Plan: Optional Unix-permission metadata in s3fs
 
 ## Context
@@ -76,7 +80,7 @@ Thread `*unixMetaConfig` into `newS3WriteFile` and `newS3MultipartUploadFile`
 
 - If config is nil → unchanged (no `Metadata`).
 - Else set `PutObjectInput.Metadata = unixmeta.Encode(unixmeta.Attrs{UID, GID,
-  Mode: 0o666 &^ umask, Mtime: time.Now()})`. (Multipart: `Metadata` on
+Mode: 0o666 &^ umask, Mtime: time.Now()})`. (Multipart: `Metadata` on
   `CreateMultipartUploadInput` at construction — `CompleteMultipartUpload`
   cannot attach user metadata.)
 
@@ -87,7 +91,7 @@ Thread `*unixMetaConfig` into `newS3WriteFile` and `newS3MultipartUploadFile`
   consumers read the raw numeric ownership and resolve to names themselves.
 - Add `newFileInfoFromHead(name, head, cfg)` that, when `cfg != nil`, runs
   `unixmeta.Decode(head.Metadata, defaults)` with defaults `{UID: cfg.uid,
-  GID: cfg.gid, Mode: 0o666 &^ cfg.umask, Mtime: head.LastModified}` and builds
+GID: cfg.gid, Mode: 0o666 &^ cfg.umask, Mtime: head.LastModified}` and builds
   a fully populated `simpleFileInfo`. When `cfg == nil`, keep the current
   `0666` path by delegating to `newFileInfo`.
 - Wire this into `Stat` (`internal/s3fs/basic.go`). `Lstat` already delegates

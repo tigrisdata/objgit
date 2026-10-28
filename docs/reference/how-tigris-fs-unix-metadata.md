@@ -1,3 +1,7 @@
+---
+title: "How Unix metadata is stored on Tigris objects"
+---
+
 # How Unix metadata is stored on Tigris objects
 
 A POSIX filesystem mapped onto S3-compatible object storage needs somewhere to keep
@@ -13,14 +17,14 @@ with `aws-sdk-go-v2`.
 
 Every value is a string. Integers are decimal-encoded.
 
-| Header | Meaning | Value format |
-|---|---|---|
-| `x-amz-meta-uid` | Owner user ID | decimal `uint32` |
-| `x-amz-meta-gid` | Owner group ID | decimal `uint32` |
-| `x-amz-meta-mode` | POSIX file mode (type + permission bits) | decimal `uint32` |
-| `x-amz-meta-rdev` | Device number (block/character devices only) | decimal `uint32` |
-| `x-amz-meta-mtime` | Modification time | Unix seconds, decimal |
-| `x-amz-meta---symlink-target` | Target path of a symlink | URL-percent-escaped string |
+| Header                        | Meaning                                      | Value format               |
+| ----------------------------- | -------------------------------------------- | -------------------------- |
+| `x-amz-meta-uid`              | Owner user ID                                | decimal `uint32`           |
+| `x-amz-meta-gid`              | Owner group ID                               | decimal `uint32`           |
+| `x-amz-meta-mode`             | POSIX file mode (type + permission bits)     | decimal `uint32`           |
+| `x-amz-meta-rdev`             | Device number (block/character devices only) | decimal `uint32`           |
+| `x-amz-meta-mtime`            | Modification time                            | Unix seconds, decimal      |
+| `x-amz-meta---symlink-target` | Target path of a symlink                     | URL-percent-escaped string |
 
 The header names are lowercase. Headers are written only when the value differs
 from the consumer's default; a missing header means "use the default" rather than
@@ -37,15 +41,15 @@ The `mode` value is the standard POSIX `mode_t` integer: the low 9 bits encode
 `rwxrwxrwx`, the next 3 encode setuid/setgid/sticky, and the file type lives in
 the high bits.
 
-| Type | Octal mask |
-|---|---|
-| Regular file | `0o100000` |
-| Directory | `0o040000` |
-| Symbolic link | `0o120000` |
-| Block device | `0o060000` |
+| Type             | Octal mask |
+| ---------------- | ---------- |
+| Regular file     | `0o100000` |
+| Directory        | `0o040000` |
+| Symbolic link    | `0o120000` |
+| Block device     | `0o060000` |
 | Character device | `0o020000` |
-| FIFO | `0o010000` |
-| Socket | `0o140000` |
+| FIFO             | `0o010000` |
+| Socket           | `0o140000` |
 
 So `33188` (decimal) = `0o100644` = regular file with `rw-r--r--`.
 

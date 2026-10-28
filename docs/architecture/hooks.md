@@ -1,3 +1,7 @@
+---
+title: "Push hooks (`hooks.go`)"
+---
+
 # Push hooks (`hooks.go`)
 
 When `-allow-hooks` is set, a successful `receive-pack` runs the repository

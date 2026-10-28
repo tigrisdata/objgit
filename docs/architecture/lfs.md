@@ -1,3 +1,7 @@
+---
+title: "Git LFS (`internal/lfs`)"
+---
+
 # Git LFS (`internal/lfs`)
 
 `objgitd` answers the Git LFS batch API with presigned Tigris URLs. The client
@@ -16,12 +20,12 @@ route, so every LFS path answers 404.
 
 ## Layout in the bucket
 
-| Key | Contents |
-| --- | --- |
-| `lfs/blobs/<oid>` | The object bytes, stored once for the whole bucket |
-| `<orgID>/<repo>/lfs/staging/<oid>` | An upload in flight, before it is verified |
+| Key                                | Contents                                              |
+| ---------------------------------- | ----------------------------------------------------- |
+| `lfs/blobs/<oid>`                  | The object bytes, stored once for the whole bucket    |
+| `<orgID>/<repo>/lfs/staging/<oid>` | An upload in flight, before it is verified            |
 | `<orgID>/<repo>/lfs/objects/<oid>` | A zero-byte marker: this repository holds that object |
-| `<orgID>/<repo>/lfs/locks.json` | Every lock held in this repository |
+| `<orgID>/<repo>/lfs/locks.json`    | Every lock held in this repository                    |
 
 `<oid>` is the SHA-256 of the object, in lowercase hexadecimal.
 
@@ -92,7 +96,7 @@ the query string. `X-Amz-Checksum-Sha256` is one of those, and a hoisted
 checksum is a checksum nobody sends and nothing enforces. `noHoistPresigner`
 turns hoisting off for uploads. `TestPresignPutSignsTheChecksumHeader` pins it.
 
-**At verify time**, `Verify` heads the *staged* object with the checksum mode
+**At verify time**, `Verify` heads the _staged_ object with the checksum mode
 enabled and compares both the length and the digest. This is the only check that
 runs on the daemon's own credentials. It is also the only check on size, because
 `Content-Length` is not signed on a presigned PUT and cannot be enforced there.
@@ -113,13 +117,13 @@ client sends that header back. A download URL has to stand on its own, so only
 
 ## Batch outcomes
 
-| Operation | Marker | Response for that object |
-| --- | --- | --- |
-| `download` | present | `actions.download`, a presigned GET |
-| `download` | absent | `error`, code 404 |
-| `upload` | present, size matches | no `actions` key, so the client skips it |
-| `upload` | present, size differs | `error`, code 422 |
-| `upload` | absent | `actions.upload` and `actions.verify` |
+| Operation  | Marker                | Response for that object                 |
+| ---------- | --------------------- | ---------------------------------------- |
+| `download` | present               | `actions.download`, a presigned GET      |
+| `download` | absent                | `error`, code 404                        |
+| `upload`   | present, size matches | no `actions` key, so the client skips it |
+| `upload`   | present, size differs | `error`, code 422                        |
+| `upload`   | absent                | `actions.upload` and `actions.verify`    |
 
 Every object carries `authenticated: true`. Without it git-lfs runs credential
 discovery against the storage host and can attach an `Authorization` header,
@@ -205,7 +209,7 @@ trusting a change to `presign.go` or `store.go`.
 
 - Nothing deletes a blob. The marker gives a collector its reference count, but
   no collector exists.
-- `-lfs-max-size` caps the size a client *declares*, not the size it uploads.
+- `-lfs-max-size` caps the size a client _declares_, not the size it uploads.
   Content-Length is not signed on a presigned PUT, so the real limit at upload
   time is what the bucket accepts. `Verify` catches the difference, but a client
   that never verifies leaves the staged object behind. Staged objects under

@@ -1,3 +1,7 @@
+---
+title: "erofs snapshots (`internal/snapshot`)"
+---
+
 # erofs snapshots (`internal/snapshot`)
 
 After a push, `objgitd` can build one EROFS image of the tree at the tip of
@@ -14,8 +18,8 @@ The design is in
 
 ## Object layout
 
-| Key                               | Contents                                                             |
-| --------------------------------- | -------------------------------------------------------------------- |
+| Key                               | Contents                                                              |
+| --------------------------------- | --------------------------------------------------------------------- |
 | `snapshots/erofs/v2/<tree>.erofs` | One EROFS image of the git tree `<tree>`, with LFS pointers resolved. |
 
 The key uses the tree hash, not the commit hash. Many commits can point at one

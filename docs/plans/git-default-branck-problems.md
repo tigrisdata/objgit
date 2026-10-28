@@ -1,3 +1,7 @@
+---
+title: "Fix: clone leaves `warning: remote HEAD refers to nonexistent ref, unable to checkout`"
+---
+
 # Fix: clone leaves `warning: remote HEAD refers to nonexistent ref, unable to checkout`
 
 ## Context

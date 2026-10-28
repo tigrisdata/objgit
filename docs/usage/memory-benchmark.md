@@ -1,3 +1,7 @@
+---
+title: "Measuring push memory"
+---
+
 # Measuring push memory
 
 `cmd/membench` answers one question: how much memory does `objgitd` need while

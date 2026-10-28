@@ -1,3 +1,7 @@
+---
+title: "A Tigris backend for go-git object storage"
+---
+
 # A Tigris backend for go-git object storage
 
 This document gives a design for `storer.EncodedObjectStorer` backed by
@@ -134,7 +138,7 @@ only container that can be, and it always holds exactly one object.
 
 CAUTION: `enqueue` in `upload.go` clamps the size it gives the bundler
 to the `BufferedByteLimit` of that bundler. The bundler takes the size
-from a semaphore whose capacity *is* that limit, and
+from a semaphore whose capacity _is_ that limit, and
 `x/sync/semaphore` parks a size above the whole capacity until the
 context is done. Without the clamp, a container above the limit hangs
 its push. Only the lone-object container of the paragraph above can
@@ -162,15 +166,15 @@ header byte at offset 5 says whether that block is one zstd frame.
 The block holds seven columns, not one struct for each record. N comes
 from the header, so every column boundary is a calculation:
 
-| Column | Size            | Field                                        |
-| ------ | --------------- | -------------------------------------------- |
-| hashes | N × hash width  | Object hash, raw bytes                       |
-| types  | N × 1           | Object type: 1 commit, 2 tree, 3 blob, 4 tag |
-| codecs | N × 1           | Payload codec: 0 raw, 1 zstd                 |
-| offset | N × 8           | Offset of the payload in the `.bin`          |
-| stored | N × 8           | Stored length: the byte span to fetch        |
-| raw    | N × 8           | Raw length: the size of the git object       |
-| bases  | N × hash width  | Delta base hash, or all zero bytes           |
+| Column | Size           | Field                                        |
+| ------ | -------------- | -------------------------------------------- |
+| hashes | N × hash width | Object hash, raw bytes                       |
+| types  | N × 1          | Object type: 1 commit, 2 tree, 3 blob, 4 tag |
+| codecs | N × 1          | Payload codec: 0 raw, 1 zstd                 |
+| offset | N × 8          | Offset of the payload in the `.bin`          |
+| stored | N × 8          | Stored length: the byte span to fetch        |
+| raw    | N × 8          | Raw length: the size of the git object       |
+| bases  | N × hash width | Delta base hash, or all zero bytes           |
 
 One record therefore costs `(2 × hash width) + 26` bytes before
 compression.

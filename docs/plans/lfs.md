@@ -1,3 +1,7 @@
+---
+title: "Plan: Git LFS support"
+---
+
 # Plan: Git LFS support
 
 ## Context
@@ -35,24 +39,24 @@ is marked CAUTION below, and each is verified against source, not assumed.
 
 ## Files
 
-| Action | Path | Purpose |
-| --- | --- | --- |
-| Create | `internal/lfs/lfs.go` | Package doc, oid validation, key layout. |
-| Create | `internal/lfs/batch.go` | Batch types and the batch resolver. |
-| Create | `internal/lfs/store.go` | The bucket surface: `s3API` and the presigner. |
-| Create | `internal/lfs/presign.go` | The custom `HTTPPresignerV4` that stops header hoisting. |
-| Create | `internal/lfs/locks.go` | The lock document and its compare-and-swap writer. |
-| Create | `internal/lfs/errors.go` | The `application/vnd.git-lfs+json` error body. |
-| Create | `cmd/objgitd/lfs.go` | The HTTP handlers, on `*daemon`. |
-| Edit | `cmd/objgitd/http.go` | New routes, registered only when LFS is on. |
-| Edit | `cmd/objgitd/ssh.go` | Intercept `git-lfs-authenticate`. |
-| Edit | `cmd/objgitd/git_protocol.go` | One new `daemon` field. |
-| Edit | `internal/repofs/repofs.go` | Reject reserved organization names. |
-| Edit | `cmd/objgitd/main.go` | Flags, the presign client, and the wiring. |
-| Edit | `internal/metrics/metrics.go` | The `objgit_lfs_*` vectors and helpers. |
-| Create | `internal/lfs/*_test.go`, `cmd/objgitd/lfs_test.go` | Tests. |
-| Create | `docs/architecture/lfs.md`, `docs/usage/lfs.md`, `docs/plans/lfs.md` | Documentation. |
-| Edit | `docs/architecture/README.md`, `AGENTS.md`, `README.md` | Index rows. |
+| Action | Path                                                                 | Purpose                                                  |
+| ------ | -------------------------------------------------------------------- | -------------------------------------------------------- |
+| Create | `internal/lfs/lfs.go`                                                | Package doc, oid validation, key layout.                 |
+| Create | `internal/lfs/batch.go`                                              | Batch types and the batch resolver.                      |
+| Create | `internal/lfs/store.go`                                              | The bucket surface: `s3API` and the presigner.           |
+| Create | `internal/lfs/presign.go`                                            | The custom `HTTPPresignerV4` that stops header hoisting. |
+| Create | `internal/lfs/locks.go`                                              | The lock document and its compare-and-swap writer.       |
+| Create | `internal/lfs/errors.go`                                             | The `application/vnd.git-lfs+json` error body.           |
+| Create | `cmd/objgitd/lfs.go`                                                 | The HTTP handlers, on `*daemon`.                         |
+| Edit   | `cmd/objgitd/http.go`                                                | New routes, registered only when LFS is on.              |
+| Edit   | `cmd/objgitd/ssh.go`                                                 | Intercept `git-lfs-authenticate`.                        |
+| Edit   | `cmd/objgitd/git_protocol.go`                                        | One new `daemon` field.                                  |
+| Edit   | `internal/repofs/repofs.go`                                          | Reject reserved organization names.                      |
+| Edit   | `cmd/objgitd/main.go`                                                | Flags, the presign client, and the wiring.               |
+| Edit   | `internal/metrics/metrics.go`                                        | The `objgit_lfs_*` vectors and helpers.                  |
+| Create | `internal/lfs/*_test.go`, `cmd/objgitd/lfs_test.go`                  | Tests.                                                   |
+| Create | `docs/architecture/lfs.md`, `docs/usage/lfs.md`, `docs/plans/lfs.md` | Documentation.                                           |
+| Edit   | `docs/architecture/README.md`, `AGENTS.md`, `README.md`              | Index rows.                                              |
 
 ## Design
 
@@ -131,13 +135,13 @@ For each object the handler does one `HeadObject` on the per-repository marker.
 The calls run under an `errgroup` with `SetLimit`. A batch larger than
 `-lfs-max-batch` is 413.
 
-| Operation | Marker present | Response for that object |
-| --- | --- | --- |
-| `download` | yes | `actions.download`, a presigned GET |
-| `download` | no | `error`, code 404 |
-| `upload` | yes, size matches | no `actions` key, so the client skips it |
-| `upload` | yes, size differs | `error`, code 422 |
-| `upload` | no | `actions.upload` and `actions.verify` |
+| Operation  | Marker present    | Response for that object                 |
+| ---------- | ----------------- | ---------------------------------------- |
+| `download` | yes               | `actions.download`, a presigned GET      |
+| `download` | no                | `error`, code 404                        |
+| `upload`   | yes, size matches | no `actions` key, so the client skips it |
+| `upload`   | yes, size differs | `error`, code 422                        |
+| `upload`   | no                | `actions.upload` and `actions.verify`    |
 
 When the marker is absent but the global blob already exists, the upload action
 still goes out. The client re-uploads bytes the bucket already holds. The
@@ -203,12 +207,12 @@ use the compare-and-swap the ref cache already uses
 write, then `If-Match: <etag>`, re-read and retry on refusal, under a bounded
 retry count.
 
-| Route | Operation | Behavior |
-| --- | --- | --- |
-| `POST .../info/lfs/locks` | Write | 201 with the lock, or 409 with the holder. |
-| `GET .../info/lfs/locks` | Read | List, with `path`, `id`, `cursor`, `limit`. |
-| `POST .../info/lfs/locks/verify` | Read | Split into `ours` and `theirs`. |
-| `POST .../info/lfs/locks/{id}/unlock` | Write | Delete one. `force` takes another owner's lock. |
+| Route                                 | Operation | Behavior                                        |
+| ------------------------------------- | --------- | ----------------------------------------------- |
+| `POST .../info/lfs/locks`             | Write     | 201 with the lock, or 409 with the holder.      |
+| `GET .../info/lfs/locks`              | Read      | List, with `path`, `id`, `cursor`, `limit`.     |
+| `POST .../info/lfs/locks/verify`      | Read      | Split into `ours` and `theirs`.                 |
+| `POST .../info/lfs/locks/{id}/unlock` | Write     | Delete one. `force` takes another owner's lock. |
 
 Lock IDs are generated by the server as lowercase hex, and validated on read. A
 client-supplied `{id}` is never used to build a key.
@@ -235,7 +239,11 @@ and `upload` to `auth.Write`, calls `d.authorize` with `Transport: "ssh"`, then
 writes one JSON object to the session, not to stderr, and exits 0:
 
 ```json
-{"href":"https://git.example.com/acme/test.git/info/lfs","header":{},"expires_in":900}
+{
+  "href": "https://git.example.com/acme/test.git/info/lfs",
+  "header": {},
+  "expires_in": 900
+}
 ```
 
 CAUTION: When LFS is off, or `-external-url` is unset, the handler must write
@@ -249,14 +257,14 @@ The `header` map is empty, because the HTTP side accepts anonymous requests.
 
 ### Flags
 
-| Flag | Default | Purpose |
-| --- | --- | --- |
-| `-allow-lfs` | `false` | Register the LFS routes. Opt-in, like `-allow-hooks`. |
-| `-allow-lfs-locks` | `true` | Register the four lock routes. |
-| `-external-url` | `""` | The public base URL, for `git-lfs-authenticate`. |
-| `-lfs-url-ttl` | `15m` | How long a presigned URL stays valid. |
-| `-lfs-max-size` | `5368709120` | The largest object. One PUT caps at 5 GiB. |
-| `-lfs-max-batch` | `500` | Objects per batch, over which the answer is 413. |
+| Flag               | Default      | Purpose                                               |
+| ------------------ | ------------ | ----------------------------------------------------- |
+| `-allow-lfs`       | `false`      | Register the LFS routes. Opt-in, like `-allow-hooks`. |
+| `-allow-lfs-locks` | `true`       | Register the four lock routes.                        |
+| `-external-url`    | `""`         | The public base URL, for `git-lfs-authenticate`.      |
+| `-lfs-url-ttl`     | `15m`        | How long a presigned URL stays valid.                 |
+| `-lfs-max-size`    | `5368709120` | The largest object. One PUT caps at 5 GiB.            |
+| `-lfs-max-batch`   | `500`        | Objects per batch, over which the answer is 413.      |
 
 Startup checks, in the style of `main.go:76-84`: `-external-url` must be
 absolute, carry a scheme, and end without a slash. It is required when
@@ -337,8 +345,7 @@ regression in header hoisting, and a fake presigner would hide it forever.
 - Download of a present marker returns a download action.
 - Download of a missing marker returns a per-object 404, and the request is
   still 200.
-- Download of an oid whose global blob exists but whose marker does not returns
-  404. This is the read-oracle test.
+- Download of an oid whose global blob exists but whose marker does not returns 404. This is the read-oracle test.
 - Upload of a present marker of the same size returns no actions.
 - Upload of a present marker of a different size returns 422.
 - Upload of a new oid returns an upload action and a verify action.
@@ -476,7 +483,7 @@ A client now uploads to `<org>/<repo>/lfs/staging/<oid>`. Verify reads that key,
 not the shared one, and promotes it with `RenameObject`. Membership therefore
 requires having written the bytes, which Tigris checked against the oid as it
 accepted them. The same change fixes a second fault the plan had: verify used to
-delete the *shared* blob on a size mismatch, so any writer could destroy an
+delete the _shared_ blob on a size mismatch, so any writer could destroy an
 object other repositories depend on. It now deletes only the caller's own staged
 key.
 

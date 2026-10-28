@@ -1,0 +1,13 @@
+# Serves the docs/ folder of this repository with Auxesia at
+# https://objgit.auxesia.automuse.art.
+#
+#   kubectl apply -k manifest/docs/
+#
+# An init container clones main from GitHub at pod start. To publish new
+# docs, restart the deployment:
+#
+#   kubectl rollout restart deployment/objgit-docs
+resources:
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml

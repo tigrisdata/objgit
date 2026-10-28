@@ -1,3 +1,7 @@
+---
+title: "Plan: bounded memory for large pushes"
+---
+
 # Plan: bounded memory for large pushes
 
 ## Goal

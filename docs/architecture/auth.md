@@ -1,3 +1,7 @@
+---
+title: "The auth seam (`internal/auth`)"
+---
+
 # The auth seam (`internal/auth`)
 
 Every transport authorizes through one interface. A real authentication and

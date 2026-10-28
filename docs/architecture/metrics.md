@@ -1,3 +1,7 @@
+---
+title: "Metrics (`internal/metrics`)"
+---
+
 # Metrics (`internal/metrics`)
 
 `internal/metrics` defines every Prometheus vector with `promauto`, against

@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: objgit-docs
+  labels:
+    app.kubernetes.io/name: objgit-docs
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - objgit.auxesia.automuse.art
+      secretName: objgit-docs-public-tls
+  rules:
+    - host: objgit.auxesia.automuse.art
+      http:
+        paths:
+          - pathType: Prefix
+            path: "/"
+            backend:
+              service:
+                name: objgit-docs
+                port:
+                  name: http

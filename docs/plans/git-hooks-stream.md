@@ -1,3 +1,7 @@
+---
+title: "Stream push-hook output to the client live"
+---
+
 # Stream push-hook output to the client live
 
 ## Context

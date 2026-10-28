@@ -1,3 +1,7 @@
+---
+title: "Plan: Kubernetes and Tekton commands in the hook shell"
+---
+
 # Plan: Kubernetes and Tekton commands in the hook shell
 
 ## Context

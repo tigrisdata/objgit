@@ -1,3 +1,7 @@
+---
+title: "Plan: Git over SSH + a generic auth seam for objgitd"
+---
+
 # Plan: Git over SSH + a generic auth seam for objgitd
 
 > **For agentic workers:** implement task-by-task in build order (bottom of this
@@ -36,14 +40,14 @@ HTTP path's assumptions do **not** — see [Two protocol gotchas](#two-protocol-
 Each transport carries a different credential, and HTTP needs a challenge flow
 the others don't:
 
-| Transport | Credential it presents        | "please authenticate" mechanism      |
-| --------- | ----------------------------- | ------------------------------------- |
-| git://    | none (anonymous)              | n/a                                   |
+| Transport | Credential it presents            | "please authenticate" mechanism   |
+| --------- | --------------------------------- | --------------------------------- |
+| git://    | none (anonymous)                  | n/a                               |
 | SSH       | public key (validated at connect) | handled in the SSH auth handshake |
-| HTTP      | `Authorization: Basic …` / none | `401` + `WWW-Authenticate`          |
+| HTTP      | `Authorization: Basic …` / none   | `401` + `WWW-Authenticate`        |
 
 The transport must **not** validate credentials itself (a password is only
-checkable against a user store the *policy* owns). Each transport's job shrinks
+checkable against a user store the _policy_ owns). Each transport's job shrinks
 to three things: **collect** the raw credential, **map** the git service to a
 read/write `Operation`, and **enforce** the returned `Decision` in its own
 dialect. All real auth logic lives behind one interface, so the same mechanism
@@ -69,17 +73,17 @@ lifecycle, `t.Helper()` helpers, table-driven subtests with `tt`).
 
 ## Files
 
-| Action | Path                          | Purpose                                                |
-| ------ | ----------------------------- | ------------------------------------------------------ |
+| Action | Path                          | Purpose                                                                    |
+| ------ | ----------------------------- | -------------------------------------------------------------------------- |
 | Create | `internal/auth/auth.go`       | transport-neutral `Authorizer`, `Credential`, `Decision`, `AllowAnonymous` |
-| Create | `internal/auth/auth_test.go`  | unit tests for `AllowAnonymous` decisions              |
-| Create | `cmd/objgitd/ssh.go`          | SSH server, host key, command dispatch                 |
-| Create | `cmd/objgitd/ssh_test.go`     | table-driven clone/push/deny/create/hook tests         |
-| Edit   | `cmd/objgitd/git_protocol.go` | `authz` field on `daemon`; git:// goes through authz   |
-| Edit   | `cmd/objgitd/http.go`         | HTTP goes through authz (Basic-auth parse, 401/403)    |
-| Edit   | `cmd/objgitd/main.go`         | `-ssh-bind` flag, default authz, SSH errgroup listener |
-| Edit   | `go.mod` / `go.sum`           | add `github.com/gliderlabs/ssh` (direct)               |
-| Edit   | `CLAUDE.md`                   | document the auth seam + third transport               |
+| Create | `internal/auth/auth_test.go`  | unit tests for `AllowAnonymous` decisions                                  |
+| Create | `cmd/objgitd/ssh.go`          | SSH server, host key, command dispatch                                     |
+| Create | `cmd/objgitd/ssh_test.go`     | table-driven clone/push/deny/create/hook tests                             |
+| Edit   | `cmd/objgitd/git_protocol.go` | `authz` field on `daemon`; git:// goes through authz                       |
+| Edit   | `cmd/objgitd/http.go`         | HTTP goes through authz (Basic-auth parse, 401/403)                        |
+| Edit   | `cmd/objgitd/main.go`         | `-ssh-bind` flag, default authz, SSH errgroup listener                     |
+| Edit   | `go.mod` / `go.sum`           | add `github.com/gliderlabs/ssh` (direct)                                   |
+| Edit   | `CLAUDE.md`                   | document the auth seam + third transport                                   |
 
 The `daemon` struct stays the shared backend. The `allowPush bool` field is
 **removed** from `daemon` (the flag survives in `main.go` only, to build the
@@ -313,6 +317,7 @@ e.g. `["git-upload-pack", "/foo/bar.git"]` — no manual parsing.
    | `git-receive-pack`   | `transport.ReceivePackService`   |
 
    Unknown → stderr error + `s.Exit(1)`.
+
 3. **Clean path:** `repoPath := strings.TrimPrefix(cmd[1], "/")` so
    `ssh://host/foo.git` and scp-style `host:foo.git` resolve identically.
 4. **Authorize:**
@@ -444,12 +449,12 @@ Receive-pack dispatches through **`d.receivePack`** (the wrapper), not
 
 `AllowAnonymous` decisions:
 
-| AllowWrite | Operation | want   |
-| ---------- | --------- | ------ |
-| false      | Read      | Allow  |
-| false      | Write     | Deny   |
-| true       | Read      | Allow  |
-| true       | Write     | Allow  |
+| AllowWrite | Operation | want  |
+| ---------- | --------- | ----- |
+| false      | Read      | Allow |
+| false      | Write     | Deny  |
+| true       | Read      | Allow |
+| true       | Write     | Allow |
 
 One table, `tt`, asserting `(AllowAnonymous{tt.allowWrite}).Authorize(ctx, auth.Request{Operation: tt.op}) == tt.want`.
 
@@ -469,6 +474,7 @@ listen on `127.0.0.1:0`, serve `newSSHServer`'s server in a goroutine, return th
 resolved addr. Skip the subtest if `ssh`/`ssh-keygen` are missing.
 
 Client identity via env on `runGit`:
+
 ```go
 // ssh-keygen -t ed25519 -N "" -f <tmp>/id_ed25519
 env := append(os.Environ(),
@@ -476,6 +482,7 @@ env := append(os.Environ(),
 	"GIT_TERMINAL_PROMPT=0",
 )
 ```
+
 URL: `ssh://git@127.0.0.1:<port>/test.git`.
 
 Cases (one table, `tt`, subtests):
@@ -511,19 +518,19 @@ Cases (one table, `tt`, subtests):
 ## Build order
 
 - [ ] **Task 1 — `internal/auth` package.** `auth.go` (interface, credentials,
-  `Decision`, `AllowAnonymous`) + `auth_test.go` table. `go test ./internal/auth/...`.
+      `Decision`, `AllowAnonymous`) + `auth_test.go` table. `go test ./internal/auth/...`.
 - [ ] **Task 2 — `authz` on daemon + git:// retrofit.** Add `authz auth.Authorizer`
-  to `daemon`, remove `allowPush` field, add `operationFor`, route `handle`
-  through authz. Update `main.go` to construct `AllowAnonymous`. Existing git://
-  tests pass.
+      to `daemon`, remove `allowPush` field, add `operationFor`, route `handle`
+      through authz. Update `main.go` to construct `AllowAnonymous`. Existing git://
+      tests pass.
 - [ ] **Task 3 — HTTP retrofit.** `credFromRequest`, `resolve(w, r, service, repoPath)`
-  with 401/403/Allow handling; update the two call sites. Existing HTTP tests pass;
-  add the anonymous-read parity case.
+      with 401/403/Allow handling; update the two call sites. Existing HTTP tests pass;
+      add the anonymous-read parity case.
 - [ ] **Task 4 — Host key.** `loadOrCreateHostKey` over `d.fs`; unit test on memfs
-  (first call creates+writes, second reads identical bytes).
+      (first call creates+writes, second reads identical bytes).
 - [ ] **Task 5 — SSH server + dispatch.** `newSSHServer`, `pubKeyContextKey`,
-  `PublicKeyHandler`, `handleSSH` with the git://-style wrapping and authz check.
+      `PublicKeyHandler`, `handleSSH` with the git://-style wrapping and authz check.
 - [ ] **Task 6 — main.go SSH wiring.** `-ssh-bind` flag, errgroup listener +
-  graceful shutdown, slog line. `go build -o objgitd ./cmd/objgitd`.
+      graceful shutdown, slog line. `go build -o objgitd ./cmd/objgitd`.
 - [ ] **Task 7 — SSH tests.** `ssh_test.go` table per the cases above; TDD each case.
 - [ ] **Task 8 — Docs.** Add the auth seam + SSH transport to `CLAUDE.md`.

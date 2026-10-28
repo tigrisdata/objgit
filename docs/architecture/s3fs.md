@@ -1,3 +1,7 @@
+---
+title: "`internal/s3fs` — a billy.Filesystem on Tigris"
+---
+
 # `internal/s3fs` — a billy.Filesystem on Tigris
 
 This package is vendored from the s3fs of Austin Poor. It is adapted to

@@ -1,3 +1,7 @@
+---
+title: "`internal/storage/tigris` — a go-git `storage.Storer` on one Tigris bucket"
+---
+
 # `internal/storage/tigris` — a go-git `storage.Storer` on one Tigris bucket
 
 This package implements `storage.Storer` for Tigris. It speaks

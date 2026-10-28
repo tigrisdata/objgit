@@ -1,3 +1,7 @@
+---
+title: "Plan: post-receive hooks for objgitd (sandboxed via kefka)"
+---
+
 # Plan: post-receive hooks for objgitd (sandboxed via kefka)
 
 ## Context

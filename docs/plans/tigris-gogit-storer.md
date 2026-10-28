@@ -1,3 +1,7 @@
+---
+title: "Plan: Tigris-backed go-git `storage.Storer`"
+---
+
 # Plan: Tigris-backed go-git `storage.Storer`
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -121,27 +125,29 @@ Ref encoding mirrors dotgit loose-ref files. Key form is `refs/` + full ref name
 
 ## Files
 
-| Action | Path                              | Purpose                                                        |
-| ------ | --------------------------------- | -------------------------------------------------------------- |
-| Create | `internal/storage/tigris/tigris.go` | doc, constants, sentinels, `Storer`, Options, `New`, `s3API`, pointer shims, temp stubs |
-| Create | `internal/storage/tigris/client_test.go` | `fakeS3`, seed helpers, constructor tables                |
-| Create | `internal/storage/tigris/objects.go` (+test) | HEAD reads, GET decode                                 |
-| Create | `internal/storage/tigris/writer.go` (+test) | staging writer, `SetEncodedObject`                      |
-| Create | `internal/storage/tigris/iter.go` (+test) | pagination + lazy filtered iteration                     |
-| Create | `internal/storage/tigris/refs.go` (+test) | six ref methods, encode/decode, shallow                  |
-| Create | `internal/storage/tigris/index.go`, `config.go` (+test) | index/config codecs, `Module`           |
-| Create | `internal/storage/tigris/livebucket_test.go` | env-gated real-bucket verification                    |
-| Modify | `AGENTS.md`                       | architecture blurb                                             |
+| Action | Path                                                    | Purpose                                                                                 |
+| ------ | ------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| Create | `internal/storage/tigris/tigris.go`                     | doc, constants, sentinels, `Storer`, Options, `New`, `s3API`, pointer shims, temp stubs |
+| Create | `internal/storage/tigris/client_test.go`                | `fakeS3`, seed helpers, constructor tables                                              |
+| Create | `internal/storage/tigris/objects.go` (+test)            | HEAD reads, GET decode                                                                  |
+| Create | `internal/storage/tigris/writer.go` (+test)             | staging writer, `SetEncodedObject`                                                      |
+| Create | `internal/storage/tigris/iter.go` (+test)               | pagination + lazy filtered iteration                                                    |
+| Create | `internal/storage/tigris/refs.go` (+test)               | six ref methods, encode/decode, shallow                                                 |
+| Create | `internal/storage/tigris/index.go`, `config.go` (+test) | index/config codecs, `Module`                                                           |
+| Create | `internal/storage/tigris/livebucket_test.go`            | env-gated real-bucket verification                                                      |
+| Modify | `AGENTS.md`                                             | architecture blurb                                                                      |
 
 ---
 
 ### Task 1: Package skeleton, S3 seam, constructor, fake client
 
 **Files:**
+
 - Create: `internal/storage/tigris/tigris.go`
 - Create: `internal/storage/tigris/client_test.go`
 
 **Interfaces:**
+
 - Consumes: nothing new.
 - Produces (every later task depends on these exact names):
 
@@ -844,11 +850,13 @@ git commit -s -m "feat(storage/tigris): scaffold Tigris-backed go-git storer sea
 ### Task 2: HEAD-backed reads — `headInfo`, `HasEncodedObject`, `EncodedObjectSize`
 
 **Files:**
+
 - Create: `internal/storage/tigris/objects.go`
 - Create: `internal/storage/tigris/objects_test.go`
 - Modify: `internal/storage/tigris/tigris.go` (delete replaced stubs)
 
 **Interfaces:**
+
 - Consumes: Task 1 `s3API`, `keyOf`, `metaType`/`metaSize`, `sp`/`ip`… wait — the production-side shim set is `sp/i32/sv/bv`; the fake side adds `ip` (int64 ptr) locally in tests. Both spelled below.
 - Produces:
 
@@ -1163,11 +1171,13 @@ git commit -s -m "feat(storage/tigris): HEAD-backed Has and Size lookups"
 ### Task 3: Full-body read — `loadObject` and `EncodedObject`
 
 **Files:**
+
 - Modify: `internal/storage/tigris/objects.go`
 - Modify: `internal/storage/tigris/objects_test.go`
 - Modify: `internal/storage/tigris/tigris.go` (delete `EncodedObject` stub)
 
 **Interfaces:**
+
 - Consumes: Task 2's `headInfo`/`objHead`.
 - Produces:
 
@@ -1341,12 +1351,14 @@ git commit -s -m "feat(storage/tigris): body fetch and type-filtered EncodedObje
 ### Task 4: The staging writer — `RawObjectWriter`
 
 **Files:**
+
 - Create: `internal/storage/tigris/writer.go`
 - Create: `internal/storage/tigris/writer_test.go`
 - Modify: `internal/storage/tigris/client_test.go` (extract `hashForBody`)
 - Modify: `internal/storage/tigris/tigris.go` (delete `RawObjectWriter` stub; real `NewEncodedObject` ships here too)
 
 **Interfaces:**
+
 - Consumes: `keyOf`, metadata consts, `sp`/`bv`, `observe`, plumbing hasher trio.
 - Produces:
 
@@ -1764,11 +1776,13 @@ git commit -s -m "feat(storage/tigris): hash-verifying staging writer for RawObj
 ### Task 5: `SetEncodedObject` and `AddAlternate`
 
 **Files:**
+
 - Modify: `internal/storage/tigris/writer.go`
 - Modify: `internal/storage/tigris/writer_test.go`
 - Modify: `internal/storage/tigris/tigris.go` (delete `SetEncodedObject`, `AddAlternate` stubs)
 
 **Interfaces:**
+
 - Consumes: Task 4's `stageWriter.Discard`.
 - Produces: `SetEncodedObject` implementation; test-only `lyingObject` wrapper (defined here, used nowhere else).
 
@@ -1939,11 +1953,13 @@ git commit -s -m "feat(storage/tigris): SetEncodedObject with forged-hash refusa
 ### Task 6: Iteration — paginated `listKeys` and the lazy `objectIter`
 
 **Files:**
+
 - Create: `internal/storage/tigris/iter.go`
 - Create: `internal/storage/tigris/iter_test.go`
 - Modify: `internal/storage/tigris/tigris.go` (delete `IterEncodedObjects` stub)
 
 **Interfaces:**
+
 - Consumes: `objectPrefix`, `headInfo`, `loadObject`, `plumbing.FromHex`, `sp`/`sv`/`bv`.
 - Produces:
 
@@ -2346,11 +2362,13 @@ git commit -s -m "feat(storage/tigris): lazy paginated EncodedObject iteration"
 ### Task 7: References (six methods) and shallow marks
 
 **Files:**
+
 - Create: `internal/storage/tigris/refs.go`
 - Create: `internal/storage/tigris/refs_test.go`
 - Modify: `internal/storage/tigris/tigris.go` (delete nine ref/shallow stubs)
 
 **Interfaces:**
+
 - Consumes: `refPrefix`, `symRefPrefix`, `refKey`, `fetchSmall`, `removeSimple` (both born here), `listKeys`, `sp`/`sv`, `isNotFound`, `storage.ErrReferenceHasChanged`, `errMalformedRef` (declared Task 1).
 - Produces:
 
@@ -2934,12 +2952,14 @@ git commit -s -m "feat(storage/tigris): loose references, CAS updates, shallow m
 ### Task 8: Worktree index, repository config, `Module` — interface completion
 
 **Files:**
+
 - Create: `internal/storage/tigris/index.go`
 - Create: `internal/storage/tigris/config.go`
 - Create: `internal/storage/tigris/index_test.go`
 - Modify: `internal/storage/tigris/tigris.go` (delete final five stubs; retire the block)
 
 **Interfaces:**
+
 - Consumes: `indexKey`, `configKey`, `fetchSmall` (Task 7), `of`, `ErrModulesNotSupported`, codec APIs verified in the header.
 - Produces:
 
@@ -3216,10 +3236,12 @@ git commit -s -m "feat(storage/tigris): complete storage.Storer with index, conf
 ### Task 9: Live-bucket verification (env-gated), docs blurb, final sweep
 
 **Files:**
+
 - Create: `internal/storage/tigris/livebucket_test.go`
 - Modify: `AGENTS.md`
 
 **Interfaces:**
+
 - Consumes: everything built so far; real credentials through the standard AWS chain (`AWS_PROFILE` / env keys) via `New(ctx, bucket)`'s default `storage-go` construction.
 - Produces: empirical confirmation of the spec's build-order item 2 ("record which error a real Tigris bucket returns for a missing key"), plus operator documentation.
 

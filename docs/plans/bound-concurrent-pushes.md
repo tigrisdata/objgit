@@ -1,3 +1,7 @@
+---
+title: "Plan: bound the number of concurrent pushes"
+---
+
 # Plan: bound the number of concurrent pushes
 
 ## Context
