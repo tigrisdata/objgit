@@ -442,16 +442,30 @@ Reads check three tiers, in this order:
 3. The loose `objects/<hex>` key.
 
 The pack index starts with a listing of `packs/*.cue` for each `Storer`.
-If both the index and loose storage lack an object, the reader lists packs
-again. Concurrent misses share one in-flight refresh. The refresh loads only unseen
-packs and preserves existing tables, iterator snapshots, and local registrations.
-Each completed attempt starts a one-second cooldown for that storer.
-Misses during the cooldown reuse its result, including an error. Later misses
-can retry after a genuine missing-object probe, an incomplete listing, or a
-storage failure. Known objects remain readable during refresh. Permission errors,
-corrupt cues, and canceled operations remain errors. This bounded recovery does
-not replace the supported bucket consistency requirement.
 Those files are small, and no `.bin` body is read to build it.
+
+If both the index and loose storage lack an object, the reader lists packs
+again. Concurrent misses share one in-flight refresh. The refresh loads only
+unseen packs and preserves existing tables, iterator snapshots, and local
+registrations. Known objects remain readable during a refresh.
+
+Each completed refresh starts a cooldown for that storer. Misses during the
+cooldown do not list again, and read as absent. The first cooldown is one
+second. A refresh that finds no new pack, or fails, doubles the next cooldown,
+up to ten seconds. A refresh that finds a new pack resets the cooldown to one
+second. Misses never stop future refreshes: a fresh reader that fetches a
+just-pushed ref is the case this path exists for.
+
+A failed refresh is not a storage error for the read. Loose storage already
+answered, so the read returns "object not found". The storer logs the failure
+once per attempt, at warn level. A canceled storer returns the cancellation
+error instead. A failed listing or a corrupt cue on the first, cold build is
+still an error. This bounded recovery does not replace the supported bucket
+consistency requirement.
+
+A storer forgets a pack whose upload failed. If the files of that pack are
+durable in the bucket after all, a later refresh loads it again. A pack that
+this storer registers while a refresh is in flight is never loaded twice.
 
 ### The pack index (`packtable.go`)
 

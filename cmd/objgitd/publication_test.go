@@ -117,10 +117,6 @@ func TestReceivePackWaitsForPublication(t *testing.T) {
 			case <-time.After(10 * time.Second):
 				t.Fatal("publication not reached")
 			}
-			hasWait := strings.Contains(logs.String(), "waiting for packfiles to finish pushing")
-			if hasWait == tt.deletion {
-				t.Errorf("wait log present=%v, deletion=%v", hasWait, tt.deletion)
-			}
 			select {
 			case <-called:
 				t.Fatal("callback ran before publication")

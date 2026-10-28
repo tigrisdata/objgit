@@ -34,12 +34,16 @@ Smart HTTP calls the same go-git server commands with `StatelessRPC: true`.
 `GET /info/refs` also sets `AdvertiseRefs: true`.
 
 For shallow clones, Git first sends a separate wants/deepen request without
-haves or done. `uploadpack.go` ends that response at the shallow-update flush.
-The upstream server otherwise appends a NAK that Git mistakes for the next
-round's shallow list. The HTTP adapter preserves upstream pack generation and
-stops only this discovery round. The adapter forwards the original request
-bytes and retains at most one packet. Upstream decodes and validates the
-request once. SSH uses the upstream command directly.
+haves or done. The response must end at the shallow-update flush. The upstream
+server goes on to decode haves, which hits EOF, or it appends a NAK. Git
+mistakes that NAK for the next round's shallow list.
+
+`uploadpack.go` holds a fork of go-git's `transport.UploadPack` with one seam.
+If a stateless request carries a deepen, the fork peeks the buffered reader for
+EOF after the first upload-request decode. If the body is exhausted, the fork
+writes the shallow update and returns. A request with haves or done after the
+deepen takes the upstream path. Everything else in the fork mirrors upstream.
+SSH uses the upstream command directly.
 
 ## SSH (`ssh.go`)
 

@@ -88,7 +88,6 @@ git -C "$OBJGIT_TEST_ROOT/source" push "$OBJGIT_HTTP" main
 The push output must contain `publication-hook-ran`. The server log must contain these messages in order:
 
 ```text
-waiting for packfiles to finish pushing
 hook: running
 hook: finished
 ```
@@ -101,8 +100,10 @@ kubectl --context "$OBJGIT_CONTEXT" -n "$OBJGIT_NAMESPACE" logs \
   > "$OBJGIT_TEST_ROOT/server-before-restart.log"
 ```
 
-The wait message marks the start of the publication barrier. It does not mark its completion.
-The hook starts only after the ref update succeeds, which requires all bin and cue uploads to succeed.
+The server publishes a ref only after the storer flushes every queued bin and cue upload.
+The hook starts after that ref update. This smoke test does not show that order.
+`TestTigrisPushPublication` in `cmd/objgitd/s3_publication_test.go` holds the uploads open and checks that order.
+To check that order on a workstation, run `go test -run TestTigrisPushPublication ./cmd/objgitd/`.
 
 ## 4. Fetch through fresh readers
 

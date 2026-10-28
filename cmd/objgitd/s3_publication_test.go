@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/xml"
 	"fmt"
@@ -39,6 +38,26 @@ type publicationS3 struct {
 	bins, cues             chan struct{}
 	binOnce, cueOnce       sync.Once
 	fail                   string
+	// earlyRefs records every ref write that arrived while a bin or cue
+	// upload of this push was still held open. The storer must flush its
+	// upload queue before it publishes a ref, so this list must stay empty.
+	earlyRefs []string
+}
+
+func closed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// earlyRefWrites returns the ref keys written before the uploads were released.
+func (s *publicationS3) earlyRefWrites() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.earlyRefs...)
 }
 
 func (s *publicationS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -67,6 +86,10 @@ func (s *publicationS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	isRef := strings.HasSuffix(key, "packed-refs") || strings.Contains(key, "refs/")
+	if r.Method == http.MethodPut && isRef && closed(s.binStarted) && (!closed(s.bins) || !closed(s.cues)) {
+		s.earlyRefs = append(s.earlyRefs, key)
+	}
 	if r.Method == http.MethodGet && r.URL.Query().Get("list-type") == "2" {
 		type entry struct {
 			Key  string
@@ -140,20 +163,6 @@ func (s *publicationS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-type publicationLog struct {
-	syncBuffer
-	waiting chan struct{}
-	once    sync.Once
-}
-
-func (l *publicationLog) Write(p []byte) (int, error) {
-	n, err := l.syncBuffer.Write(p)
-	if bytes.Contains(p, []byte("waiting for packfiles to finish pushing")) {
-		l.once.Do(func() { close(l.waiting) })
-	}
-	return n, err
-}
-
 func TestTigrisPushPublication(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
@@ -180,7 +189,7 @@ func TestTigrisPushPublication(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			logs := &publicationLog{waiting: make(chan struct{})}
+			logs := &syncBuffer{}
 			prev := slog.Default()
 			slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
 			defer slog.SetDefault(prev)
@@ -235,7 +244,6 @@ func TestTigrisPushPublication(t *testing.T) {
 				}
 			}
 			wait(backend.binStarted)
-			wait(logs.waiting)
 			assertNoHook := func() {
 				t.Helper()
 				if strings.Contains(logs.String(), "hook: running") {
@@ -260,6 +268,11 @@ func TestTigrisPushPublication(t *testing.T) {
 			case <-time.After(15 * time.Second):
 				t.Fatal("push did not finish")
 			}
+			// The fake S3 saw every ref write. None may land while a pack
+			// upload is still held open: the storer flushes first.
+			if early := backend.earlyRefWrites(); len(early) > 0 {
+				t.Fatalf("refs written before uploads completed: %v", early)
+			}
 			if tt.fail != "" {
 				if res.err == nil {
 					t.Fatalf("failed upload accepted: %s", res.out)
@@ -280,7 +293,6 @@ func TestTigrisPushPublication(t *testing.T) {
 			if !strings.Contains(res.out, "publication-hook-ran") {
 				t.Fatalf("hook output missing: %s", res.out)
 			}
-			assertPackWaitBeforeHook(t, logs.String())
 			clone := filepath.Join(t.TempDir(), "clone")
 			if out, err := git(work, "clone", "--depth=1", "--no-checkout", remote, clone); err != nil {
 				t.Fatalf("cold clone: %v\n%s\nlogs:\n%s", err, out, logs.String())

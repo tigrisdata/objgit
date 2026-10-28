@@ -7,11 +7,15 @@ Hook output streams to the pushing client live, as `remote: ...` lines. Hooks
 therefore run **synchronously**: the client waits for them to finish before
 the push completes. `-hook-timeout` bounds that wait.
 
-Before reference publication, receive-pack logs
-`waiting for packfiles to finish pushing` for a push that contains a pack.
-The Tigris storer then waits for every queued bin and cue upload.
-An upload failure prevents ref publication and hook execution.
-The upload failure remains fatal for that writer, including later ref updates.
+The Tigris storer waits for every queued bin and cue upload before it
+publishes a ref. `updateReferences` commits the refs through `SetReference`,
+and the storer flushes its upload queue before it writes a ref. The hook runs
+after that commit, so the packs are durable before a hook can clone the ref.
+If an upload fails, the storer does not publish the ref and the hook does not
+run. The upload failure remains fatal for that writer, and later ref updates
+on the same writer return the same error. `TestTigrisPushPublication` in
+`cmd/objgitd/s3_publication_test.go` holds the uploads open and checks this
+order.
 
 A hook **cannot reject a push**. It runs after the refs are updated and after
 report-status is sent, which is post-receive semantics. Deleted branches are

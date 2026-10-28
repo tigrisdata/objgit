@@ -1,173 +1,148 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
-	"errors"
+	"context"
+	"fmt"
 	"io"
-	"strconv"
 	"strings"
 	"testing"
-	"testing/iotest"
+	"time"
 
-	"github.com/go-git/go-git/v6/plumbing/format/pktline"
-	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/object"
+	"github.com/go-git/go-git/v6/plumbing/transport"
+	"github.com/go-git/go-git/v6/storage/memory"
 	"github.com/go-git/go-git/v6/utils/ioutil"
 )
 
-func TestShallowRoundWriter(t *testing.T) {
-	const response = "000ahello\n00000008NAK\n"
+// pkt frames one pkt-line payload.
+func pkt(payload string) string {
+	return fmt.Sprintf("%04x%s", len(payload)+4, payload)
+}
+
+// seedCommitChain stores n commits on an empty tree, each the parent of the
+// next, and returns them oldest first.
+func seedCommitChain(t *testing.T, st *memory.Storage, n int) []plumbing.Hash {
+	t.Helper()
+	to := st.NewEncodedObject()
+	if err := (&object.Tree{}).Encode(to); err != nil {
+		t.Fatal(err)
+	}
+	th, err := st.SetEncodedObject(to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var chain []plumbing.Hash
+	for i := range n {
+		sig := object.Signature{Name: "T", Email: "t@example.com", When: time.Unix(int64(i), 0)}
+		c := &object.Commit{Author: sig, Committer: sig, Message: fmt.Sprint(i), TreeHash: th}
+		if i > 0 {
+			c.ParentHashes = []plumbing.Hash{chain[i-1]}
+		}
+		co := st.NewEncodedObject()
+		if err := c.Encode(co); err != nil {
+			t.Fatal(err)
+		}
+		ch, err := st.SetEncodedObject(co)
+		if err != nil {
+			t.Fatal(err)
+		}
+		chain = append(chain, ch)
+	}
+	return chain
+}
+
+func TestUploadPackHTTP(t *testing.T) {
+	st := memory.NewStorage()
+	chain := seedCommitChain(t, st, 3)
+	tip := chain[2].String()
+	shallowTip := pkt("shallow "+tip+"\n") + "0000"
+	const nak = "0008NAK\n"
+
 	for _, tt := range []struct {
-		name  string
-		chunk int
-	}{{"single write", len(response)}, {"byte writes", 1}, {"split headers", 3}, {"split payloads", 7}} {
-		t.Run(tt.name, func(t *testing.T) {
-			var output bytes.Buffer
-			w := &shallowRoundWriter{WriteCloser: ioutil.WriteNopCloser(&output)}
-			var err error
-			for off := 0; off < len(response) && err == nil; {
-				end := min(off+tt.chunk, len(response))
-				n, werr := w.Write([]byte(response[off:end]))
-				off += n
-				err = werr
-			}
-			if !errors.Is(err, errShallowRoundDone) {
-				t.Fatalf("error=%v", err)
-			}
-			if got := output.String(); got != "000ahello\n0000" {
-				t.Fatalf("response=%q", got)
-			}
-			if n, err := w.Write([]byte("0008NAK\n")); n != 0 || !errors.Is(err, errShallowRoundDone) {
-				t.Fatalf("write after flush=%d, %v", n, err)
-			}
-		})
-	}
-}
-
-type failedShallowWriter struct{ err error }
-
-func (w failedShallowWriter) Write([]byte) (int, error) { return 0, w.err }
-func (w failedShallowWriter) Close() error              { return nil }
-
-func TestShallowRoundWriterPreservesWriteError(t *testing.T) {
-	want := io.ErrClosedPipe
-	w := &shallowRoundWriter{WriteCloser: failedShallowWriter{want}}
-	if _, err := w.Write([]byte("0000")); !errors.Is(err, want) {
-		t.Fatalf("error=%v", err)
-	}
-}
-
-type shortShallowWriter struct{}
-
-func (shortShallowWriter) Write(p []byte) (int, error) { return len(p) - 1, nil }
-func (shortShallowWriter) Close() error                { return nil }
-func TestShallowRoundWriterRejectsShortWrite(t *testing.T) {
-	w := &shallowRoundWriter{WriteCloser: shortShallowWriter{}}
-	if _, err := w.Write([]byte("0000")); !errors.Is(err, io.ErrShortWrite) {
-		t.Fatalf("error=%v", err)
-	}
-}
-
-func TestUploadRequestReader(t *testing.T) {
-	const want = "0032want 1111111111111111111111111111111111111111\n"
-	for _, tt := range []struct {
-		name, input string
-		shallow     bool
-		wantErr     bool
+		name      string
+		stateless bool
+		input     string
+		want      string // the whole response, or its prefix when pack is set
+		pack      bool   // a packfile follows want
+		wantErr   string
 	}{
-		{"ordinary", want + "00000009done\n", false, false},
-		{"many wants", strings.Repeat(want, 10000) + "00000009done\n", false, false},
-		{"shallow discovery", want + "000ddeepen 1\n0000", true, false},
-		{"shallow with done", want + "000ddeepen 1\n00000009done\n", false, false},
-		{"shallow since", want + "001cdeepen-since 1234567890\n0000", true, false},
-		{"shallow not", want + "0014deepen-not main\n0000", true, false},
-		{"flush only", "0000", false, false},
-		{"empty", "", false, false},
-		{"maximum packet", "fff0" + strings.Repeat("x", pktline.MaxSize-4) + "0000", false, false},
-		{"oversized packet", "fff1", false, true},
-		{"short header", "00", false, true},
-		{"short payload", "0009ab", false, true},
-		{"invalid length", "zzzz", false, true},
+		{
+			name:      "shallow discovery round",
+			stateless: true,
+			input:     pkt("want "+tip+" multi_ack_detailed side-band-64k\n") + pkt("deepen 1\n") + "0000",
+			want:      shallowTip,
+		},
+		{
+			name:      "shallow discovery round without multi_ack",
+			stateless: true,
+			input:     pkt("want "+tip+"\n") + pkt("deepen 1\n") + "0000",
+			want:      shallowTip,
+		},
+		{
+			name:      "shallow with done in one round",
+			stateless: true,
+			input:     pkt("want "+tip+"\n") + pkt("deepen 1\n") + "0000" + pkt("done\n"),
+			want:      shallowTip + nak + "PACK",
+			pack:      true,
+		},
+		{
+			name:      "shallow with haves and done in one round",
+			stateless: true,
+			input:     pkt("want "+tip+"\n") + pkt("deepen 1\n") + "0000" + pkt("have "+chain[0].String()+"\n") + pkt("done\n"),
+			want:      shallowTip + pkt("ACK "+chain[0].String()+"\n") + "PACK",
+			pack:      true,
+		},
+		{
+			name:      "ordinary request",
+			stateless: true,
+			input:     pkt("want "+tip+"\n") + "0000" + pkt("done\n"),
+			want:      nak + "PACK",
+			pack:      true,
+		},
+		{
+			name:      "deepen-since is unsupported",
+			stateless: true,
+			input:     pkt("want "+tip+"\n") + pkt("deepen-since 1234567890\n") + "0000",
+			wantErr:   "unsupported depth",
+		},
+		{
+			name:      "deepen-not is unsupported",
+			stateless: true,
+			input:     pkt("want "+tip+"\n") + pkt("deepen-not main\n") + "0000",
+			wantErr:   "unsupported depth",
+		},
+		{
+			name:      "flush only",
+			stateless: true,
+			input:     "0000",
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			for _, chunk := range []int{1, 3, 8192} {
-				rd := &uploadRequestReader{rd: bufio.NewReader(iotest.OneByteReader(strings.NewReader(tt.input)))}
-				defer rd.Close()
-				var got bytes.Buffer
-				buf := make([]byte, chunk)
-				_, err := io.CopyBuffer(&got, readerOnly{rd}, buf)
-				if (err != nil) != tt.wantErr {
-					t.Fatalf("chunk %d: error=%v", chunk, err)
+			var out bytes.Buffer
+			err := uploadPackHTTP(context.Background(), st,
+				io.NopCloser(strings.NewReader(tt.input)),
+				ioutil.WriteNopCloser(&out),
+				&transport.UploadPackRequest{StatelessRPC: tt.stateless})
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err=%v want %q", err, tt.wantErr)
 				}
-				if !tt.wantErr && got.String() != tt.input {
-					t.Fatalf("chunk %d: request changed: %q", chunk, got.String())
-				}
-				if rd.shallowOnly != tt.shallow {
-					t.Fatalf("chunk %d: shallow=%v want=%v", chunk, rd.shallowOnly, tt.shallow)
-				}
+				return
 			}
-		})
-	}
-}
-
-type readerOnly struct{ io.Reader }
-
-func BenchmarkUploadRequestReader(b *testing.B) {
-	for _, wants := range []int{1, 10000} {
-		b.Run(strconv.Itoa(wants), func(b *testing.B) {
-			input := strings.Repeat("0032want 1111111111111111111111111111111111111111\n", wants) + "00000009done\n"
-			b.ReportAllocs()
-			b.SetBytes(int64(len(input)))
-			b.ResetTimer()
-			for b.Loop() {
-				rd := &uploadRequestReader{rd: bufio.NewReader(strings.NewReader(input))}
-				if _, err := io.Copy(io.Discard, rd); err != nil {
-					b.Fatal(err)
-				}
-				rd.Close()
+			if err != nil {
+				t.Fatalf("err=%v\nresponse=%q", err, out.String())
 			}
-		})
-	}
-}
-
-// The old adapter decoded, sorted, and encoded the complete request before
-// upstream decoded it again. Keep that baseline to measure adapter overhead.
-func BenchmarkUploadRequestDecodeReplay(b *testing.B) {
-	for _, wants := range []int{1, 10000} {
-		b.Run(strconv.Itoa(wants), func(b *testing.B) {
-			input := strings.Repeat("0032want 1111111111111111111111111111111111111111\n", wants) + "00000009done\n"
-			b.ReportAllocs()
-			b.SetBytes(int64(len(input)))
-			b.ResetTimer()
-			for b.Loop() {
-				rd := bufio.NewReader(strings.NewReader(input))
-				var req packp.UploadRequest
-				if err := req.Decode(rd); err != nil {
-					b.Fatal(err)
+			got := out.String()
+			if tt.pack {
+				if !strings.HasPrefix(got, tt.want) {
+					t.Fatalf("response=%q\nwant prefix %q", got, tt.want)
 				}
-				var prefix bytes.Buffer
-				if err := req.Encode(&prefix); err != nil {
-					b.Fatal(err)
-				}
-				if _, err := io.Copy(io.Discard, io.MultiReader(&prefix, rd)); err != nil {
-					b.Fatal(err)
-				}
+				return
 			}
-		})
-	}
-}
-
-func TestUploadRequestReaderPreservesReadError(t *testing.T) {
-	for _, tt := range []struct{ name, input string }{
-		{"header", ""},
-		{"payload", "0009ab"},
-		{"after shallow flush", "000ddeepen 1\n0000"},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			rd := &uploadRequestReader{rd: bufio.NewReader(io.MultiReader(strings.NewReader(tt.input), iotest.ErrReader(io.ErrClosedPipe)))}
-			defer rd.Close()
-			if _, err := io.Copy(io.Discard, rd); !errors.Is(err, io.ErrClosedPipe) {
-				t.Fatalf("error=%v", err)
+			if got != tt.want {
+				t.Fatalf("response=%q\nwant %q", got, tt.want)
 			}
 		})
 	}
