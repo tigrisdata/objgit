@@ -1,2 +1,14 @@
 title: objgit
-subtitle: A git server that stores repositories in Tigris
+subtitle: Git backed by object storage
+ignore:
+  - plans/**
+  - superpowers/**
+  - reference/**
+llms:
+  header: >-
+    Objgit is a git server that is backed by [Tigris](https://www.tigrisdata.com), globally distributed object storage.
+
+    For questions about Tigris, reference these files:
+
+    * https://www.tigrisdata.com/llms.txt
+    * https://www.tigrisdata.com/docs/llms.txt
