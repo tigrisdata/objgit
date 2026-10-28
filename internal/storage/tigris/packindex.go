@@ -423,8 +423,19 @@ type packAccess struct {
 // build.
 type packIndex struct {
 	mu       sync.Mutex
+	buildMu  sync.Mutex          // serializes cold builds and the bounded refresh
+	indexed  map[string]struct{} // immutable packs already registered or loaded
 	built    bool
 	hashSize int
+
+	// The refresh fields are under refreshMu, not mu. See refreshPacks.
+	refreshMu    sync.Mutex
+	refresh      *packRefresh  // the attempt in flight, if any
+	refreshAfter time.Time     // no attempt starts before this
+	refreshWait  time.Duration // the cooldown the last attempt started
+	refreshBase  time.Duration // the cooldown after an attempt that found a pack
+	refreshMax   time.Duration // the cap on a doubled cooldown
+	now          func() time.Time
 
 	ids    []string          // pack number -> pack id
 	idNum  map[string]uint32 // pack id -> pack number
@@ -444,13 +455,25 @@ type packIndex struct {
 // them all into one.
 const maxPackTables = 16
 
+// The refresh cooldown starts at refreshBaseCooldown. Each attempt that finds
+// no new pack doubles it, up to refreshMaxCooldown; an attempt that finds one
+// resets it. See refreshPacks.
+const (
+	refreshBaseCooldown = time.Second
+	refreshMaxCooldown  = 10 * time.Second
+)
+
 func newPackIndex(hashSize int) *packIndex {
 	return &packIndex{
-		hashSize: hashSize,
-		idNum:    make(map[string]uint32),
-		sizes:    make(map[string]int64),
-		local:    make(map[string]string),
-		access:   make(map[string]*packAccess),
+		hashSize:    hashSize,
+		indexed:     make(map[string]struct{}),
+		idNum:       make(map[string]uint32),
+		sizes:       make(map[string]int64),
+		local:       make(map[string]string),
+		access:      make(map[string]*packAccess),
+		refreshBase: refreshBaseCooldown,
+		refreshMax:  refreshMaxCooldown,
+		now:         time.Now,
 	}
 }
 
@@ -491,16 +514,24 @@ func (p *packIndex) register(id string, recs []cueRecord, localBin string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	num := p.packNum(id)
-	if _, ok := p.dead[num]; ok {
-		// A pack that failed once and is written again is live. The map is
-		// shared with snapshots, so replace it.
-		dead := maps.Clone(p.dead)
-		delete(dead, num)
-		p.dead = dead
-	}
+	p.indexed[id] = struct{}{}
+	p.revive(num)
 	p.addTable(newPackTable(p.hashSize, num, recs))
 	p.sizes[id] = packExtent(recs)
 	p.local[id] = localBin
+}
+
+// revive takes pack num off the dead set, for a pack that failed once and is
+// live again: written again, or found durable in the bucket after all. The
+// map is shared with snapshots, so it is replaced and never edited. Callers
+// hold p.mu.
+func (p *packIndex) revive(num uint32) {
+	if _, ok := p.dead[num]; !ok {
+		return
+	}
+	dead := maps.Clone(p.dead)
+	delete(dead, num)
+	p.dead = dead
 }
 
 // markUploaded drops a pack's local-cache visibility once its upload lands:
@@ -514,9 +545,14 @@ func (p *packIndex) markUploaded(id string) {
 
 // deregister removes a pack that failed to upload entirely: its entries must
 // not point at a pack S3 will never have.
+//
+// It also forgets the pack in indexed. An upload can report failure after the
+// bucket has the bytes, when only the reply was lost, and a later refresh must
+// then be free to load the pack from its .cue like any other.
 func (p *packIndex) deregister(id string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	delete(p.indexed, id)
 	if num, ok := p.idNum[id]; ok {
 		// A new slice and a new map, never edits in place: a packSnapshot
 		// shares both.
@@ -656,11 +692,8 @@ func (p *packIndex) bulkCopy(id string) (*os.File, bool) {
 	}
 }
 
-// ensurePacksBuilt lists packs/*.cue under this Storer's prefix and merges
-// their entries into the index, once per instance. Not sticky on error — a
-// transient S3 failure is retried on the next call, not remembered forever.
-// Entries this instance has itself register-ed (its own in-flight pushes)
-// are untouched: they live outside anything a listing could ever race with.
+// ensurePacksBuilt loads the initial pack listing. A miss in both pack and
+// loose storage can request another listing through refreshPacks.
 func (s *Storer) ensurePacksBuilt() error {
 	s.packs.mu.Lock()
 	built := s.packs.built
@@ -668,63 +701,181 @@ func (s *Storer) ensurePacksBuilt() error {
 	if built {
 		return nil
 	}
+	_, err := s.buildPacks(false)
+	return err
+}
+
+// packRefresh holds one attempt's result for all callers that joined it.
+// Closing done publishes err without holding the index or refresh locks.
+type packRefresh struct {
+	done chan struct{}
+	err  error
+}
+
+// refreshPacks lists packs/*.cue again, so a reader that built its index
+// before another writer published can still find the new pack. Concurrent
+// misses join one attempt. After an attempt completes, no new attempt starts
+// for one cooldown; a miss inside it returns nil at once, and the index stays
+// as it is.
+//
+// The cooldown adapts. A negotiation can send hundreds of haves this server
+// does not hold, and each one is a miss, so an attempt that found nothing, or
+// failed, doubles the next cooldown up to refreshMax. An attempt that found a
+// pack resets it to refreshBase. Misses never stop refreshing altogether: a
+// fresh reader fetching a just-pushed ref is the case this path exists for.
+//
+// A failed attempt is logged here, once, and its error goes to every caller
+// that joined it. What a read makes of that error is lookupAfterMiss's call.
+func (s *Storer) refreshPacks() error {
+	if err := s.ctx.Err(); err != nil {
+		return err
+	}
+	p := s.packs
+	p.refreshMu.Lock()
+	if active := p.refresh; active != nil {
+		p.refreshMu.Unlock()
+		select {
+		case <-active.done:
+			return active.err
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		}
+	}
+	if p.now().Before(p.refreshAfter) {
+		p.refreshMu.Unlock()
+		return nil
+	}
+	active := &packRefresh{done: make(chan struct{})}
+	p.refresh = active
+	p.refreshMu.Unlock()
+
+	found, err := s.buildPacks(true)
+	active.err = err
+
+	p.refreshMu.Lock()
+	wait := p.refreshBase
+	if err != nil || found == 0 {
+		wait = min(max(2*p.refreshWait, p.refreshBase), p.refreshMax)
+	}
+	p.refreshWait = wait
+	p.refreshAfter = p.now().Add(wait)
+	p.refresh = nil
+	close(active.done)
+	p.refreshMu.Unlock()
+
+	if err != nil && s.ctx.Err() == nil {
+		slog.Warn("pack refresh failed; misses read as absent until the next attempt",
+			"prefix", s.prefix, "cooldown", wait, "err", err)
+	}
+	return err
+}
+
+// buildPacks lists packs/*.cue and loads every pack the index does not hold
+// yet. With refresh false it is the cold build, which runs once; with refresh
+// true it is a later pass for packs published since. It reports how many
+// packs it added.
+//
+// This storer's own write path can register a pack while the listing is in
+// flight, and that pack's .cue can land in the bucket during the same listing.
+// indexed is checked under mu right before each .cue is fetched, and once more
+// when the tables go in, so no pack is ever loaded twice. The second check
+// can drop a pack from the merged table, which costs one more merge; the race
+// is rare.
+func (s *Storer) buildPacks(refresh bool) (int, error) {
+	s.packs.buildMu.Lock()
+	defer s.packs.buildMu.Unlock()
+	s.packs.mu.Lock()
+	built := s.packs.built
+	s.packs.mu.Unlock()
+	if built && !refresh {
+		return 0, nil
+	}
+	if err := s.ctx.Err(); err != nil {
+		return 0, err
+	}
 
 	keys, err := s.listKeys(s.prefix + packPrefix)
 	if err != nil {
-		return fmt.Errorf("tigris: list packs: %w", err)
+		return 0, fmt.Errorf("tigris: list packs: %w", err)
 	}
 
 	// Parse each .cue into a table of its own, and drop its records at once,
 	// so the cold build never holds a whole repository of cueRecords.
 	hashLen := s.oh.Size()
-	var (
-		tables []*packTable
-		sizes  = make(map[string]int64)
-	)
+	type loadedPack struct {
+		id    string
+		num   uint32
+		table *packTable
+		size  int64
+	}
+	var packs []loadedPack
 	for _, k := range keys {
 		if !strings.HasSuffix(k, cueSuffix) {
 			continue
 		}
 		id := strings.TrimSuffix(strings.TrimPrefix(k, s.prefix+packPrefix), cueSuffix)
+		s.packs.mu.Lock()
+		_, known := s.packs.indexed[id]
+		s.packs.mu.Unlock()
+		if known {
+			continue
+		}
 
 		raw, err := s.fetchSmall(k)
 		if err != nil {
-			return fmt.Errorf("tigris: fetch cue %s: %w", k, err)
+			return 0, fmt.Errorf("tigris: fetch cue %s: %w", k, err)
 		}
 		recs, err := parseCue(hashLen, raw)
 		if err != nil {
-			return fmt.Errorf("tigris: parse cue %s: %w", k, err)
+			return 0, fmt.Errorf("tigris: parse cue %s: %w", k, err)
 		}
 		s.packs.mu.Lock()
 		num := s.packs.packNum(id)
 		s.packs.mu.Unlock()
-		tables = append(tables, newPackTable(hashLen, num, recs))
-		sizes[id] = packExtent(recs)
+		packs = append(packs, loadedPack{id, num, newPackTable(hashLen, num, recs), packExtent(recs)})
 	}
 	// One table for the whole repository makes each lookup one binary search.
-	if len(tables) > 1 {
-		tables = []*packTable{mergeTables(hashLen, tables, nil)}
+	// Merge before taking mu, so a large merge never holds up a lookup.
+	merge := func(packs []loadedPack) []*packTable {
+		tables := make([]*packTable, 0, len(packs))
+		for _, pk := range packs {
+			tables = append(tables, pk.table)
+		}
+		if len(tables) > 1 {
+			tables = []*packTable{mergeTables(hashLen, tables, nil)}
+		}
+		return tables
 	}
+	tables := merge(packs)
 
 	s.packs.mu.Lock()
 	defer s.packs.mu.Unlock()
-	if s.packs.built {
-		return nil // lost a race with a concurrent cold build on this instance
+	// Drop any pack that register added since its .cue was fetched.
+	kept := packs[:0]
+	for _, pk := range packs {
+		if _, ok := s.packs.indexed[pk.id]; !ok {
+			kept = append(kept, pk)
+		}
+	}
+	if len(kept) != len(packs) {
+		tables = merge(kept)
+	}
+	for _, pk := range kept {
+		s.packs.indexed[pk.id] = struct{}{}
+		s.packs.revive(pk.num)
+		if _, ok := s.packs.sizes[pk.id]; !ok {
+			s.packs.sizes[pk.id] = pk.size
+		}
 	}
 	// The cold tables go first, which makes them the oldest. The packs this
 	// instance registered itself are newer, so their records win.
 	s.packs.tables = append(tables, s.packs.tables...)
-	for id, n := range sizes {
-		if _, ok := s.packs.sizes[id]; !ok {
-			s.packs.sizes[id] = n
-		}
-	}
 	if len(s.packs.tables) > maxPackTables {
 		s.packs.tables = []*packTable{mergeTables(hashLen, s.packs.tables, s.packs.dead)}
 		s.packs.dead = nil
 	}
 	s.packs.built = true
-	return nil
+	return len(kept), nil
 }
 
 // packLookup reports whether h lives in a pack this Storer knows about,

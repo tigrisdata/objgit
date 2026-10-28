@@ -132,7 +132,7 @@ type uploader struct {
 	b *bundler.Bundler[uploadJob]
 
 	mu      sync.Mutex
-	err     error // first upload error since the last flush
+	err     error // first upload error; fatal for this uploader
 	pending map[plumbing.Hash]pendingMeta
 }
 
@@ -244,7 +244,8 @@ func (u *uploader) sizeHint(job uploadJob) int {
 }
 
 // flush waits for every upload queued so far to finish and returns the first
-// error any of them hit, clearing it so the next flush starts fresh. Callers
+// error any of them hit. Failed jobs discard their staging files, so the
+// error remains fatal for this uploader: another flush cannot repair it. Callers
 // that hand out references to objects (SetReference) flush first, so a ref
 // can never point at an object that failed — or hasn't yet finished —
 // uploading.
@@ -252,7 +253,5 @@ func (u *uploader) flush() error {
 	u.b.Flush()
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	err := u.err
-	u.err = nil
-	return err
+	return u.err
 }

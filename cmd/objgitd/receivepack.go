@@ -188,6 +188,12 @@ func receivePackStreaming(
 		return res
 	}
 
+	// updateReferences commits every ref through the storer's SetReference
+	// family. The tigris storer flushes every queued pack upload (bin and
+	// cue) before it publishes a ref, so by the time onUpdated runs, and a
+	// hook can clone the ref, the packs are durable. receive-pack adds no
+	// barrier of its own. TestTigrisPushPublication in s3_publication_test.go
+	// holds the fake S3's uploads open and checks that ordering.
 	var firstErr error
 	cmdStatus := make(map[plumbing.ReferenceName]error)
 	acceptedAt := updateReferences(st, updreq, cmdStatus, &firstErr)

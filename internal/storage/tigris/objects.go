@@ -48,12 +48,45 @@ func (s *Storer) headInfo(h plumbing.Hash) (objHead, error) {
 	switch {
 	case err == nil:
 	case isNotFound(err):
-		return zeroObjHead, plumbing.ErrObjectNotFound
+		e, err := s.lookupAfterMiss(h)
+		if err != nil {
+			return zeroObjHead, err
+		}
+		return objHead{typ: e.typ, size: e.raw}, nil
 	default:
 		return zeroObjHead, fmt.Errorf("tigris: head %s: %w", h.String(), err)
 	}
 
 	return parseObjHead(h, out.Metadata, out.ContentLength)
+}
+
+// lookupAfterMiss is a read's last step once loose storage has said 404 for
+// h: the pack index may predate a pack another writer just published, so it
+// is refreshed and searched once more. The result is the entry, or
+// ErrObjectNotFound.
+//
+// A refresh that fails does not make this read a storage error. Loose storage
+// has already answered, and a missing object is a normal answer: during a
+// fetch negotiation go-git walks every `have` the client sends, tolerates
+// only ErrObjectNotFound for one this server lacks, and fails the whole
+// upload-pack on anything else. refreshPacks logs the failure once per
+// attempt and rate-limits the next one, so a sick bucket is neither hidden
+// nor hammered. Cancellation is the one exception: a canceled storer reports
+// that, so a read does not pretend to have searched.
+func (s *Storer) lookupAfterMiss(h plumbing.Hash) (packEntry, error) {
+	if err := s.refreshPacks(); err != nil {
+		if cerr := s.ctx.Err(); cerr != nil {
+			return packEntry{}, cerr
+		}
+	}
+	e, ok, err := s.packLookup(h)
+	if err != nil {
+		return packEntry{}, err
+	}
+	if !ok {
+		return packEntry{}, plumbing.ErrObjectNotFound
+	}
+	return e, nil
 }
 
 // parsePendingHead mirrors parseObjHead for a pending-overlay entry, whose
@@ -144,7 +177,11 @@ func (s *Storer) EncodedObject(t plumbing.ObjectType, h plumbing.Hash) (plumbing
 	switch {
 	case err == nil:
 	case isNotFound(err):
-		return nil, plumbing.ErrObjectNotFound
+		e, err := s.lookupAfterMiss(h)
+		if err != nil {
+			return nil, err
+		}
+		return s.packObject(t, h, e)
 	default:
 		return nil, fmt.Errorf("tigris: get %s: %w", h.String(), err)
 	}

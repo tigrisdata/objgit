@@ -235,6 +235,12 @@ func WithRefCASObserver(fn func()) Option {
 	return func(s *Storer) { s.refCASObserver = fn }
 }
 
+// WithS3Client uses a configured S3 client instead of creating the default
+// Tigris client. This supports custom endpoints and transport-level tests.
+func WithS3Client(client *s3.Client) Option {
+	return func(s *Storer) { s.client = client }
+}
+
 func withClient(c s3API) Option {
 	return func(s *Storer) { s.client = c }
 }

@@ -160,7 +160,7 @@ func (d *daemon) handleRPC(w http.ResponseWriter, r *http.Request, service strin
 	var err error
 	switch service {
 	case transport.UploadPackService:
-		err = transport.UploadPack(r.Context(), st, in, out, &transport.UploadPackRequest{
+		err = uploadPackHTTP(r.Context(), st, in, out, &transport.UploadPackRequest{
 			StatelessRPC: true,
 			GitProtocol:  gitProtocol,
 		})

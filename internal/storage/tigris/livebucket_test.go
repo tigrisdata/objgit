@@ -161,8 +161,52 @@ func TestLiveBucketPackRoundTrip(t *testing.T) {
 		}
 	})
 
-	// Fresh Storer: cold cue-index build, then reads straight off the wire.
-	reader := base.Scoped(prefix)
+	// Publish a commit and resolve it through a new root, with no writer
+	// overlay or shared local cache.
+	var tip plumbing.Hash
+	for _, h := range fx.hashes {
+		if fx.byHash[h].typ == plumbing.CommitObject {
+			tip = h
+			break
+		}
+	}
+	if tip.IsZero() {
+		t.Fatal("fixture contains no commit")
+	}
+	ref := plumbing.NewHashReference(plumbing.NewBranchReferenceName("main"), tip)
+	if err := s.SetReference(ref); err != nil {
+		t.Fatalf("publish ref: %v", err)
+	}
+	fresh, err := New(ctx, bucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := fresh.Scoped(prefix)
+	gotRef, err := reader.Reference(ref.Name())
+	if err != nil || gotRef.Hash() != tip {
+		t.Fatalf("cold ref: %v, %v", gotRef, err)
+	}
+	for _, h := range fx.hashes {
+		obj, err := reader.EncodedObject(plumbing.AnyObject, h)
+		if err != nil {
+			t.Fatalf("cold object %s: %v", h, err)
+		}
+		r, err := obj.Reader()
+		if err != nil {
+			t.Fatal(err)
+		}
+		hasher := plumbing.NewHasher(reader.of, obj.Type(), obj.Size())
+		_, err = io.Copy(hasher, r)
+		r.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hasher.Sum() != h {
+			t.Fatalf("cold object hash differs for %s", h)
+		}
+	}
+	// Use another cold reader to exercise ranged GET and prefetch below.
+	reader = fresh.Scoped(prefix)
 
 	blobs := blobHashes(fx)
 	if len(blobs) < 4 {
